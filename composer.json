@@ -1,0 +1,31 @@
+{
+  "name": "build-gaia/chronos-collector",
+  "description": "Chronos telemetry collector SDK for PHP. Thin span-decoration API over the native Rust extension.",
+  "license": "Apache-2.0",
+  "type": "library",
+  "require": {
+    "php": ">=8.1"
+  },
+  "autoload": {
+    "psr-4": {
+      "Chronos\\Collector\\": "api/src/"
+    },
+    "files": [
+      "api/src/functions.php"
+    ]
+  },
+  "suggest": {
+    "laravel/framework": "Required for automatic Laravel HTTP instrumentation",
+    "symfony/framework-bundle": "Required for Symfony HTTP instrumentation"
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Chronos\\Collector\\Framework\\Laravel\\ChronosServiceProvider"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "php api/tests/verify.php"
+  }
+}
