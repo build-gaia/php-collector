@@ -1,5 +1,5 @@
 {
-  "name": "build-gaia/chronos-collector",
+  "name": "build-gaia/php-collector",
   "description": "Chronos telemetry collector SDK for PHP. Thin span-decoration API over the native Rust extension.",
   "license": "Apache-2.0",
   "type": "library",
