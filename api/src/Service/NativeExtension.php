@@ -18,7 +18,7 @@ final class NativeExtension
 
     public static function loaded(): bool
     {
-        return self::$loaded ??= extension_loaded('chronos');
+        return self::$loaded ??= extension_loaded('chronos-ext');
     }
 
     /**
