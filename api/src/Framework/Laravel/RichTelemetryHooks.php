@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Chronos\Collector\Framework\Laravel;
 
 use Chronos\Collector\Service\NativeExtension;
+use Chronos\Collector\Service\QueryPlan;
 use Chronos\Collector\Service\Severity;
 use Chronos\Collector\Service\Span;
 use Chronos\Collector\Service\SpanManager;
@@ -86,6 +87,15 @@ final class RichTelemetryHooks
             $bindingsCount = count((array) ($query->bindings ?? []));
             $span->add('db.parameters.count', (string) $bindingsCount);
             $span->add('db.parameters', Span::boundedParametersJson((array) ($query->bindings ?? [])), Span::MAX_TEXT_LENGTH);
+            // DB::listen fires AFTER execution and this span's duration comes from
+            // $query->time, so an EXPLAIN here cannot contaminate the query's own
+            // timing — unlike the Doctrine path, which has to capture before the
+            // span opens. Off unless CHRONOS_PHP_EXPLAIN is set. See QueryPlan.
+            if (QueryPlan::enabled()) {
+                foreach (QueryPlan::capture(self::pdo($query), $sql, (array) ($query->bindings ?? [])) as $key => $value) {
+                    $span->add($key, $value, Span::MAX_TEXT_LENGTH);
+                }
+            }
         }
         $span->finish();
     }
@@ -191,6 +201,26 @@ final class RichTelemetryHooks
             $body = is_string($event->message ?? null) ? $event->message : '';
             NativeExtension::captureLog($severity['text'], $severity['number'], $body, $attributes);
         } catch (Throwable) {
+        }
+    }
+
+    /**
+     * The PDO handle behind a query event, for the EXPLAIN. Laravel's connection
+     * has already executed the statement by the time DB::listen fires, so this
+     * never opens a connection that was not open anyway.
+     */
+    private static function pdo(object $query): ?\PDO
+    {
+        try {
+            $connection = $query->connection ?? null;
+            if (!is_object($connection) || !method_exists($connection, 'getPdo')) {
+                return null;
+            }
+            $handle = $connection->getPdo();
+
+            return $handle instanceof \PDO ? $handle : null;
+        } catch (Throwable) {
+            return null;
         }
     }
 
