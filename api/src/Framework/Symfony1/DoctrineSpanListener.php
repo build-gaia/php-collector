@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Symfony1;
 
+use Chronos\Collector\Service\QueryPlan;
 use Chronos\Collector\Service\Span;
 use Chronos\Collector\Service\SpanManager;
 use Throwable;
@@ -43,6 +44,19 @@ final class DoctrineSpanListener extends \Doctrine_EventListener
     {
         try {
             $sql = (string) $event->getQuery();
+            $eventParams = method_exists($event, 'getParams') ? $event->getParams() : null;
+            // BEFORE the span opens, deliberately. An EXPLAIN is a round trip, and
+            // inside the span window it would be counted as query time — every
+            // latency number Chronos reports for this query would then include the
+            // cost of profiling it. Off unless CHRONOS_PHP_EXPLAIN is set, so this
+            // is one static bool check on the normal path. See QueryPlan.
+            $plan = QueryPlan::enabled()
+                ? QueryPlan::capture(
+                    self::pdo(self::resolveConnection($event)),
+                    $sql,
+                    is_array($eventParams) ? $eventParams : [],
+                )
+                : [];
             $span = SpanManager::open('SQL ' . self::verb($sql));
             if (!$span->isVoid()) {
                 $span->add('span.kind', 'client');
@@ -63,10 +77,14 @@ final class DoctrineSpanListener extends \Doctrine_EventListener
                 // larger text ceiling so a big query is captured whole, not clipped at 512.
                 $span->add('db.statement', $sql, Span::MAX_TEXT_LENGTH);
                 $span->add('db.query.text', $sql, Span::MAX_TEXT_LENGTH);
-                $params = method_exists($event, 'getParams') ? $event->getParams() : null;
-                if (is_array($params)) {
-                    $span->add('db.parameters.count', (string) count($params));
-                    $span->add('db.parameters', Span::boundedParametersJson($params), Span::MAX_TEXT_LENGTH);
+                if (is_array($eventParams)) {
+                    $span->add('db.parameters.count', (string) count($eventParams));
+                    $span->add('db.parameters', Span::boundedParametersJson($eventParams), Span::MAX_TEXT_LENGTH);
+                }
+                // The plan, when one was captured. A plan is large and structured,
+                // so it opts into the same text ceiling as the statement.
+                foreach ($plan as $key => $value) {
+                    $span->add($key, $value, Span::MAX_TEXT_LENGTH);
                 }
             }
             $this->stack[] = $span;
@@ -86,11 +104,65 @@ final class DoctrineSpanListener extends \Doctrine_EventListener
         }
     }
 
+    /**
+     * The connection behind an event.
+     *
+     * Doctrine 1's Doctrine_Event has NO getConnection() — the connection arrives
+     * via getInvoker(), which is either the connection itself or a
+     * Doctrine_Connection_Statement exposing getConnection(). The old
+     * method_exists($event, 'getConnection') guard silently returned on every
+     * query, which is why SQL nodes showed "host not reported".
+     */
+    private static function resolveConnection(\Doctrine_Event $event): ?object
+    {
+        try {
+            if (method_exists($event, 'getInvoker')) {
+                $invoker = $event->getInvoker();
+                if ($invoker instanceof \Doctrine_Connection) {
+                    return $invoker;
+                }
+                if (is_object($invoker) && method_exists($invoker, 'getConnection')) {
+                    $connection = $invoker->getConnection();
+                    if (is_object($connection)) {
+                        return $connection;
+                    }
+                }
+            }
+            if (method_exists($event, 'getConnection')) {
+                $connection = $event->getConnection();
+
+                return is_object($connection) ? $connection : null;
+            }
+        } catch (Throwable) {
+        }
+
+        return null;
+    }
+
+    /**
+     * The live PDO handle behind a Doctrine connection, for the EXPLAIN. Doctrine
+     * connects lazily, so this can open the connection — harmless here, because
+     * the statement it is about to explain is about to run on it anyway.
+     */
+    private static function pdo(?object $connection): ?\PDO
+    {
+        try {
+            if ($connection === null || !method_exists($connection, 'getDbh')) {
+                return null;
+            }
+            $handle = $connection->getDbh();
+
+            return $handle instanceof \PDO ? $handle : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /** Adds DB host/name/user (never password) from the Doctrine connection, best-effort. */
     private static function addConnectionMetadata(Span $span, \Doctrine_Event $event): void
     {
         try {
-            $connection = method_exists($event, 'getConnection') ? $event->getConnection() : null;
+            $connection = self::resolveConnection($event);
             if ($connection === null || !method_exists($connection, 'getOption')) {
                 return;
             }
