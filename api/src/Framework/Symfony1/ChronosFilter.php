@@ -38,11 +38,26 @@ final class ChronosFilter extends \sfFilter
             is_string($dstDirective) ? $dstDirective : null,
             $request->getMethod(),
             $request->getPathInfo(),
+            // Empty service name: the native collector falls back to the
+            // CHRONOS_PHP_APPLICATION identity, keeping the service map's node
+            // names aligned with the application id.
+            '',
+        );
+
+        // Framework identity for the `app.*` span attributes. Symfony 1 reports its
+        // version through SYMFONY_VERSION when the core is loaded.
+        NativeExtension::setAppMetadata(
             'symfony1',
+            \defined('SYMFONY_VERSION') ? (string) \SYMFONY_VERSION : '',
         );
 
         self::attachDoctrineSpans();
         self::attachLogListener($this->context);
+
+        // Everything up to here — sfContext creation, autoloading, config cache,
+        // Doctrine connection setup — is the bootstrap phase the Timeline tab shows
+        // first. The filter chain is where the application's own work begins.
+        NativeExtension::markPhase('dispatch');
 
         try {
             $filterChain->execute();
@@ -50,9 +65,14 @@ final class ChronosFilter extends \sfFilter
             $route = self::resolveRoute($this->context);
             $statusCode = self::resolveStatusCode($this->context);
 
-            NativeExtension::requestEnd($statusCode, $route ?? $request->getPathInfo());
+            // The action has run and the response is fully rendered but not yet sent:
+            // the one moment the body exists in memory and can be captured exactly.
+            NativeExtension::markPhase('send');
+            self::captureResponse($this->context);
+
+            NativeExtension::requestEnd($statusCode, $route ?? $request->getPathInfo(), null, true);
         } catch (Throwable $e) {
-            NativeExtension::requestEnd(500, $request->getPathInfo());
+            NativeExtension::requestEnd(500, $request->getPathInfo(), $e, false);
             throw $e;
         }
     }
@@ -110,7 +130,33 @@ final class ChronosFilter extends \sfFilter
             if (method_exists($manager, 'addListener')) {
                 $manager->addListener($listener);
             }
+            // The Doctrine listener owns SQL spans (host/db/bound params) — the
+            // native PDO fallback stands down for this request.
+            NativeExtension::suppressNative('sql');
         } catch (Throwable) {
+        }
+    }
+
+    /**
+     * Hand the rendered response body and its content type to the collector.
+     *
+     * symfony1 holds the whole body in sfWebResponse::getContent() right up to
+     * sendContent(), so this is exact and costs nothing. A streaming response
+     * reports null content and is correctly skipped rather than forced into memory.
+     */
+    private static function captureResponse(object $context): void
+    {
+        try {
+            $response = method_exists($context, 'getResponse') ? $context->getResponse() : null;
+            if (!is_object($response) || !method_exists($response, 'getContent')) {
+                return;
+            }
+            $contentType = method_exists($response, 'getContentType')
+                ? (string) $response->getContentType()
+                : '';
+            NativeExtension::setResponseBody($response->getContent(), $contentType);
+        } catch (Throwable) {
+            // Capture is never allowed to break the response it is observing.
         }
     }
 
