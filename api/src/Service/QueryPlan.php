@@ -11,11 +11,35 @@ use Throwable;
 /**
  * Captures an execution plan for a SQL statement, next to the statement itself.
  *
- * WHY HERE. The Chronos engine never has a route to the observed application's
- * database — it only ever sees spans. So the only place a plan can be produced
- * is the process that already holds the connection: this one. The plan is
- * attached to the SQL span as `db.plan`, and the Database page reads it back off
- * the span index.
+ * WHY HERE. This process already holds the connection, so it is the one place a
+ * plan can be produced for the ACTUAL statement with the ACTUAL bind values, on
+ * the real request path, with no credential stored anywhere and no network route
+ * from Chronos to the database required. It needs no operator configuration in
+ * Chronos at all, and it is the only path that works when the engine has no way
+ * in — a private subnet, a socket-only connection, or simply no account it may
+ * use. The plan is attached to the SQL span as `db.plan`, and the Database page
+ * reads it back off the span index.
+ *
+ * THERE IS ALSO AN ENGINE-SIDE PATH, and it is worth knowing where the seam is.
+ * The engine can now be given credentials for the observed application's own
+ * databases and connect out to them itself (see the engine's `data_source`
+ * module), so an earlier version of this comment claiming the engine "never has
+ * a route to the database" is no longer true. The two paths differ in kind, not
+ * in quality:
+ *
+ *   - THIS path is inline and per-request. It is exact — the real statement,
+ *     the real binds — but it costs request latency, and it needs a code deploy
+ *     plus `CHRONOS_PHP_EXPLAIN` in the application's environment.
+ *   - THE ENGINE-SIDE path is out-of-band and on a schedule. It costs the
+ *     request nothing and needs no deploy, but it re-runs EXPLAIN against binds
+ *     sampled from a recent slow span — or NULL binds when no usable exemplar
+ *     exists, which can produce a different plan than a real request gets — and
+ *     it requires an operator to store a database credential in Chronos.
+ *
+ * Both are surfaced side by side in the desktop's plan panel. What tells them
+ * apart on the wire is `db.plan.source`, which this class sets to
+ * `collector-inline` (see attributes() below); the engine labels its own plans
+ * separately. Neither path supersedes the other.
  *
  * WHY IT IS OFF BY DEFAULT. An EXPLAIN is a real round trip to the database on
  * the request path, and on a slow query the optimizer work is not free either.
@@ -167,8 +191,9 @@ final class QueryPlan
 
     /**
      * The span attributes for a captured plan. `db.plan.source` marks where it
-     * came from, so a plan captured inline is never mistaken for one produced by
-     * something with its own view of the database.
+     * came from, so a plan captured inline here — exact statement, exact binds —
+     * is never mistaken for one the engine produced out-of-band against sampled
+     * or NULL binds.
      *
      * @return array<string, string>
      */
