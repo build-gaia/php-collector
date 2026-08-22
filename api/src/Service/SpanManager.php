@@ -30,6 +30,17 @@ final class SpanManager
         self::$finished = [];
     }
 
+    /**
+     * Clear request-scoped state. Called from NativeExtension::requestStart because
+     * these statics persist across requests inside one FPM worker — without a reset
+     * the lazily-seeded synthetic root would carry the previous request's trace ids.
+     */
+    public static function reset(): void
+    {
+        self::$stack = [];
+        self::$finished = [];
+    }
+
     /** @return list<SpanRecord> */
     public static function end(): array
     {
@@ -64,8 +75,17 @@ final class SpanManager
     public static function complete(Span $span): void
     {
         self::$stack = array_values(array_filter(self::$stack, static fn (Span $open): bool => $open !== $span));
+        $record = $span->toRecord();
+        // With the native extension loaded the .so owns the span batch: bridge the
+        // finished span across the FFI so it ships in the same .trace envelope as
+        // the observer spans. The legacy static buffer only backs the pure-PHP path.
+        if (NativeExtension::loaded()) {
+            NativeExtension::recordSpan($record);
+
+            return;
+        }
         if (count(self::$finished) < self::MAX_SPANS) {
-            self::$finished[] = $span->toRecord();
+            self::$finished[] = $record;
         }
     }
 
@@ -133,9 +153,37 @@ final class SpanManager
 
     private static function top(): ?Span
     {
+        if (self::$stack === []) {
+            self::seedFromNative();
+        }
         $top = end(self::$stack);
 
         return $top === false ? null : $top;
+    }
+
+    /**
+     * With the native extension driving the request lifecycle, nothing calls begin() —
+     * historically that left top() null forever, so every $chronos->span->create() and
+     * Doctrine SQL span silently no-oped. Seed the stack lazily from the native trace
+     * context instead: a synthetic root bound to the request's trace/span ids that acts
+     * purely as a parent (it is never finished, so it never emits a duplicate root —
+     * the .so writes the real request root span at request end).
+     */
+    private static function seedFromNative(): void
+    {
+        if (!NativeExtension::loaded()) {
+            return;
+        }
+        $traceparent = NativeExtension::traceparent();
+        if ($traceparent === null) {
+            return;
+        }
+        $parts = explode('-', $traceparent);
+        if (count($parts) !== 4 || strlen($parts[1]) !== 32 || strlen($parts[2]) !== 16) {
+            return;
+        }
+        self::$stack = [Span::open($parts[1], $parts[2], '', 'request')];
+        self::$finished = [];
     }
 
     /**
