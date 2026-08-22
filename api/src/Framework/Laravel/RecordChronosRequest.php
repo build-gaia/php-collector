@@ -45,6 +45,25 @@ final class RecordChronosRequest
             $routePattern,
             $serviceName,
         );
+        // Language/framework/release identity for the `app.*` span attributes.
+        // Resolved here rather than in the .so: only userland can read the
+        // framework's version constant and the app's configured release.
+        NativeExtension::setAppMetadata(
+            'laravel',
+            \class_exists(\Illuminate\Foundation\Application::class) ? app()->version() : '',
+            (string) config('app.version', ''),
+        );
+        // RichTelemetryHooks (installed by the service provider whenever the
+        // extension is loaded) owns SQL and cache spans with connection identity
+        // — the native PDO/Redis fallbacks stand down. Per request: the native
+        // flags reset at every requestStart.
+        NativeExtension::suppressNative('sql');
+        NativeExtension::suppressNative('cache');
+
+        // The middleware stack below this point is the application's own work; every
+        // millisecond before it was framework bootstrap. The Timeline tab splits the
+        // request on exactly this boundary.
+        NativeExtension::markPhase('dispatch');
 
         try {
             $response = $next($request);
@@ -54,14 +73,53 @@ final class RecordChronosRequest
                 ? (int) $response->getStatusCode()
                 : 0;
 
-            NativeExtension::requestEnd($statusCode, $resolvedRoute ?? $routePattern);
+            // Laravel renders most exceptions into an error response instead of letting
+            // them escape to middleware, attaching the original throwable to it — this
+            // is the path real application errors actually take.
+            $rendered = is_object($response) && isset($response->exception) && $response->exception instanceof Throwable
+                ? $response->exception
+                : null;
+
+            // Rendered into a response by the framework's exception handler, so
+            // handled=true; the catch branch below is the unhandled path.
+            NativeExtension::markPhase('send');
+            $this->captureResponse($response);
+
+            NativeExtension::requestEnd($statusCode, $resolvedRoute ?? $routePattern, $rendered, true);
 
             $this->injectDownstream($response);
 
             return $response;
         } catch (Throwable $e) {
-            NativeExtension::requestEnd(500, $routePattern);
+            NativeExtension::requestEnd(500, $routePattern, $e, false);
             throw $e;
+        }
+    }
+
+    /**
+     * Hand the rendered body and content type to the collector.
+     *
+     * Laravel returns a Symfony Response for HTTP routes, so getContent() is the
+     * whole body — except for a StreamedResponse or a file download, where it is
+     * false and correctly skipped. A JsonResponse arrives here already encoded,
+     * which is exactly what the Response tab wants to pretty-print.
+     */
+    private function captureResponse(mixed $response): void
+    {
+        try {
+            if (!is_object($response) || !method_exists($response, 'getContent')) {
+                return;
+            }
+            $body = $response->getContent();
+            if (!is_string($body)) {
+                return;
+            }
+            $contentType = isset($response->headers) && method_exists($response->headers, 'get')
+                ? (string) $response->headers->get('Content-Type', '')
+                : '';
+            NativeExtension::setResponseBody($body, $contentType);
+        } catch (Throwable) {
+            // Capture is never allowed to break the response it is observing.
         }
     }
 
