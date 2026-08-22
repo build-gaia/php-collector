@@ -220,8 +220,11 @@ final class NativeExtension
     }
 
     /**
-     * Hand the collector the response body about to be sent, so the trace can show
-     * a rendered Response tab.
+     * Hand the collector the response body and headers about to be sent, so the
+     * trace can show a rendered Response tab.
+     *
+     * The headers matter as much as the body: this runs BEFORE the framework
+     * flushes, so the collector's own `headers_list()` read is still empty.
      *
      * The .so reads every other part of the HTTP stack itself, but by the time
      * request-end runs the body has gone to the SAPI and PHP kept no copy. A bridge
@@ -233,18 +236,52 @@ final class NativeExtension
      * here is deliberately generous relative to the collector's own so the .so
      * stays the single place the real limit is configured.
      */
-    public static function setResponseBody(?string $body, string $contentType = ''): void
-    {
+    /** @param array<string, string> $headers */
+    public static function setResponseBody(
+        ?string $body,
+        string $contentType = '',
+        array $headers = [],
+    ): void {
         if (!self::loaded() || !function_exists('chronos_set_http_response_body')) {
             return;
         }
-        if (!is_string($body) || $body === '') {
+        $body = is_string($body) ? $body : '';
+        if ($body === '' && $headers === []) {
             return;
         }
         try {
-            \chronos_set_http_response_body(substr($body, 0, 1048576), $contentType);
+            \chronos_set_http_response_body(substr($body, 0, 1048576), $contentType, $headers);
         } catch (\Throwable) {
         }
+    }
+
+    /**
+     * Flatten a framework header bag to name => value.
+     *
+     * Symfony-style bags hold a LIST of values per name (Set-Cookie legitimately
+     * repeats); they are joined rather than reduced to the first, because "which
+     * cookies did this response set" is usually the whole question.
+     *
+     * @param iterable<string, string|list<string>|null> $bag
+     * @return array<string, string>
+     */
+    public static function flattenHeaders(iterable $bag): array
+    {
+        $headers = [];
+        foreach ($bag as $name => $value) {
+            if (!is_string($name)) {
+                continue;
+            }
+            if (is_array($value)) {
+                $value = implode(', ', array_filter($value, 'is_scalar'));
+            }
+            if ($value === null || is_array($value)) {
+                continue;
+            }
+            $headers[$name] = (string) $value;
+        }
+
+        return $headers;
     }
 
     /**

@@ -111,13 +111,13 @@ final class RecordChronosRequest
                 return;
             }
             $body = $response->getContent();
-            if (!is_string($body)) {
-                return;
-            }
-            $contentType = isset($response->headers) && method_exists($response->headers, 'get')
-                ? (string) $response->headers->get('Content-Type', '')
-                : '';
-            NativeExtension::setResponseBody($body, $contentType);
+            $body = is_string($body) ? $body : '';
+            $hasBag = isset($response->headers) && method_exists($response->headers, 'get');
+            $contentType = $hasBag ? (string) $response->headers->get('Content-Type', '') : '';
+            $headers = $hasBag && method_exists($response->headers, 'all')
+                ? NativeExtension::flattenHeaders($response->headers->all())
+                : [];
+            NativeExtension::setResponseBody($body, $contentType, $headers);
         } catch (Throwable) {
             // Capture is never allowed to break the response it is observing.
         }

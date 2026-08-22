@@ -154,7 +154,13 @@ final class ChronosFilter extends \sfFilter
             $contentType = method_exists($response, 'getContentType')
                 ? (string) $response->getContentType()
                 : '';
-            NativeExtension::setResponseBody($response->getContent(), $contentType);
+            // sfWebResponse holds its headers until sendHttpHeaders(), which runs
+            // after this filter returns — so the collector's own headers_list()
+            // read would find nothing. Supply them here.
+            $headers = method_exists($response, 'getHttpHeaders')
+                ? NativeExtension::flattenHeaders((array) $response->getHttpHeaders())
+                : [];
+            NativeExtension::setResponseBody($response->getContent(), $contentType, $headers);
         } catch (Throwable) {
             // Capture is never allowed to break the response it is observing.
         }
