@@ -42,8 +42,23 @@ final class ChronosHttpKernel implements HttpKernelInterface
             null,
             $request->getMethod(),
             $request->getPathInfo(),
-            'symfony',
+            // Empty service name → native falls back to CHRONOS_PHP_APPLICATION.
+            '',
         );
+
+        // Framework identity for the `app.*` span attributes. Symfony exposes its
+        // version as a Kernel constant; the app's own release stays config-driven.
+        NativeExtension::setAppMetadata(
+            'symfony',
+            \defined('Symfony\\Component\\HttpKernel\\Kernel::VERSION')
+                ? \Symfony\Component\HttpKernel\Kernel::VERSION
+                : '',
+        );
+
+        // Container boot, bundle registration and kernel warmup are behind us; the
+        // kernel call below is the application's own work. Marks the boundary the
+        // Timeline tab draws between "bootstrap" and "dispatch".
+        NativeExtension::markPhase('dispatch');
 
         try {
             $response = $this->kernel->handle($request, $type, $catch);
@@ -51,14 +66,44 @@ final class ChronosHttpKernel implements HttpKernelInterface
             $route = $this->resolveRoute($request);
             $statusCode = method_exists($response, 'getStatusCode') ? (int) $response->getStatusCode() : 0;
 
-            NativeExtension::requestEnd($statusCode, $route ?? $request->getPathInfo());
+            NativeExtension::markPhase('send');
+            $this->captureResponse($response);
+
+            NativeExtension::requestEnd($statusCode, $route ?? $request->getPathInfo(), null, true);
 
             $this->injectDownstream($response);
 
             return $response;
         } catch (Throwable $e) {
-            NativeExtension::requestEnd(500, $request->getPathInfo());
+            NativeExtension::requestEnd(500, $request->getPathInfo(), $e, false);
             throw $e;
+        }
+    }
+
+    /**
+     * Hand the rendered body and content type to the collector, one moment before
+     * Symfony sends it.
+     *
+     * A StreamedResponse or BinaryFileResponse has no in-memory body — getContent()
+     * returns false — and is skipped rather than forced to materialise, which would
+     * turn an observation into a behaviour change (and, for a file download, an OOM).
+     */
+    private function captureResponse(Response $response): void
+    {
+        try {
+            if (!method_exists($response, 'getContent')) {
+                return;
+            }
+            $body = $response->getContent();
+            if (!is_string($body)) {
+                return;
+            }
+            $contentType = isset($response->headers) && method_exists($response->headers, 'get')
+                ? (string) $response->headers->get('Content-Type', '')
+                : '';
+            NativeExtension::setResponseBody($body, $contentType);
+        } catch (Throwable) {
+            // Capture is never allowed to break the response it is observing.
         }
     }
 
