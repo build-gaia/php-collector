@@ -16,7 +16,7 @@ final class ChronosFilter extends \sfFilter
 {
     public function execute($filterChain): void
     {
-        if (!NativeExtension::loaded()) {
+        if (!NativeExtension::enabled()) {
             $filterChain->execute();
             return;
         }
@@ -43,6 +43,13 @@ final class ChronosFilter extends \sfFilter
             // names aligned with the application id.
             '',
         );
+        if (!NativeExtension::active()) {
+            // The collector declined this request — everything below would be FFI
+            // calls into no-ops, and the Doctrine/log listeners would only add
+            // per-query overhead with nowhere to send the result.
+            $filterChain->execute();
+            return;
+        }
 
         // Framework identity for the `app.*` span attributes. Symfony 1 reports its
         // version through SYMFONY_VERSION when the core is loaded.
@@ -153,6 +160,11 @@ final class ChronosFilter extends \sfFilter
     private static function captureResponse(object $context): void
     {
         try {
+            // getContent() copies the whole body; on an unsampled request the
+            // collector would drop it anyway, so don't pay for the copy.
+            if (!NativeExtension::httpCapturing()) {
+                return;
+            }
             $response = method_exists($context, 'getResponse') ? $context->getResponse() : null;
             if (!is_object($response) || !method_exists($response, 'getContent')) {
                 return;

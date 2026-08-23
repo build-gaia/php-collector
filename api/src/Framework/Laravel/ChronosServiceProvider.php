@@ -19,13 +19,18 @@ final class ChronosServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        // enabled() is the process-level master switch (extension loaded AND
+        // CHRONOS_PHP_ENABLED on): with the .so baked into a fleet image but the
+        // collector off, this provider registers nothing at all.
+        if (!NativeExtension::enabled()) {
+            return;
+        }
+
         try {
             $this->app->make(Kernel::class)->pushMiddleware(RecordChronosRequest::class);
         } catch (Throwable) {
         }
 
-        if (NativeExtension::loaded()) {
-            RichTelemetryHooks::install();
-        }
+        RichTelemetryHooks::install();
     }
 }

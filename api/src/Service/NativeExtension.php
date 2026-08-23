@@ -16,6 +16,8 @@ final class NativeExtension
 {
     private static ?bool $loaded = null;
 
+    private static ?bool $enabled = null;
+
     /** Once-per-process guard for the instrumentation-manifest load (the native
      * trace allowlist is per-process and only ever grows, so once is enough). */
     private static bool $manifestLoaded = false;
@@ -25,6 +27,60 @@ final class NativeExtension
         // The module registers as `chronos` (matching the chronos.so filename);
         // `chronos-ext` was the crate-derived name older builds registered under.
         return self::$loaded ??= (extension_loaded('chronos') || extension_loaded('chronos-ext'));
+    }
+
+    /**
+     * Process-level master switch: the extension is loaded AND configured on.
+     * Framework integrations gate listener installation on this, so a fleet-wide
+     * image with the .so baked in but CHRONOS_PHP_ENABLED unset costs an
+     * application nothing — no listeners, no middleware body, no FFI per query.
+     */
+    public static function enabled(): bool
+    {
+        if (!self::loaded()) {
+            return false;
+        }
+        if (self::$enabled === null) {
+            // chronos_setting() resolves env > php.ini (chronos.*) > .chronos file;
+            // older extensions predate it, where loaded implies "assume on" exactly
+            // as before.
+            $value = function_exists('chronos_setting')
+                ? \chronos_setting('CHRONOS_PHP_ENABLED')
+                : '1';
+            self::$enabled = in_array(strtolower($value), ['1', 'true', 'yes', 'on'], true);
+        }
+
+        return self::$enabled;
+    }
+
+    /**
+     * Whether a request is currently open in the native collector. Per-request
+     * truth (sampling aside): false when disabled, mis-configured, or CLI without
+     * CHRONOS_PHP_CLI_ENABLED. Bridges skip their per-request work when false.
+     */
+    public static function active(): bool
+    {
+        return self::loaded()
+            && function_exists('chronos_request_active')
+            && \chronos_request_active();
+    }
+
+    /**
+     * Whether THIS request's HTTP stack is being captured. Bridges ask before
+     * copying a response body across the FFI so an unsampled request never pays
+     * for the copy. Older extensions lack the probe; capture was unconditional
+     * there, so true preserves their behaviour.
+     */
+    public static function httpCapturing(): bool
+    {
+        if (!self::loaded()) {
+            return false;
+        }
+        if (!function_exists('chronos_http_capturing')) {
+            return true;
+        }
+
+        return \chronos_http_capturing();
     }
 
     /**
@@ -54,6 +110,13 @@ final class NativeExtension
             $routePattern,
             $serviceName,
         );
+        // When the collector declined the request (disabled, no envelope, CLI
+        // opt-out), the rest of this bridge's per-request work is pure overhead.
+        // Only a probe-capable extension can say so; an older .so keeps the
+        // unconditional behaviour it always had.
+        if (function_exists('chronos_request_active') && !\chronos_request_active()) {
+            return;
+        }
         SpanManager::reset();
         // The plan-capture budget is per REQUEST, but its counter is a static that
         // outlives one — same reason the span stack above needs resetting.

@@ -25,7 +25,7 @@ final class ChronosHttpKernel implements HttpKernelInterface
         int $type = self::MAIN_REQUEST,
         bool $catch = true,
     ): Response {
-        if ($type !== self::MAIN_REQUEST || !NativeExtension::loaded()) {
+        if ($type !== self::MAIN_REQUEST || !NativeExtension::enabled()) {
             return $this->kernel->handle($request, $type, $catch);
         }
 
@@ -45,6 +45,11 @@ final class ChronosHttpKernel implements HttpKernelInterface
             // Empty service name → native falls back to CHRONOS_PHP_APPLICATION.
             '',
         );
+        if (!NativeExtension::active()) {
+            // The collector declined this request — everything below would be FFI
+            // calls into no-ops.
+            return $this->kernel->handle($request, $type, $catch);
+        }
 
         // Framework identity for the `app.*` span attributes. Symfony exposes its
         // version as a Kernel constant; the app's own release stays config-driven.
@@ -91,6 +96,11 @@ final class ChronosHttpKernel implements HttpKernelInterface
     private function captureResponse(Response $response): void
     {
         try {
+            // getContent() copies the whole body; on an unsampled request the
+            // collector would drop it anyway, so don't pay for the copy.
+            if (!NativeExtension::httpCapturing()) {
+                return;
+            }
             if (!method_exists($response, 'getContent')) {
                 return;
             }

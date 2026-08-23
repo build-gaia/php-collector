@@ -45,9 +45,23 @@ spl_autoload_register(static function (string $class): void {
 /**
  * The conformance suite lives with the specification, not with any implementation, so that no
  * language is privileged. It is reached by relative path because the collector is a submodule of
- * the platform repository and the suite is a sibling of it.
+ * the platform repository and the suite is a sibling of it. A standalone checkout of the package
+ * (composer zipball, the published repo on its own) has no sibling spec tree — there the
+ * replay-conformance sections are SKIPPED, not failed: they verify the replay shim against the
+ * spec, which is monorepo CI's job, while the package's own unit sections always run.
+ * CHRONOS_CONFORMANCE_SUITE overrides the location explicitly.
  */
-const SUITE = __DIR__.'/../../../docs/specs/replay-protocol-conformance';
+const SUITE = __DIR__.'/../../../../../docs/specs/replay-protocol-conformance';
+
+function suiteDirectory(): ?string
+{
+    $override = getenv('CHRONOS_CONFORMANCE_SUITE');
+    if (is_string($override) && $override !== '' && is_dir($override)) {
+        return $override;
+    }
+
+    return is_dir(SUITE) ? SUITE : null;
+}
 
 final class Runner
 {
@@ -263,37 +277,44 @@ $runner = new Runner();
 
 // ── 1. Unit-level vectors ───────────────────────────────────────────────────────────────────
 
-$runner->test('digest vectors', static function (Runner $runner): void {
-    $vectors = readJson(SUITE.'/digest-vectors.json')['vectors'] ?? [];
-    $runner->assertTrue($vectors !== [], 'digest-vectors.json carries no vectors');
-    foreach ($vectors as $index => $vector) {
-        $runner->assertSame(
-            $vector['eventDigest'],
-            Canonical::eventDigest($vector['event']['kind'], $vector['event']['payload']),
-            sprintf('vector %d (%s)', $index, $vector['note'] ?? ''),
-        );
-    }
-});
+$suite = suiteDirectory();
+if ($suite === null) {
+    fwrite(STDOUT, "SKIP replay-conformance sections: spec suite not present (standalone package checkout; set CHRONOS_CONFORMANCE_SUITE to run them)\n");
+}
 
-$runner->test('selector vectors', static function (Runner $runner): void {
-    $vectors = readJson(SUITE.'/selector-vectors.json')['vectors'] ?? [];
-    $runner->assertTrue($vectors !== [], 'selector-vectors.json carries no vectors');
-    foreach ($vectors as $index => $vector) {
-        $runner->assertSame(
-            $vector['selector'],
-            Vocabulary::selectorFor($vector['channel'], $vector['payload']),
-            sprintf('vector %d (%s)', $index, $vector['note'] ?? ''),
-        );
-    }
-});
+if ($suite !== null) {
+    $runner->test('digest vectors', static function (Runner $runner) use ($suite): void {
+        $vectors = readJson($suite.'/digest-vectors.json')['vectors'] ?? [];
+        $runner->assertTrue($vectors !== [], 'digest-vectors.json carries no vectors');
+        foreach ($vectors as $index => $vector) {
+            $runner->assertSame(
+                $vector['eventDigest'],
+                Canonical::eventDigest($vector['event']['kind'], $vector['event']['payload']),
+                sprintf('vector %d (%s)', $index, $vector['note'] ?? ''),
+            );
+        }
+    });
+
+    $runner->test('selector vectors', static function (Runner $runner) use ($suite): void {
+        $vectors = readJson($suite.'/selector-vectors.json')['vectors'] ?? [];
+        $runner->assertTrue($vectors !== [], 'selector-vectors.json carries no vectors');
+        foreach ($vectors as $index => $vector) {
+            $runner->assertSame(
+                $vector['selector'],
+                Vocabulary::selectorFor($vector['channel'], $vector['payload']),
+                sprintf('vector %d (%s)', $index, $vector['note'] ?? ''),
+            );
+        }
+    });
+}
 
 // ── 2. Conformance cases ────────────────────────────────────────────────────────────────────
 
-$index = readJson(SUITE.'/cases.json');
+$index = $suite !== null ? readJson($suite.'/cases.json') : [];
 foreach ($index['cases'] ?? [] as $entry) {
     $case = (string) $entry['case'];
-    $runner->test('conformance '.$case, static function (Runner $runner) use ($case): void {
-        $caseDirectory = SUITE.'/cases/'.$case;
+    $runner->test('conformance '.$case, static function (Runner $runner) use ($case, $suite): void {
+        $caseDirectory = $suite.'/cases/'.$case;
         [$inputs, $report] = materialise($caseDirectory, $case);
         $before = fingerprint($inputs);
         try {

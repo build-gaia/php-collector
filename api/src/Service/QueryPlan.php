@@ -351,6 +351,14 @@ final class QueryPlan
                     return (string) $bag[$name];
                 }
             }
+            // The native settings layer adds php.ini (chronos.*) and the
+            // application's .chronos file as sources.
+            if (function_exists('chronos_setting')) {
+                $value = \chronos_setting($name);
+                if ($value !== '') {
+                    return $value;
+                }
+            }
         }
 
         return null;

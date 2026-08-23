@@ -21,7 +21,7 @@ final class RecordChronosRequest
 {
     public function handle(Request $request, Closure $next): mixed
     {
-        if (!NativeExtension::loaded()) {
+        if (!NativeExtension::enabled()) {
             return $next($request);
         }
 
@@ -45,6 +45,12 @@ final class RecordChronosRequest
             $routePattern,
             $serviceName,
         );
+        if (!NativeExtension::active()) {
+            // The collector declined this request (no identity envelope, or a CLI
+            // context without CHRONOS_PHP_CLI_ENABLED) — everything below would be
+            // FFI calls into no-ops.
+            return $next($request);
+        }
         // Language/framework/release identity for the `app.*` span attributes.
         // Resolved here rather than in the .so: only userland can read the
         // framework's version constant and the app's configured release.
@@ -107,6 +113,11 @@ final class RecordChronosRequest
     private function captureResponse(mixed $response): void
     {
         try {
+            // getContent() copies the whole body; on an unsampled request the
+            // collector would drop it anyway, so don't pay for the copy.
+            if (!NativeExtension::httpCapturing()) {
+                return;
+            }
             if (!is_object($response) || !method_exists($response, 'getContent')) {
                 return;
             }
