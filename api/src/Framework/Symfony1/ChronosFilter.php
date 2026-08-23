@@ -72,6 +72,12 @@ final class ChronosFilter extends \sfFilter
 
             NativeExtension::requestEnd($statusCode, $route ?? $request->getPathInfo(), null, true);
         } catch (Throwable $e) {
+            // The response object still holds whatever was set before the throw —
+            // usually headers only, since symfony renders its exception page after
+            // this filter unwinds. Capturing it anyway is what makes an errored
+            // request's Response tab exact rather than a headers_list() guess made
+            // before the framework flushed anything.
+            self::captureResponse($this->context);
             NativeExtension::requestEnd(500, $request->getPathInfo(), $e, false);
             throw $e;
         }
