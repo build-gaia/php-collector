@@ -22,7 +22,9 @@ final class NativeExtension
 
     public static function loaded(): bool
     {
-        return self::$loaded ??= extension_loaded('chronos-ext');
+        // The module registers as `chronos` (matching the chronos.so filename);
+        // `chronos-ext` was the crate-derived name older builds registered under.
+        return self::$loaded ??= (extension_loaded('chronos') || extension_loaded('chronos-ext'));
     }
 
     /**
