@@ -84,6 +84,11 @@ final class NativeExtension
             if (($manifest === false || $manifest === '') && isset($_SERVER['CHRONOS_PHP_INSTRUMENTATION_MANIFEST'])) {
                 $manifest = (string) $_SERVER['CHRONOS_PHP_INSTRUMENTATION_MANIFEST'];
             }
+            if (($manifest === false || $manifest === '') && function_exists('chronos_setting')) {
+                // The unified native settings layer also reads php.ini (chronos.*)
+                // and the application's .chronos file.
+                $manifest = \chronos_setting('CHRONOS_PHP_INSTRUMENTATION_MANIFEST');
+            }
             if (!is_string($manifest) || $manifest === '') {
                 return;
             }
