@@ -23,15 +23,20 @@ use Chronos\Collector\Replay\Answer;
 use Chronos\Collector\Replay\CallPath;
 use Chronos\Collector\Replay\MutationSweep;
 use Chronos\Collector\Replay\Canonical;
+use Chronos\Collector\Replay\DatabaseAnswer;
 use Chronos\Collector\Replay\Divergence;
 use Chronos\Collector\Replay\Effect;
 use Chronos\Collector\Replay\EffectPolicy;
+use Chronos\Collector\Replay\HttpAnswer;
 use Chronos\Collector\Replay\Lookup;
 use Chronos\Collector\Replay\ReplayBlocked;
 use Chronos\Collector\Replay\ReplayRuntime;
 use Chronos\Collector\Replay\ReplaySession;
 use Chronos\Collector\Replay\Report;
 use Chronos\Collector\Replay\Vocabulary;
+use Chronos\Collector\Framework\Guzzle\ImmediatePromise;
+use Chronos\Collector\Framework\Guzzle\ReplayMiddleware;
+use Chronos\Collector\Framework\Pdo\EffectConnection;
 
 spl_autoload_register(static function (string $class): void {
     $prefix = 'Chronos\\Collector\\';
@@ -662,6 +667,137 @@ $runner->test('ADR 0021 Phase 4: mutation sweep profiles rewrite recorded fixtur
     $runner->assertSame('', $byProfile[MutationSweep::PROFILE_HTTP_EMPTY_BODY][2]['payload']['body'], 'empty body');
     // Call-path events are preserved untouched.
     $runner->assertSame('App\\Go', $byProfile[MutationSweep::PROFILE_CLOCK_SKEW][3]['payload']['name'], 'call preserved');
+});
+
+$runner->test('ADR 0021 Phase 3: callPath lands on the replay report', static function (Runner $runner): void {
+    $inputs = sys_get_temp_dir().'/chronos-replay-callpath-'.bin2hex(random_bytes(4));
+    mkdir($inputs, 0o700, true);
+    $events = [
+        ['sequence' => 1, 'kind' => 'time', 'payload' => ['function' => 'time', 'result' => '100']],
+        ['sequence' => 2, 'kind' => 'call', 'payload' => ['name' => 'App\\A', 'depth' => '1']],
+        ['sequence' => 3, 'kind' => 'call', 'payload' => ['name' => 'App\\B', 'depth' => '2']],
+    ];
+    file_put_contents($inputs.'/manifest.json', json_encode(['recordingId' => 'rec-callpath', 'eventCount' => count($events)]));
+    file_put_contents($inputs.'/events.json', json_encode(['events' => $events]));
+    try {
+        ReplayRuntime::reset();
+        ReplayRuntime::useTerminator(static function (int $code): void {});
+        $session = ReplayRuntime::boot([
+            'CHRONOS_REPLAY_RECORDING' => 'rec-callpath',
+            'CHRONOS_REPLAY_INPUTS' => $inputs,
+            'CHRONOS_REPLAY_REPORT' => $inputs.'/report.json',
+        ]);
+        $runner->assertTrue($session !== null, 'session');
+        CallPath::note('App\\A', 1);
+        CallPath::note('App\\B-alt', 2);
+        Effect::time('time');
+        $code = $session->finish();
+        $runner->assertSame(0, $code, 'conformant despite observational calls');
+        $report = json_decode((string) file_get_contents($inputs.'/report.json'), true, 512, JSON_THROW_ON_ERROR);
+        $runner->assertSame(2, $report['callPath']['recordedCount'] ?? null, 'recorded frames');
+        $runner->assertSame(2, $report['callPath']['executedCount'] ?? null, 'executed frames');
+        $runner->assertSame(1, $report['callPath']['firstDivergence']['index'] ?? null, 'divergence index');
+        $runner->assertSame('App\\B', $report['callPath']['firstDivergence']['recorded']['name'] ?? null, 'recorded name');
+        $runner->assertSame('App\\B-alt', $report['callPath']['firstDivergence']['executed']['name'] ?? null, 'executed name');
+        $runner->assertSame(0, $report['counts']['unconsumed'] ?? -1, 'call events not unconsumed');
+    } finally {
+        ReplayRuntime::reset();
+        removeTree($inputs);
+    }
+});
+
+$runner->test('ADR 0021: HttpAnswer and Guzzle ReplayMiddleware consume fixtures', static function (Runner $runner): void {
+    $inputs = sys_get_temp_dir().'/chronos-replay-http-mw-'.bin2hex(random_bytes(4));
+    mkdir($inputs, 0o700, true);
+    $events = [
+        ['sequence' => 1, 'kind' => 'http_request', 'payload' => ['method' => 'GET', 'url' => 'https://api.example.test/v1/rate']],
+        ['sequence' => 2, 'kind' => 'http_response', 'payload' => ['status' => '503', 'body' => '', 'headers' => 'X-Chronos-Simulated: 1']],
+        ['sequence' => 3, 'kind' => 'http_request', 'payload' => ['method' => 'GET', 'url' => 'https://api.example.test/v1/rate']],
+        ['sequence' => 4, 'kind' => 'http_response', 'payload' => ['status' => '200', 'body' => '{"ok":true}']],
+    ];
+    file_put_contents($inputs.'/manifest.json', json_encode(['recordingId' => 'rec-http-mw', 'eventCount' => count($events)]));
+    file_put_contents($inputs.'/events.json', json_encode(['events' => $events]));
+    try {
+        ReplayRuntime::reset();
+        ReplayRuntime::useTerminator(static function (int $code): void {});
+        ReplayRuntime::boot([
+            'CHRONOS_REPLAY_RECORDING' => 'rec-http-mw',
+            'CHRONOS_REPLAY_INPUTS' => $inputs,
+            'CHRONOS_REPLAY_REPORT' => $inputs.'/report.json',
+            'CHRONOS_REPLAY_EFFECT_NETWORK_CALL' => 'replayed',
+        ]);
+        $payload = Effect::http('GET', 'https://api.example.test/v1/rate');
+        $runner->assertSame(503, HttpAnswer::status($payload ?? []), 'status');
+        $runner->assertSame('', HttpAnswer::body($payload ?? []), 'body');
+        $response = ReplayMiddleware::response($payload ?? []);
+        $runner->assertSame(503, $response->getStatusCode(), 'synthetic status');
+        $runner->assertSame('', (string) $response->getBody(), 'synthetic body');
+
+        $liveCalled = false;
+        $inner = static function () use (&$liveCalled) {
+            $liveCalled = true;
+
+            return new ImmediatePromise(new \stdClass());
+        };
+        $middleware = ReplayMiddleware::create()($inner);
+        $request = new class {
+            public function getMethod(): string
+            {
+                return 'GET';
+            }
+
+            public function getUri(): string
+            {
+                return 'https://api.example.test/v1/rate';
+            }
+        };
+        $promise = $middleware($request, []);
+        $response = $promise->wait();
+        $runner->assertSame(false, $liveCalled, 'live handler skipped');
+        $runner->assertSame(200, $response->getStatusCode(), 'replayed status');
+        $runner->assertSame('{"ok":true}', (string) $response->getBody(), 'replayed body');
+    } finally {
+        ReplayRuntime::reset();
+        removeTree($inputs);
+    }
+});
+
+$runner->test('ADR 0021: DatabaseAnswer and EffectConnection consume empty_database', static function (Runner $runner): void {
+    $base = [
+        ['sequence' => 1, 'kind' => 'database_query', 'payload' => ['statement' => 'SELECT id FROM users']],
+        ['sequence' => 2, 'kind' => 'database_result', 'payload' => ['rows' => [['id' => '1']], 'rowCount' => '1']],
+        ['sequence' => 3, 'kind' => 'database_query', 'payload' => ['statement' => 'SELECT id FROM users']],
+        ['sequence' => 4, 'kind' => 'database_result', 'payload' => ['rows' => [['id' => '2']], 'rowCount' => '1']],
+    ];
+    $mutated = MutationSweep::apply($base, MutationSweep::PROFILE_EMPTY_DATABASE);
+    $runner->assertTrue($mutated !== null, 'empty_database applies');
+    $inputs = sys_get_temp_dir().'/chronos-replay-pdo-'.bin2hex(random_bytes(4));
+    mkdir($inputs, 0o700, true);
+    file_put_contents($inputs.'/manifest.json', json_encode(['recordingId' => 'rec-pdo', 'eventCount' => count($mutated)]));
+    file_put_contents($inputs.'/events.json', json_encode(['events' => $mutated]));
+    try {
+        ReplayRuntime::reset();
+        ReplayRuntime::useTerminator(static function (int $code): void {});
+        ReplayRuntime::boot([
+            'CHRONOS_REPLAY_RECORDING' => 'rec-pdo',
+            'CHRONOS_REPLAY_INPUTS' => $inputs,
+            'CHRONOS_REPLAY_REPORT' => $inputs.'/report.json',
+            'CHRONOS_REPLAY_EFFECT_DATABASE_READ' => 'replayed',
+        ]);
+        $payload = Effect::database('SELECT id FROM users');
+        $runner->assertSame([], DatabaseAnswer::rows($payload ?? []), 'empty rows');
+        $runner->assertSame(0, DatabaseAnswer::rowCount($payload ?? []), 'rowCount 0');
+
+        $pdo = new \PDO('sqlite::memory:');
+        $conn = new EffectConnection($pdo);
+        $stmt = $conn->query('SELECT id FROM users');
+        $runner->assertTrue($stmt !== false, 'statement');
+        $runner->assertSame([], $stmt->fetchAll(), 'fetchAll empty');
+        $runner->assertSame(0, $stmt->rowCount(), 'statement rowCount');
+    } finally {
+        ReplayRuntime::reset();
+        removeTree($inputs);
+    }
 });
 
 

@@ -23,10 +23,18 @@ driver or a socket. Everything language-specific lives above it, in exactly two 
 | `Report.php` | writes the report, with the stderr fallback (§9) |
 | `ReplayRuntime.php` | process bootstrap, shutdown handler, exit-code override |
 | `Effect.php` | what application code and interception layers call |
-| `CallPath.php` | extract `call` visits from a recording; first-divergence for ADR 0021 Phase 3 |
+| `CallPath.php` | extract `call` visits from a recording; first-divergence for ADR 0021 Phase 3; report fragment |
 | `MutationSweep.php` | bounded recording mutations for ADR 0021 Phase 4 agent sweeps |
+| `HttpAnswer.php` / `DatabaseAnswer.php` | normalise Effect payloads for HTTP / SQL adapters |
 | `bootstrap.php` | `auto_prepend_file` entry point for a replay image |
 | `ReplayBlocked.php` / `ReplayAborted.php` | the two ways a lookup refuses to produce a value |
+
+Userland adapters (not protocol):
+
+| File | Role |
+| --- | --- |
+| `Framework/Guzzle/ReplayMiddleware.php` | short-circuit outbound HTTP via `Effect::http` |
+| `Framework/Pdo/EffectConnection.php` | PDO decorator answering SQL via `Effect::database` |
 
 ## The three decisions worth knowing before reading the code
 
@@ -89,8 +97,12 @@ which is exactly what replay needs. The concrete asks against the native crate, 
 1. **Done (scalars):** `chronos_replay_arm()` swaps handlers for time/random/getenv; hooks call
    `chronos_replay_effect_delegate($kind, $selector)` → `Effect`. See `native/src/replay_hooks.rs`
    and `replay/testdata/phase1b/`.
-2. **Still needed:** PDO / curl / file handler overrides (non-scalar returns).
-3. The functions worth arming next, with the channel and selector each maps to:
+2. **Done (userland HTTP/SQL):** `Framework/Guzzle/ReplayMiddleware` and
+   `Framework/Pdo/EffectConnection` consume mutated HTTP/DB fixtures without native non-scalar
+   hooks. Wire them in the app container / HandlerStack.
+3. **Still needed:** native PDO / curl / file handler overrides for apps that do not use those
+   seams.
+4. The functions worth arming next, with the channel and selector each maps to:
 
    | Native symbols | Channel | Selector |
    | --- | --- | --- |
@@ -102,12 +114,14 @@ which is exactly what replay needs. The concrete asks against the native crate, 
    | `file_get_contents`, `fopen`, `fwrite` | `file` | the path |
 
    `PDO`/`PDOStatement` is the hard one and the most valuable: substituting a result set means
-   returning a synthetic statement object, not a scalar. Until it exists, a Laravel application is
-   better served by a userland PDO wrapper bound in the container.
+   returning a synthetic statement object, not a scalar. Until native overrides exist,
+   `Framework/Pdo/EffectConnection` is the container-bound seam.
 
-4. Redis and the queue need no native hook: `Framework/Predis/ChronosPredisClient` and Laravel's
+5. Redis and the queue need no native hook: `Framework/Predis/ChronosPredisClient` and Laravel's
    queue connector are already userland seams that can call `Effect::cache()` and
    `Effect::queue()`.
 
-Nothing in this list changes the protocol. Every one of these is a way of getting a call to
-`Effect`; the contract underneath is finished.
+Phase 3 report hook: when the recording carries `kind=call` events and the replay notes an
+executed path (`CallPath::note` or `CHRONOS_REPLAY_CALL_PATH_EXECUTED` JSON file), the report
+gains a `callPath` object with `firstDivergence`. Observational `call` events are excluded from
+unconsumed accounting.

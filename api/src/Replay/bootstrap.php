@@ -32,6 +32,7 @@ foreach ([
     'Recording.php',
     'EffectPolicy.php',
     'Report.php',
+    'CallPath.php',
     'ReplaySession.php',
     'ReplayRuntime.php',
     'ReplayBlocked.php',

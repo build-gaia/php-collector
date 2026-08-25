@@ -117,6 +117,7 @@ final class ReplayRuntime
         self::$session = null;
         self::$booted = false;
         self::$terminator = null;
+        CallPath::resetExecuted();
     }
 
     /**
@@ -141,10 +142,6 @@ final class ReplayRuntime
 
 
     /**
-     * Arm chronos.so scalar overrides so `time()` / `mt_rand()` / `getenv()` route through Effect.
-     * No-op when the native extension is absent (Phase 1 fixtures call Effect directly).
-     */
-        /**
      * Arm chronos.so scalar overrides so `time()` / `mt_rand()` / `getenv()` route through Effect.
      * No-op when the native extension is absent (Phase 1 fixtures call Effect directly).
      */
