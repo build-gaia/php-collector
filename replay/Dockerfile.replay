@@ -1,0 +1,102 @@
+# Chronos replay image for a PHP application.
+#
+# Builds an image that carries the application's code plus the Chronos replay shim armed in
+# replay mode, suitable for CHRONOS_SCHEDULER_REPLAY_IMAGE. The build CONTEXT is the
+# application repository (mercury: the path MERCURY_DIR resolves to in ~/code/docker-images),
+# not the collector — the shim arrives through the application's own vendor tree, so the image
+# is the application's image with one ini file and one entrypoint added.
+#
+# Parameterised on purpose. Nothing below is specific to mercury except the defaults: another
+# PHP application on another base image is the same three build arguments.
+#
+# Read the sandbox constraints before changing anything here (ADR 0015, scheduler
+# internal/executor/docker.go): the container runs --read-only, --network none, --cap-drop ALL,
+# --user 65532:65532, with /workspace as the only writable bind mount and /tmp as a bounded
+# noexec tmpfs. An image that needs to write anywhere else does not run at all.
+
+# The base image is pinned by digest and the digest has no default. That is the enforcement:
+# executor.Docker refuses a non-digest-pinned image with ErrMutableImage, so an image built on
+# a floating tag would be rejected at launch — better for the build to fail here, where the
+# person who can fix it is watching.
+ARG PHP_BASE=009103122343.dkr.ecr.eu-west-2.amazonaws.com/apps/mercury
+ARG PHP_BASE_DIGEST
+
+FROM ${PHP_BASE}@${PHP_BASE_DIGEST}
+
+# Where the application lives inside the base image, and where its Composer vendor tree is.
+# mercury's base image sets APP=mercury and COMPOSER_VENDOR_DIR=/opt/composer/vendor, and
+# symlinks the app's vendor/ at that path.
+ARG APP_ROOT=/srv/www/mercury/local
+ARG VENDOR_DIR=/opt/composer/vendor
+ARG SHIM=${VENDOR_DIR}/build-gaia/php-collector/api/src/Replay/bootstrap.php
+
+LABEL org.opencontainers.image.title="chronos-replay-mercury"
+LABEL org.opencontainers.image.description="Application code plus the Chronos replay shim, for the replay sandbox"
+
+WORKDIR ${APP_ROOT}
+COPY . ${APP_ROOT}
+
+# The application's own dependencies, with no dev tree: the replay sandbox runs the
+# application, not its test suite.
+RUN composer install --no-dev --no-ansi --no-interaction --optimize-autoloader
+
+# Fail the build if the shim is not where the ini file is about to point. An image whose
+# auto_prepend_file does not exist starts fine, replays nothing, writes no report and exits 0 —
+# a green run that proved nothing, which is the one outcome worth spending a build step to avoid.
+RUN test -f "${SHIM}" || { \
+        echo "the Chronos replay shim is not at ${SHIM}; check that build-gaia/php-collector is required and that VENDOR_DIR is right" >&2; \
+        exit 1; \
+    }
+
+# Bake everything Laravel would otherwise write on first boot. A read-only rootfs means
+# bootstrap/cache has to be populated at build time or the very first request dies trying to
+# discover packages — and it would die before the shim could report anything, which reads to an
+# operator as a broken plan rather than as a broken image.
+RUN touch .env \
+    && php artisan key:generate --force \
+    && php artisan package:discover --ansi \
+    && chmod -R a-w bootstrap/cache
+
+# Replay-mode PHP configuration.
+#
+# auto_prepend_file rather than a framework hook: the recording has to be discovered and the
+# report armed before any application code runs, so that a fatal inside the framework's own
+# bootstrap still produces a report.
+RUN printf '%s\n' \
+    "auto_prepend_file=${SHIM}" \
+    'display_errors=Off' \
+    'log_errors=On' \
+    'error_log=/dev/stderr' \
+    'opcache.enable_cli=1' \
+    'opcache.validate_timestamps=0' \
+    > "$(php -r 'echo PHP_CONFIG_FILE_SCAN_DIR;')/zz-chronos-replay.ini"
+
+# Telemetry off, hard. The protocol's own non-goal: a replay MUST NOT write a recording, and
+# capturing a replay's effects is a separate feature with a separate capture policy. Leaving the
+# collector armed would spool spans for a run that never happened.
+ENV CHRONOS_PHP_ENABLED=false
+ENV DD_TRACE_ENABLED=0
+ENV DD_PROFILING_ENABLED=0
+
+# Laravel writes logs, sessions, framework caches and compiled views under storage/. Pointed at
+# the workspace bind mount, which is the only writable path that survives the container — so the
+# replay's own artefacts land next to its report instead of vanishing with /tmp.
+ENV LARAVEL_STORAGE_PATH=/workspace/storage
+ENV APP_ENV=replay
+ENV APP_DEBUG=false
+ENV LOG_CHANNEL=stderr
+
+# The report's default location, stated explicitly so it is visible in `docker inspect` rather
+# than only in the protocol.
+ENV CHRONOS_REPLAY_REPORT=/workspace/chronos-replay-report.json
+
+# From a NAMED build context, because the build context proper is the application repository and
+# this script lives with the protocol implementation. Keeping it a reviewable file rather than an
+# inlined heredoc is worth the extra --build-context argument.
+COPY --from=chronos-replay --chmod=0555 chronos-replay-entrypoint.sh /usr/local/bin/chronos-replay-entrypoint
+
+# 65532:65532 is the uid the executor forces. Declared here too so a local `docker run` of this
+# image hits the same permissions the sandbox will, instead of passing as root and failing later.
+USER 65532:65532
+
+ENTRYPOINT ["/usr/local/bin/chronos-replay-entrypoint"]
