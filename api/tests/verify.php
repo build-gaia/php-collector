@@ -36,6 +36,7 @@ use Chronos\Collector\Replay\Report;
 use Chronos\Collector\Replay\Vocabulary;
 use Chronos\Collector\Framework\Guzzle\ImmediatePromise;
 use Chronos\Collector\Framework\Guzzle\ReplayMiddleware;
+use Chronos\Collector\Framework\Laravel\RequestFacts;
 use Chronos\Collector\Framework\Pdo\EffectConnection;
 
 spl_autoload_register(static function (string $class): void {
@@ -829,6 +830,66 @@ $runner->test('ADR 0021: ReplayRuntime arms native scalar hooks when extension p
         ReplayRuntime::reset();
         removeTree($inputs);
     }
+});
+
+$runner->test('Laravel request facts hydrate the root with names and counts only', static function (Runner $runner): void {
+    RequestFacts::reset();
+    RequestFacts::noteView('users.show');
+    RequestFacts::noteView('users.show');
+    RequestFacts::noteView('layouts.app');
+    RequestFacts::noteModel('App\\Models\\User');
+    RequestFacts::noteModel('App\\Models\\User');
+    RequestFacts::noteModel('App\\Models\\User');
+    RequestFacts::noteMail('App\\Mail\\Welcome');
+    RequestFacts::noteJob('App\\Jobs\\IndexUser', 'default');
+    RequestFacts::noteGate('update', true);
+    RequestFacts::noteGate('update', true);
+    RequestFacts::noteGate('delete', false);
+    RequestFacts::noteEvent('App\\Events\\UserViewed');
+    RequestFacts::noteEvent('Illuminate\\Database\\Events\\QueryExecuted');
+    RequestFacts::noteEvent('composing: users.show');
+
+    $attributes = RequestFacts::snapshot(RequestFacts::identity(
+        routeName: 'users.show',
+        routeAction: 'App\\Http\\Controllers\\UserController@show',
+        middleware: ['web', 'auth'],
+        userId: '42',
+        guard: 'web',
+        peakMemoryBytes: 8_388_608,
+    ));
+
+    $runner->assertSame('users.show', $attributes['http.route.name'] ?? null, 'route name');
+    $runner->assertSame('App\\Http\\Controllers\\UserController@show', $attributes['http.route.action'] ?? null, 'action');
+    $runner->assertSame('["web","auth"]', $attributes['http.route.middleware'] ?? null, 'middleware');
+    $runner->assertSame('42', $attributes['enduser.id'] ?? null, 'user id');
+    $runner->assertSame('web', $attributes['enduser.guard'] ?? null, 'guard');
+    $runner->assertSame('8388608', $attributes['process.runtime.php.memory.peak_bytes'] ?? null, 'peak memory');
+    $runner->assertSame('{"users.show":2,"layouts.app":1}', $attributes['laravel.views'] ?? null, 'views');
+    $runner->assertSame('{"App\\\\Models\\\\User":3}', $attributes['laravel.models'] ?? null, 'models');
+    $runner->assertSame('{"App\\\\Mail\\\\Welcome":1}', $attributes['laravel.mail'] ?? null, 'mail');
+    $runner->assertSame('{"App\\\\Jobs\\\\IndexUser@default":1}', $attributes['laravel.jobs'] ?? null, 'jobs');
+    $runner->assertSame('{"update:allow":2,"delete:deny":1}', $attributes['laravel.gates'] ?? null, 'gates');
+    $runner->assertSame('{"App\\\\Events\\\\UserViewed":1}', $attributes['laravel.events'] ?? null, 'app events only');
+    $runner->assertTrue(!isset($attributes['laravel.views.truncated']), 'no truncation flag when under cap');
+});
+
+$runner->test('Laravel request facts stop tracking new names after the unique cap', static function (Runner $runner): void {
+    RequestFacts::reset();
+    for ($i = 0; $i < 40; ++$i) {
+        RequestFacts::noteView('view-'.$i);
+    }
+    RequestFacts::noteView('view-0');
+    $attributes = RequestFacts::snapshot();
+    $views = json_decode($attributes['laravel.views'] ?? '[]', true);
+    $runner->assertSame(32, is_array($views) ? count($views) : 0, 'unique cap');
+    $runner->assertSame(2, is_array($views) ? ($views['view-0'] ?? 0) : 0, 'known names still count');
+    $runner->assertSame('true', $attributes['laravel.views.truncated'] ?? null, 'truncated');
+});
+
+$runner->test('Laravel request facts omit empty identity rather than writing blank keys', static function (Runner $runner): void {
+    RequestFacts::reset();
+    $attributes = RequestFacts::snapshot(RequestFacts::identity());
+    $runner->assertSame([], $attributes, 'empty request writes nothing');
 });
 
 exit($runner->finish());
