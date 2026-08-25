@@ -27,6 +27,7 @@ pub mod log_spool;
 pub mod metrics_spool;
 pub mod observer;
 pub mod profile_spool;
+pub mod request_attributes;
 pub mod replay_hooks;
 pub mod sampler;
 pub mod settings;
@@ -235,6 +236,7 @@ fn start_request(
 
     observer::set_request_context(context.clone());
     log_spool::reset();
+    request_attributes::reset();
 
     // Full HTTP stack capture rides the head-sampling decision for the same reason
     // profiling does: an unsampled request has no span to hang headers off, so
@@ -315,6 +317,21 @@ fn enrich_request(
     }
 }
 
+/// PHP-callable: merge extra attributes onto the request root span that will be
+/// written at `chronos_request_end`. Framework bridges use this for facts the
+/// .so cannot observe — route action, authenticated user id, view/model counts.
+///
+/// Last write wins per key. Empty keys/values are ignored. New keys beyond the
+/// cap are dropped; overwriting an existing key always lands. No-op when the
+/// collector is inert for this request.
+#[php_function]
+pub fn chronos_set_request_attributes(attributes: std::collections::HashMap<String, String>) {
+    if REQUEST_CONFIG.with(|c| c.borrow().is_none()) {
+        return;
+    }
+    request_attributes::merge(attributes);
+}
+
 /// PHP-callable: declare the observed application's language/framework/release
 /// identity for this request. Called by the SDK's framework bridge right after
 /// `chronos_request_start`, because only userland can cheaply read `PHP_VERSION`
@@ -387,6 +404,7 @@ pub fn chronos_request_end(
     let errored = !error_type.is_empty();
 
     let sampled = context.as_ref().map(|c| c.sampled).unwrap_or(false);
+    let extra_attributes = request_attributes::take();
     if config.apm_enabled && sampled {
         let mut spans = observer::drain();
         if let Some(ctx) = &context {
@@ -434,6 +452,7 @@ pub fn chronos_request_end(
             attributes.extend(http_capture::drain(
                 request_end_ns.saturating_sub(request_start_ns),
             ));
+            attributes.extend(extra_attributes);
             let root = observer::root_http_span(
                 ctx,
                 &route_pattern,
@@ -808,6 +827,7 @@ pub fn module(module: ModuleBuilder) -> ModuleBuilder {
         .request_shutdown_function(request_shutdown)
         .function(wrap_function!(chronos_request_start))
         .function(wrap_function!(chronos_set_app_metadata))
+        .function(wrap_function!(chronos_set_request_attributes))
         .function(wrap_function!(chronos_request_end))
         .function(wrap_function!(chronos_record_span))
         .function(wrap_function!(chronos_capture_log))
