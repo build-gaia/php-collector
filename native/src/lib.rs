@@ -27,6 +27,7 @@ pub mod log_spool;
 pub mod metrics_spool;
 pub mod observer;
 pub mod profile_spool;
+pub mod replay_hooks;
 pub mod sampler;
 pub mod settings;
 pub mod spool;
@@ -683,6 +684,14 @@ pub fn chronos_record_dst(kind: String, payload: std::collections::HashMap<Strin
     dst_spool::record(event_kind, payload.into_iter().collect());
 }
 
+
+/// PHP-callable: arm scalar builtin overrides for replay (time/random/getenv → Effect).
+/// Requires userland `chronos_replay_effect_delegate($kind, $selector)` from bootstrap.
+#[php_function]
+pub fn chronos_replay_arm() {
+    replay_hooks::arm();
+}
+
 /// PHP-callable: whether a request is currently open in the collector. False when
 /// the collector is disabled, mis-configured (no identity envelope), or the process
 /// is CLI without `CHRONOS_PHP_CLI_ENABLED`. The SDK bridges gate their per-request
@@ -806,6 +815,7 @@ pub fn module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(chronos_suppress_native))
         .function(wrap_function!(chronos_trace_function))
         .function(wrap_function!(chronos_record_dst))
+        .function(wrap_function!(chronos_replay_arm))
         .function(wrap_function!(chronos_request_active))
         .function(wrap_function!(chronos_http_capturing))
         .function(wrap_function!(chronos_setting))

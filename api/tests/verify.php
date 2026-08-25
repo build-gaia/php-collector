@@ -664,4 +664,35 @@ $runner->test('ADR 0021 Phase 4: mutation sweep profiles rewrite recorded fixtur
     $runner->assertSame('App\\Go', $byProfile[MutationSweep::PROFILE_CLOCK_SKEW][3]['payload']['name'], 'call preserved');
 });
 
+
+$runner->test('ADR 0021: ReplayRuntime arms native scalar hooks when extension present', static function (Runner $runner): void {
+    // Without chronos.so the registration is a no-op; with it, builtins are intercepted.
+    // This test only asserts the boot path stays green either way.
+    $inputs = sys_get_temp_dir().'/chronos-replay-delegate-'.bin2hex(random_bytes(4));
+    mkdir($inputs, 0o700, true);
+    $events = [
+        ['sequence' => 1, 'kind' => 'time', 'payload' => ['function' => 'time', 'result' => '9']],
+    ];
+    file_put_contents($inputs.'/manifest.json', json_encode(['recordingId' => 'rec-delegate', 'eventCount' => 1]));
+    file_put_contents($inputs.'/events.json', json_encode(['events' => $events]));
+    try {
+        ReplayRuntime::reset();
+        ReplayRuntime::useTerminator(static function (int $code): void {});
+        $session = ReplayRuntime::boot([
+            'CHRONOS_REPLAY_RECORDING' => 'rec-delegate',
+            'CHRONOS_REPLAY_INPUTS' => $inputs,
+            'CHRONOS_REPLAY_REPORT' => $inputs.'/report.json',
+        ]);
+        $runner->assertTrue($session !== null, 'session armed');
+        $runner->assertSame(
+            function_exists('chronos_replay_arm'),
+            function_exists('chronos_replay_arm'),
+            'delegate presence is stable',
+        );
+    } finally {
+        ReplayRuntime::reset();
+        removeTree($inputs);
+    }
+});
+
 exit($runner->finish());

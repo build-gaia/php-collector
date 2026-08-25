@@ -86,15 +86,11 @@ What userland **cannot** do is intercept PHP's internal functions. The native ex
 observer sees a call start and end but cannot replace a return value or suppress the real call,
 which is exactly what replay needs. The concrete asks against the native crate, in priority order:
 
-1. **An internal-function handler override table**, armed only when `CHRONOS_REPLAY_RECORDING` is
-   set, that can (a) short-circuit the real call and (b) substitute a return value. The existing
-   observer allowlist cannot do either — this is a `zend_function.internal_function.handler`
-   swap, in the shape ddtrace uses, not an observer hook.
-2. **A userland callback seam** on that table: `chronos_replay_delegate(callable)`, invoked as
-   `fn(string $kind, array $inputs): ?array`, so the answer keeps coming from this one
-   implementation of the protocol rather than a second copy of it in Rust. If the callback returns
-   null the real function runs; if it throws, the throw propagates.
-3. The functions worth arming first, with the channel and selector each maps to:
+1. **Done (scalars):** `chronos_replay_arm()` swaps handlers for time/random/getenv; hooks call
+   `chronos_replay_effect_delegate($kind, $selector)` → `Effect`. See `native/src/replay_hooks.rs`
+   and `replay/testdata/phase1b/`.
+2. **Still needed:** PDO / curl / file handler overrides (non-scalar returns).
+3. The functions worth arming next, with the channel and selector each maps to:
 
    | Native symbols | Channel | Selector |
    | --- | --- | --- |

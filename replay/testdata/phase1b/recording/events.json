@@ -1,0 +1,20 @@
+{
+  "events": [
+    {
+      "sequence": 1,
+      "timestamp": "2026-08-21T09:01:00.000000Z",
+      "kind": "time",
+      "payload": { "function": "time", "result": "1755772800" },
+      "payloadDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "redaction": "capped"
+    },
+    {
+      "sequence": 2,
+      "timestamp": "2026-08-21T09:01:00.100000Z",
+      "kind": "random",
+      "payload": { "function": "mt_rand", "result": "42" },
+      "payloadDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "redaction": "capped"
+    }
+  ]
+}

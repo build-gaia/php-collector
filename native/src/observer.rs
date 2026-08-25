@@ -1180,7 +1180,7 @@ pub fn take_pending_traceparent() -> Option<String> {
 }
 
 #[cfg(feature = "zend-observer")]
-mod zend_helpers {
+pub(crate) mod zend_helpers {
     use std::ffi::CStr;
 
     pub unsafe fn function_name(
