@@ -21,6 +21,7 @@ namespace Chronos\Collector\Tests;
 
 use Chronos\Collector\Replay\Answer;
 use Chronos\Collector\Replay\CallPath;
+use Chronos\Collector\Replay\MutationSweep;
 use Chronos\Collector\Replay\Canonical;
 use Chronos\Collector\Replay\Divergence;
 use Chronos\Collector\Replay\Effect;
@@ -635,6 +636,32 @@ $runner->test('ADR 0021 Phase 2: call path extract and first divergence', static
     $runner->assertSame('App\\Billing\\Charge::fallback', $divergence['executed']['name'], 'executed frame');
 
     $runner->assertSame(null, CallPath::firstDivergence($recorded, $recorded), 'identical paths');
+});
+
+
+$runner->test('ADR 0021 Phase 4: mutation sweep profiles rewrite recorded fixtures', static function (Runner $runner): void {
+    $events = [
+        ['sequence' => 1, 'kind' => 'time', 'payload' => ['function' => 'time', 'result' => '1000']],
+        ['sequence' => 2, 'kind' => 'database_result', 'payload' => ['rows' => [['id' => 1]], 'rowCount' => '1']],
+        ['sequence' => 3, 'kind' => 'http_response', 'payload' => ['status' => '200', 'body' => '{"ok":true}']],
+        ['sequence' => 4, 'kind' => 'call', 'payload' => ['name' => 'App\\Go', 'depth' => '1']],
+    ];
+    $variants = MutationSweep::expand($events);
+    $profiles = array_column($variants, 'profile');
+    $runner->assertTrue(in_array(MutationSweep::PROFILE_CLOCK_SKEW, $profiles, true), 'clock skew');
+    $runner->assertTrue(in_array(MutationSweep::PROFILE_EMPTY_DATABASE, $profiles, true), 'empty db');
+    $runner->assertTrue(in_array(MutationSweep::PROFILE_HTTP_5XX, $profiles, true), 'http 5xx');
+
+    $byProfile = [];
+    foreach ($variants as $variant) {
+        $byProfile[$variant['profile']] = $variant['events'];
+    }
+    $runner->assertSame('4600', $byProfile[MutationSweep::PROFILE_CLOCK_SKEW][0]['payload']['result'], 'skew +1h');
+    $runner->assertSame([], $byProfile[MutationSweep::PROFILE_EMPTY_DATABASE][1]['payload']['rows'], 'empty rows');
+    $runner->assertSame('503', $byProfile[MutationSweep::PROFILE_HTTP_5XX][2]['payload']['status'], '503');
+    $runner->assertSame('', $byProfile[MutationSweep::PROFILE_HTTP_EMPTY_BODY][2]['payload']['body'], 'empty body');
+    // Call-path events are preserved untouched.
+    $runner->assertSame('App\\Go', $byProfile[MutationSweep::PROFILE_CLOCK_SKEW][3]['payload']['name'], 'call preserved');
 });
 
 exit($runner->finish());

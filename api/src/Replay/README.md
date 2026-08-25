@@ -24,6 +24,7 @@ driver or a socket. Everything language-specific lives above it, in exactly two 
 | `ReplayRuntime.php` | process bootstrap, shutdown handler, exit-code override |
 | `Effect.php` | what application code and interception layers call |
 | `CallPath.php` | extract `call` visits from a recording; first-divergence for ADR 0021 Phase 3 |
+| `MutationSweep.php` | bounded recording mutations for ADR 0021 Phase 4 agent sweeps |
 | `bootstrap.php` | `auto_prepend_file` entry point for a replay image |
 | `ReplayBlocked.php` / `ReplayAborted.php` | the two ways a lookup refuses to produce a value |
 
