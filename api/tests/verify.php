@@ -20,6 +20,7 @@ declare(strict_types=1);
 namespace Chronos\Collector\Tests;
 
 use Chronos\Collector\Replay\Answer;
+use Chronos\Collector\Replay\CallPath;
 use Chronos\Collector\Replay\Canonical;
 use Chronos\Collector\Replay\Divergence;
 use Chronos\Collector\Replay\Effect;
@@ -611,6 +612,29 @@ $runner->test('ADR 0021 Phase 1: fixture app runs under the replay shim', static
     } finally {
         removeTree($workspace);
     }
+});
+
+
+$runner->test('ADR 0021 Phase 2: call path extract and first divergence', static function (Runner $runner): void {
+    $events = [
+        ['kind' => 'time', 'payload' => ['function' => 'time', 'result' => '1']],
+        ['kind' => 'call', 'payload' => ['name' => 'App\\Http\\Kernel::handle', 'depth' => '1']],
+        ['kind' => 'call', 'payload' => ['name' => 'App\\Http\\Controllers\\Checkout::store', 'depth' => '2']],
+        ['kind' => 'call', 'payload' => ['name' => 'App\\Billing\\Charge::run', 'depth' => '3']],
+    ];
+    $recorded = CallPath::fromEvents($events);
+    $runner->assertSame(3, count($recorded), 'call visits only');
+    $runner->assertSame('App\\Http\\Kernel::handle', $recorded[0]['name'], 'first frame');
+
+    $executed = $recorded;
+    $executed[2] = ['name' => 'App\\Billing\\Charge::fallback', 'depth' => 3];
+    $divergence = CallPath::firstDivergence($recorded, $executed);
+    $runner->assertTrue($divergence !== null, 'divergence found');
+    $runner->assertSame(2, $divergence['index'], 'first divergent index');
+    $runner->assertSame('App\\Billing\\Charge::run', $divergence['recorded']['name'], 'recorded frame');
+    $runner->assertSame('App\\Billing\\Charge::fallback', $divergence['executed']['name'], 'executed frame');
+
+    $runner->assertSame(null, CallPath::firstDivergence($recorded, $recorded), 'identical paths');
 });
 
 exit($runner->finish());

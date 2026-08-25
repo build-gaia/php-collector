@@ -111,6 +111,8 @@ forwarder as a sidecar (or host daemon) pointing at the same directory. See
 | `profile_sample_rate` | `CHRONOS_PHP_PROFILE_SAMPLE_RATE` | `99` Hz |
 | `dst_enabled` | `CHRONOS_PHP_DST_ENABLED` | `0` (lab/CLI only; ignored when `CHRONOS_PHP_ENV=production` — use `x-chronos-dst` / `chronos_dst`) |
 | `env` | `CHRONOS_PHP_ENV` | — (`production`/`prod` refuses process-wide DST) |
+| `dst_call_path_max` | `CHRONOS_PHP_DST_CALL_PATH_MAX` | `4096` (DST-gated first-party call visits) |
+| `dst_call_path_max_depth` | `CHRONOS_PHP_DST_CALL_PATH_MAX_DEPTH` | `64` |
 | `runtime_metrics_enabled` | `CHRONOS_PHP_RUNTIME_METRICS_ENABLED` | `0` |
 | `cli_enabled` | `CHRONOS_PHP_CLI_ENABLED` | `0` |
 | `http_capture` / `http_capture_bodies` | `CHRONOS_PHP_HTTP_CAPTURE` / `_BODIES` | `1` |
