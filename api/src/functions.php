@@ -16,20 +16,44 @@ declare(strict_types=1);
 
 namespace Chronos;
 
+use Chronos\Collector\Service\NativeExtension;
 use Chronos\Collector\Service\SpanDecorations;
 
 if (!function_exists('Chronos\\trace_method')) {
     /**
-     * Register a span decoration for $class::$method. The decorator is invoked with the child span and
-     * the call arguments when the method is entered through the call-through path
-     * (SpanManager::callThrough), and, once the native extension is installed, transparently on every
-     * call. Registration itself never invokes anything and never throws.
+     * Register a span decoration for $class::$method (or a plain function when $class is '').
      *
-     * @param callable $decorator function(\Chronos\Collector\Service\Span $span, array $arguments): void
+     * Two things happen, matching the two capture paths:
+     *   1. The decorator (if any) lands in the SpanDecorations registry, so the userland
+     *      call-through path (SpanManager::callThrough) can invoke it with the child span.
+     *   2. The qualified name is registered into the NATIVE extension's span allowlist
+     *      (chronos_trace_function), so the Zend observer emits a span for every call —
+     *      transparently, with no app-code change — tagged chronos.instrumented=manifest.
+     *
+     * v1 LIMITATION: the native observer cannot invoke PHP decorator callbacks from inside
+     * its span capture — a natively-intercepted call yields a span with timing + name only.
+     * Decorator-added attributes (user.id, order.* …) appear only when the call is routed
+     * through SpanManager::callThrough. Do not expect decorator attributes on native spans.
+     *
+     * Registration itself never invokes anything and never throws.
+     *
+     * @param ?callable $decorator function(\Chronos\Collector\Service\Span $span, array $arguments): void
      */
-    function trace_method(string $class, string $method, callable $decorator): void
+    function trace_method(string $class, string $method, ?callable $decorator = null): void
     {
-        SpanDecorations::register($class, $method, $decorator);
+        try {
+            if ($decorator !== null && $class !== '') {
+                SpanDecorations::register($class, $method, $decorator);
+            }
+            $class = ltrim(trim($class), '\\');
+            $method = trim($method);
+            if ($method === '') {
+                return;
+            }
+            NativeExtension::traceFunction($class === '' ? $method : $class.'::'.$method);
+        } catch (\Throwable) {
+            // Instrumentation registration must never take down the application.
+        }
     }
 }
 
@@ -37,13 +61,15 @@ if (!function_exists('Chronos\\load_instrumentation')) {
     /**
      * Load an application instrumentation manifest — a plain PHP file that calls Chronos\trace_method()
      * to declare its decorations. Fail-open: a missing or unreadable path, or a manifest that throws, is
-     * swallowed so instrumentation configuration can never take down the application.
+     * swallowed so instrumentation configuration can never take down the application. require_once, so
+     * the composer-autoload-time bootstrap and the per-request NativeExtension fallback can both try
+     * without double-registering.
      */
     function load_instrumentation(string $path): void
     {
         try {
             if ($path !== '' && is_file($path) && is_readable($path)) {
-                require $path;
+                require_once $path;
             }
         } catch (\Throwable) {
         }
