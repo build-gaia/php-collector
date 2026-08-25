@@ -43,6 +43,7 @@ final class Span
     private string $startedAt;
     private ?string $endedAtOverride = null;
     private bool $finished = false;
+    private string $status = 'ok';
 
     /** @var array<string, string> */
     private array $attributes = [];
@@ -166,8 +167,21 @@ final class Span
      * contain user data) exception.message. This is ADDITIVE to any legacy exception.* attributes a
      * caller also sets; both coexist.
      */
+    /**
+     * Mark this span errored; toRecord() then emits status "error" so the engine's
+     * span index and trace views surface the failure.
+     */
+    public function markError(): void
+    {
+        if ($this->void || $this->finished) {
+            return;
+        }
+        $this->status = 'error';
+    }
+
     public function recordException(Throwable $exception, bool $rich, ?string $stacktraceJson = null): void
     {
+        $this->markError();
         $attributes = ['exception.type' => get_class($exception)];
         if ($rich) {
             $attributes['exception.message'] = $exception->getMessage();
@@ -263,7 +277,7 @@ final class Span
         self::attachStructured($attributes, 'span.events', $this->events);
         self::attachStructured($attributes, 'span.links', $this->links);
 
-        return new SpanRecord($this->traceId, $this->id, $this->parentSpanId, $this->name, $this->startedAt, $this->endedAtOverride ?? self::now(), 'ok', $attributes);
+        return new SpanRecord($this->traceId, $this->id, $this->parentSpanId, $this->name, $this->startedAt, $this->endedAtOverride ?? self::now(), $this->status, $attributes);
     }
 
     /**
