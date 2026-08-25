@@ -65,8 +65,10 @@ composer require build-gaia/php-collector
 The extension works without it; the package adds what only userland can know:
 
 - **Laravel** — zero configuration: the service provider auto-discovers, and you
-  get route patterns, SQL spans with connection identity and bound parameters,
-  cache hit/miss spans, log→trace correlation, and exact response capture.
+  get route pattern/name/action/middleware on the request span, SQL spans with
+  connection identity and bound parameters, cache hit/miss/write/forget spans,
+  log→trace correlation, exact response capture, and bounded view/model/mail/job/gate/event
+  counts plus authenticated user id and peak memory.
 - **Symfony** — decorate your kernel with
   `Chronos\Collector\Framework\Symfony\ChronosHttpKernel`.
 - **symfony1** — register `Chronos\Collector\Framework\Symfony1\ChronosFilter`
