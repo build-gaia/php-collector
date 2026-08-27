@@ -6,6 +6,12 @@ by a native extension (`chronos.so`), spooled to disk, and shipped by a forwarde
 Designed to be safe to bake into every image: with `CHRONOS_PHP_ENABLED` unset,
 both the extension and this package cost your application nothing.
 
+> **`build-gaia/php-collector` is a read-only publishing mirror.** The source
+> lives at `build-gaia/collector` under `sdks/php`, and is split out to this
+> repository on every push so Packagist finds `composer.json` at a repository
+> root. A commit made here is overwritten by the next split — open pull
+> requests against `build-gaia/collector` instead.
+
 ## Install
 
 ### 1. The native extension
