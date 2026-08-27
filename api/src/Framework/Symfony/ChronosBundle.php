@@ -22,5 +22,7 @@ final class ChronosBundle extends Bundle
 
         $container->register(Chronos::class, Chronos::class)->setPublic(true);
         $container->register('chronos', Chronos::class)->setPublic(true);
+
+        $container->addCompilerPass(new ChronosCachePass());
     }
 }

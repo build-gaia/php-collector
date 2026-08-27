@@ -37,6 +37,8 @@ use Chronos\Collector\Replay\Vocabulary;
 use Chronos\Collector\Framework\Guzzle\ImmediatePromise;
 use Chronos\Collector\Framework\Guzzle\ReplayMiddleware;
 use Chronos\Collector\Framework\Laravel\RequestFacts;
+use Chronos\Collector\Service\CacheCapture;
+use Chronos\Collector\Service\Span;
 use Chronos\Collector\Framework\Pdo\EffectConnection;
 
 spl_autoload_register(static function (string $class): void {
@@ -863,14 +865,73 @@ $runner->test('Laravel request facts hydrate the root with names and counts only
     $runner->assertSame('["web","auth"]', $attributes['http.route.middleware'] ?? null, 'middleware');
     $runner->assertSame('42', $attributes['enduser.id'] ?? null, 'user id');
     $runner->assertSame('web', $attributes['enduser.guard'] ?? null, 'guard');
-    $runner->assertSame('8388608', $attributes['process.runtime.php.memory.peak_bytes'] ?? null, 'peak memory');
-    $runner->assertSame('{"users.show":2,"layouts.app":1}', $attributes['laravel.views'] ?? null, 'views');
-    $runner->assertSame('{"App\\\\Models\\\\User":3}', $attributes['laravel.models'] ?? null, 'models');
-    $runner->assertSame('{"App\\\\Mail\\\\Welcome":1}', $attributes['laravel.mail'] ?? null, 'mail');
-    $runner->assertSame('{"App\\\\Jobs\\\\IndexUser@default":1}', $attributes['laravel.jobs'] ?? null, 'jobs');
-    $runner->assertSame('{"update:allow":2,"delete:deny":1}', $attributes['laravel.gates'] ?? null, 'gates');
-    $runner->assertSame('{"App\\\\Events\\\\UserViewed":1}', $attributes['laravel.events'] ?? null, 'app events only');
-    $runner->assertTrue(!isset($attributes['laravel.views.truncated']), 'no truncation flag when under cap');
+    $runner->assertSame('8388608', $attributes['process.runtime.memory.peak_bytes'] ?? null, 'peak memory');
+    // ADR 0024 §1: the keys name the activity, and which framework did it is
+    // already on the span as app.framework.
+    $runner->assertSame('{"users.show":2,"layouts.app":1}', $attributes['framework.views'] ?? null, 'views');
+    $runner->assertSame('{"App\\\\Models\\\\User":3}', $attributes['framework.models'] ?? null, 'models');
+    $runner->assertSame('{"App\\\\Mail\\\\Welcome":1}', $attributes['framework.mail'] ?? null, 'mail');
+    $runner->assertSame('{"update:allow":2,"delete:deny":1}', $attributes['framework.authorization'] ?? null, 'authorization');
+    $runner->assertTrue(!isset($attributes['laravel.views']), 'the old framework-named keys are gone');
+    $runner->assertTrue(!isset($attributes['framework.views.truncated']), 'no truncation flag when under cap');
+
+    // Events and jobs are catalogs, not counts (ADR 0024 §2, §3): a name alone
+    // cannot say where the message went or where it was dispatched from.
+    $events = json_decode($attributes['messaging.events'] ?? '[]', true);
+    $runner->assertSame(1, is_array($events) ? count($events) : 0, 'framework events stay out of the catalog');
+    $runner->assertSame('App\\Events\\UserViewed', $events[0]['name'] ?? null, 'event name');
+    $runner->assertSame('in_process', $events[0]['destination.kind'] ?? null, 'a plain event crosses no boundary');
+    $runner->assertSame('process', $events[0]['operation'] ?? null, 'and is processed, not published');
+    $runner->assertSame('App\\Events\\UserViewed', $events[0]['schema'] ?? null, 'schema defaults to the class');
+    $runner->assertSame(1, $events[0]['count'] ?? null, 'occurrences are counted, not duplicated');
+    $runner->assertTrue(isset($events[0]['code.filepath']), 'the dispatch call site is the navigable field');
+
+    $jobs = json_decode($attributes['messaging.jobs'] ?? '[]', true);
+    $runner->assertSame(1, is_array($jobs) ? count($jobs) : 0, 'one job');
+    $runner->assertSame('App\\Jobs\\IndexUser', $jobs[0]['name'] ?? null, 'job name');
+    $runner->assertSame('default', $jobs[0]['queue'] ?? null, 'queue');
+    $runner->assertTrue(!isset($attributes['laravel.jobs']), 'the old count dictionary is gone');
+});
+
+$runner->test('the activity catalog counts repeats instead of duplicating them', static function (Runner $runner): void {
+    RequestFacts::reset();
+    for ($i = 0; $i < 40; ++$i) {
+        RequestFacts::noteEvent('App\\Events\\OrderPlaced');
+    }
+    RequestFacts::noteEvent('App\\Events\\OrderShipped');
+    $attributes = RequestFacts::snapshot();
+
+    $events = json_decode($attributes['messaging.events'] ?? '[]', true);
+    $runner->assertSame(2, is_array($events) ? count($events) : 0, 'two distinct events');
+    // Busiest first, so a cap hit loses the thing that happened once rather than
+    // the thing that happened forty times.
+    $runner->assertSame('App\\Events\\OrderPlaced', $events[0]['name'] ?? null, 'busiest first');
+    $runner->assertSame(40, $events[0]['count'] ?? null, 'repeats increment the count');
+    $runner->assertTrue(!isset($attributes['messaging.events.truncated']), 'repeats are not a cap hit');
+});
+
+$runner->test('the activity catalog reports its cap rather than hiding it', static function (Runner $runner): void {
+    RequestFacts::reset();
+    for ($i = 0; $i < 40; ++$i) {
+        RequestFacts::noteEvent('App\\Events\\Event'.$i);
+    }
+    $attributes = RequestFacts::snapshot();
+
+    $events = json_decode($attributes['messaging.events'] ?? '[]', true);
+    $runner->assertSame(16, is_array($events) ? count($events) : 0, 'entry cap');
+    $runner->assertSame('true', $attributes['messaging.events.truncated'] ?? null, 'and it says so');
+});
+
+$runner->test('a published event records the transport it left over', static function (Runner $runner): void {
+    RequestFacts::reset();
+    RequestFacts::noteEvent('App\\Events\\OrderPlaced', 'redis', 'orders,orders.eu', 'json');
+    $attributes = RequestFacts::snapshot();
+
+    $events = json_decode($attributes['messaging.events'] ?? '[]', true);
+    $runner->assertSame('redis', $events[0]['destination.kind'] ?? null, 'the transport names itself');
+    $runner->assertSame('orders,orders.eu', $events[0]['destination'] ?? null, 'every channel it went to');
+    $runner->assertSame('publish', $events[0]['operation'] ?? null, 'crossing a boundary is a publish');
+    $runner->assertSame('json', $events[0]['protocol'] ?? null, 'and the encoding on the wire');
 });
 
 $runner->test('Laravel request facts stop tracking new names after the unique cap', static function (Runner $runner): void {
@@ -880,16 +941,39 @@ $runner->test('Laravel request facts stop tracking new names after the unique ca
     }
     RequestFacts::noteView('view-0');
     $attributes = RequestFacts::snapshot();
-    $views = json_decode($attributes['laravel.views'] ?? '[]', true);
+    $views = json_decode($attributes['framework.views'] ?? '[]', true);
     $runner->assertSame(32, is_array($views) ? count($views) : 0, 'unique cap');
     $runner->assertSame(2, is_array($views) ? ($views['view-0'] ?? 0) : 0, 'known names still count');
-    $runner->assertSame('true', $attributes['laravel.views.truncated'] ?? null, 'truncated');
+    $runner->assertSame('true', $attributes['framework.views.truncated'] ?? null, 'truncated');
 });
 
 $runner->test('Laravel request facts omit empty identity rather than writing blank keys', static function (Runner $runner): void {
     RequestFacts::reset();
     $attributes = RequestFacts::snapshot(RequestFacts::identity());
     $runner->assertSame([], $attributes, 'empty request writes nothing');
+});
+
+$runner->test('CacheCapture encodes scalars and JSON documents', static function (Runner $runner): void {
+    $runner->assertSame('ada', CacheCapture::encode('ada'));
+    $runner->assertSame('true', CacheCapture::encode(true));
+    $runner->assertSame('false', CacheCapture::encode(false));
+    $runner->assertSame('null', CacheCapture::encode(null));
+    $runner->assertSame('42', CacheCapture::encode(42));
+    $runner->assertSame('{"id":1}', CacheCapture::encode(['id' => 1]));
+});
+
+$runner->test('CacheCapture stamps a hit with the value and a miss without', static function (Runner $runner): void {
+    $hit = Span::open('t', 's1', '', 'cache GET');
+    CacheCapture::stamp($hit, true, ['id' => 7]);
+    $hitAttributes = $hit->toRecord()->attributes;
+    $runner->assertSame('true', $hitAttributes['cache.hit'] ?? null);
+    $runner->assertSame('{"id":7}', $hitAttributes['cache.value'] ?? null);
+
+    $miss = Span::open('t', 's2', '', 'cache GET');
+    CacheCapture::stamp($miss, false, ['id' => 7]);
+    $missAttributes = $miss->toRecord()->attributes;
+    $runner->assertSame('false', $missAttributes['cache.hit'] ?? null);
+    $runner->assertTrue(!array_key_exists('cache.value', $missAttributes), 'miss carries no value');
 });
 
 exit($runner->finish());

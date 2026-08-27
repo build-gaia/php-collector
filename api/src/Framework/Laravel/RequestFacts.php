@@ -4,16 +4,26 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Laravel;
 
+use Chronos\Collector\Service\ActivityCatalog;
+use Chronos\Collector\Service\CallSite;
+use Chronos\Collector\Service\MessagingSpan;
 use Chronos\Collector\Service\NativeExtension;
 use Throwable;
 
 /**
- * Bounded Laravel facts stamped onto the request root span at flush.
+ * Bounded framework facts stamped onto the request root span at flush.
  *
  * This is the Debugbar-shaped hydration that belongs on a trace: which action
- * ran, who was authenticated, which views/models/mail/jobs/gates/events
+ * ran, who was authenticated, which views/models/mail/authorization checks
  * participated — names and counts only. View data, cache values, session
  * contents, notification bodies and Gate arguments stay out.
+ *
+ * The attribute names are FRAMEWORK-GENERIC (`framework.views`, not
+ * `laravel.views`) per ADR 0024 §1: a Symfony request renders views and hydrates
+ * models too, and which framework did it is already on the span as
+ * `app.framework`. Events and jobs are not counts at all any more — they are
+ * catalogs (§2, §3), because a destination, a transport and a dispatch site are
+ * the questions asked straight after "did it happen".
  *
  * Accumulated in userland because only Laravel knows these events; flushed
  * through the native collector because the synthetic SpanManager root is never
@@ -35,13 +45,11 @@ final class RequestFacts
     private static array $mail = [];
 
     /** @var array<string, int> */
-    private static array $jobs = [];
-
-    /** @var array<string, int> */
     private static array $gates = [];
 
-    /** @var array<string, int> */
-    private static array $events = [];
+    private static ?ActivityCatalog $events = null;
+
+    private static ?ActivityCatalog $jobs = null;
 
     private static int $droppedViews = 0;
 
@@ -49,26 +57,20 @@ final class RequestFacts
 
     private static int $droppedMail = 0;
 
-    private static int $droppedJobs = 0;
-
     private static int $droppedGates = 0;
-
-    private static int $droppedEvents = 0;
 
     public static function reset(): void
     {
         self::$views = [];
         self::$models = [];
         self::$mail = [];
-        self::$jobs = [];
         self::$gates = [];
-        self::$events = [];
         self::$droppedViews = 0;
         self::$droppedModels = 0;
         self::$droppedMail = 0;
-        self::$droppedJobs = 0;
         self::$droppedGates = 0;
-        self::$droppedEvents = 0;
+        self::events()->reset();
+        self::jobs()->reset();
     }
 
     public static function noteView(string $name): void
@@ -86,10 +88,37 @@ final class RequestFacts
         self::note(self::$mail, self::$droppedMail, $type);
     }
 
-    public static function noteJob(string $job, string $queue = ''): void
-    {
-        $label = $queue === '' ? $job : $job.'@'.$queue;
-        self::note(self::$jobs, self::$droppedJobs, $label);
+    /**
+     * One queued job, as a catalog record.
+     *
+     * `transport` is the queue connection's DRIVER, not its name: "redis" says
+     * where to look, where the application's own name for the connection
+     * ("default") says nothing. `handlerFile` is the one field about the code
+     * rather than the dispatch, and it is what turns "this request queued
+     * IndexUser" into somewhere to go.
+     */
+    public static function noteJob(
+        string $job,
+        string $queue = '',
+        string $transport = '',
+        ?int $delayMs = null,
+        string $handlerFile = '',
+        ?int $payloadSize = null,
+    ): void {
+        if ($job === '') {
+            return;
+        }
+        self::jobs()->record(
+            $job.'@'.$queue,
+            static fn (): array => [
+                'name' => $job,
+                'queue' => $queue,
+                'transport' => $transport,
+                'delay_ms' => $delayMs,
+                'handler.filepath' => $handlerFile,
+                'payload.size' => $payloadSize,
+            ] + CallSite::attributes(),
+        );
     }
 
     public static function noteGate(string $ability, bool $allowed): void
@@ -98,12 +127,45 @@ final class RequestFacts
         self::note(self::$gates, self::$droppedGates, $label);
     }
 
-    public static function noteEvent(string $name): void
-    {
-        if (self::isFrameworkEvent($name)) {
+    /**
+     * One dispatched event, as a catalog record.
+     *
+     * `in_process` is a deliberate member of the destination vocabulary rather
+     * than an absence: a Laravel event with a synchronous listener really has no
+     * broker, and recording that as "no destination" would make the common case
+     * look like missing data.
+     */
+    public static function noteEvent(
+        string $name,
+        string $destinationKind = 'in_process',
+        string $destination = '',
+        string $protocol = '',
+        string $schema = '',
+    ): void {
+        if ($name === '' || self::isFrameworkEvent($name)) {
             return;
         }
-        self::note(self::$events, self::$droppedEvents, $name);
+        self::events()->record(
+            $name.'@'.$destinationKind.'/'.$destination,
+            static fn (): array => [
+                'name' => $name,
+                'destination' => $destination,
+                'destination.kind' => $destinationKind,
+                'operation' => $destinationKind === 'in_process' ? 'process' : 'publish',
+                'protocol' => $protocol,
+                'schema' => $schema === '' ? $name : $schema,
+            ] + CallSite::attributes(),
+        );
+    }
+
+    private static function events(): ActivityCatalog
+    {
+        return self::$events ??= new ActivityCatalog();
+    }
+
+    private static function jobs(): ActivityCatalog
+    {
+        return self::$jobs ??= new ActivityCatalog();
     }
 
     /**
@@ -148,7 +210,7 @@ final class RequestFacts
             $attributes['enduser.guard'] = self::clip($guard, 32);
         }
         if ($peakMemoryBytes > 0) {
-            $attributes['process.runtime.php.memory.peak_bytes'] = (string) $peakMemoryBytes;
+            $attributes['process.runtime.memory.peak_bytes'] = (string) $peakMemoryBytes;
         }
 
         return $attributes;
@@ -163,12 +225,12 @@ final class RequestFacts
     public static function snapshot(array $identity = []): array
     {
         $attributes = $identity;
-        self::putCounts($attributes, 'laravel.views', self::$views, self::$droppedViews);
-        self::putCounts($attributes, 'laravel.models', self::$models, self::$droppedModels);
-        self::putCounts($attributes, 'laravel.mail', self::$mail, self::$droppedMail);
-        self::putCounts($attributes, 'laravel.jobs', self::$jobs, self::$droppedJobs);
-        self::putCounts($attributes, 'laravel.gates', self::$gates, self::$droppedGates);
-        self::putCounts($attributes, 'laravel.events', self::$events, self::$droppedEvents);
+        self::putCounts($attributes, 'framework.views', self::$views, self::$droppedViews);
+        self::putCounts($attributes, 'framework.models', self::$models, self::$droppedModels);
+        self::putCounts($attributes, 'framework.mail', self::$mail, self::$droppedMail);
+        self::putCounts($attributes, 'framework.authorization', self::$gates, self::$droppedGates);
+        self::events()->putInto($attributes, 'messaging.events');
+        self::jobs()->putInto($attributes, 'messaging.jobs');
 
         return $attributes;
     }
@@ -232,9 +294,28 @@ final class RequestFacts
                 $event::listen(\Illuminate\Queue\Events\JobQueued::class, static function (object $observed): void {
                     $job = $observed->job ?? null;
                     $name = is_object($job) ? $job::class : (is_string($job) ? $job : '');
+                    if ($name === '') {
+                        return;
+                    }
                     $queue = isset($observed->queue) && is_string($observed->queue) ? $observed->queue : '';
-                    if ($name !== '') {
-                        self::noteJob($name, $queue);
+                    $transport = self::queueDriver($observed->connectionName ?? null);
+                    $payloadSize = self::payloadSize($observed->payload ?? null);
+                    self::noteJob(
+                        $name,
+                        $queue,
+                        $transport,
+                        self::jobDelayMs(is_object($job) ? $job : null),
+                        is_object($job) ? self::classFile($job::class) : '',
+                        $payloadSize,
+                    );
+                    // A job pushed onto redis/sqs/a database really leaves the
+                    // process and will run in another trace, so it is an edge and
+                    // gets a tier-2 span. The `sync` driver runs it inline: no
+                    // boundary crossed, nothing to draw.
+                    if ($transport !== '' && $transport !== 'sync') {
+                        MessagingSpan::published($transport, $queue, $name, array_filter([
+                            'messaging.message.body.size' => $payloadSize === null ? '' : (string) $payloadSize,
+                        ]));
                     }
                 });
             }
@@ -249,17 +330,191 @@ final class RequestFacts
                 });
             }
             $event::listen('*', static function (mixed ...$args): void {
-                $name = $args[0] ?? '';
-                if (is_object($name)) {
-                    self::noteEvent($name::class);
+                $observed = $args[0] ?? '';
+                // The framework filter runs FIRST. This closure fires for every
+                // internal Illuminate event, and interrogating each one — a
+                // broadcastOn() call, a backtrace — would put the collector's
+                // cost on work it then throws away.
+                $name = is_object($observed) ? $observed::class : (is_string($observed) ? $observed : '');
+                if ($name === '' || self::isFrameworkEvent($name)) {
                     return;
                 }
-                if (is_string($name)) {
-                    self::noteEvent($name);
+                if (is_string($observed)) {
+                    // A string event name has no object to interrogate, so the
+                    // most that can be said is that it was dispatched in-process.
+                    self::noteEvent($observed);
+
+                    return;
                 }
+                // Broadcasting is what makes an event LEAVE the process. Everything
+                // else is a synchronous listener call, however many of them there
+                // are, and calling that `in_process` is the accurate reading.
+                if (!self::isBroadcast($observed)) {
+                    self::noteEvent($name);
+
+                    return;
+                }
+                $driver = self::broadcastDriver();
+                $destination = self::broadcastDestination($observed);
+                self::noteEvent($name, $driver, $destination, 'json');
+                // Tier 2 (ADR 0024 §2): this message really leaves the process,
+                // so it is a topology edge and gets its own span carrying the
+                // OTel messaging.* keys the producer graph joins on.
+                MessagingSpan::published($driver, $destination, $name, ['messaging.protocol' => 'json']);
             });
         } catch (Throwable) {
         }
+    }
+
+    /**
+     * Whether the event is broadcast, and therefore actually crosses a process
+     * boundary. `ShouldBroadcastNow` extends `ShouldBroadcast`, so one check
+     * covers both.
+     */
+    private static function isBroadcast(object $event): bool
+    {
+        return interface_exists(\Illuminate\Contracts\Broadcasting\ShouldBroadcast::class)
+            && $event instanceof \Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+    }
+
+    /**
+     * The broadcast transport's own name — `redis`, `pusher`, `ably`, `log`.
+     *
+     * Deliberately not folded into a closed vocabulary: a destination kind that
+     * cannot say "pusher" would have to say something false instead, and the
+     * point of the field is to name where the message went. `in_process` is the
+     * one reserved member, because it is the one case with no transport at all.
+     */
+    private static function broadcastDriver(): string
+    {
+        try {
+            if (!function_exists('config')) {
+                return 'broadcast';
+            }
+            $connection = config('broadcasting.default');
+            if (!is_string($connection) || $connection === '') {
+                return 'broadcast';
+            }
+            $driver = config("broadcasting.connections.{$connection}.driver");
+
+            return is_string($driver) && $driver !== '' ? $driver : $connection;
+        } catch (Throwable) {
+            return 'broadcast';
+        }
+    }
+
+    /**
+     * The channels the event was broadcast on, comma-joined.
+     *
+     * `broadcastOn()` is application code and is called here — unavoidably, since
+     * it is the only place the channel names exist. It is the one application
+     * method this class invokes, it is conventionally a pure `return new
+     * Channel(...)`, and it is wrapped: a throwing implementation costs the
+     * destination field and nothing else.
+     *
+     * `broadcastWith()` is NOT called, which is why no `payload.size` is recorded
+     * for an event. It builds the payload rather than reporting it, so calling it
+     * would run application work a second time and risk doubling whatever side
+     * effect it has.
+     */
+    private static function broadcastDestination(object $event): string
+    {
+        try {
+            if (!method_exists($event, 'broadcastOn')) {
+                return '';
+            }
+            $channels = $event->broadcastOn();
+            if (!is_array($channels)) {
+                $channels = [$channels];
+            }
+            $names = [];
+            foreach (array_slice($channels, 0, 4) as $channel) {
+                $name = match (true) {
+                    is_string($channel) => $channel,
+                    is_object($channel) && property_exists($channel, 'name') && is_string($channel->name) => $channel->name,
+                    is_object($channel) && method_exists($channel, '__toString') => (string) $channel,
+                    default => '',
+                };
+                if ($name !== '') {
+                    $names[] = $name;
+                }
+            }
+
+            return implode(',', $names);
+        } catch (Throwable) {
+            return '';
+        }
+    }
+
+    /** The queue connection's driver, which is where to look; the name is not. */
+    private static function queueDriver(mixed $connectionName): string
+    {
+        try {
+            if (!is_string($connectionName) || $connectionName === '' || !function_exists('config')) {
+                return is_string($connectionName) ? $connectionName : '';
+            }
+            $driver = config("queue.connections.{$connectionName}.driver");
+
+            return is_string($driver) && $driver !== '' ? $driver : $connectionName;
+        } catch (Throwable) {
+            return '';
+        }
+    }
+
+    /**
+     * The dispatch delay in milliseconds, when one was set. Laravel accepts an
+     * int of seconds, a DateInterval or an absolute DateTimeInterface, so all
+     * three are resolved to the same unit rather than reported in whichever one
+     * the caller happened to use.
+     */
+    private static function jobDelayMs(?object $job): ?int
+    {
+        try {
+            if ($job === null || !property_exists($job, 'delay')) {
+                return null;
+            }
+            $delay = $job->delay;
+
+            return match (true) {
+                is_int($delay) || is_float($delay) => (int) ($delay * 1000),
+                $delay instanceof \DateInterval => (int) (((float) $delay->format('%a')) * 86400000)
+                    + ($delay->h * 3600000) + ($delay->i * 60000) + ($delay->s * 1000),
+                $delay instanceof \DateTimeInterface => max(0, (int) (($delay->getTimestamp() - time()) * 1000)),
+                default => null,
+            };
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** The file a class is declared in, for the jump-to-handler link. */
+    private static function classFile(string $class): string
+    {
+        try {
+            if (!class_exists($class)) {
+                return '';
+            }
+            $file = (new \ReflectionClass($class))->getFileName();
+
+            return is_string($file) ? $file : '';
+        } catch (Throwable) {
+            return '';
+        }
+    }
+
+    /**
+     * The encoded size of an already-serialised payload.
+     *
+     * Read only, never re-encoded: the size is evidence about a payload that
+     * exists, not a reason to build one.
+     */
+    private static function payloadSize(mixed $payload): ?int
+    {
+        if (is_string($payload) && $payload !== '') {
+            return strlen($payload);
+        }
+
+        return null;
     }
 
     private static function mailType(object $event): string

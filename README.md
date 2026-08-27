@@ -66,11 +66,22 @@ The extension works without it; the package adds what only userland can know:
 
 - **Laravel** — zero configuration: the service provider auto-discovers, and you
   get route pattern/name/action/middleware on the request span, SQL spans with
-  connection identity and bound parameters, cache hit/miss/write/forget spans,
-  log→trace correlation, exact response capture, and bounded view/model/mail/job/gate/event
-  counts plus authenticated user id and peak memory.
-- **Symfony** — decorate your kernel with
-  `Chronos\Collector\Framework\Symfony\ChronosHttpKernel`.
+  connection identity and bound parameters, cache hit/miss/write/forget spans
+  with the hit value, log→trace correlation, exact response capture, bounded
+  `framework.views` / `.models` / `.mail` / `.authorization` counts, authenticated
+  user id and peak memory, plus the `messaging.events` / `messaging.jobs`
+  catalogs.
+
+  The catalogs are the part worth reading twice. An event or a queued job is
+  recorded with its **destination, transport, encoding and dispatch call site**,
+  not just its name — and a message that actually leaves the process (a broadcast
+  event, a job on any driver but `sync`) additionally gets its own producer span
+  carrying `messaging.system` / `messaging.destination.name` /
+  `messaging.operation`, which is what draws the edge to the broker on the service
+  map. See ADR 0024 for the vocabulary and its bounds.
+- **Symfony** — register `Chronos\Collector\Framework\Symfony\ChronosBundle`
+  (or decorate the kernel with `ChronosHttpKernel`). Cache pools are wrapped so
+  reads show hit/miss and the unserialized hit value.
 - **symfony1** — register `Chronos\Collector\Framework\Symfony1\ChronosFilter`
   in `filters.yml`.
 - **Custom spans** — `$chronos->span->create('name')`, or declare an

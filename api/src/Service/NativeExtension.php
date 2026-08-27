@@ -335,7 +335,9 @@ final class NativeExtension
      * Guarded by size before the call: shipping a 40 MB CSV export across the FFI
      * boundary only for the .so to truncate it to 64 KiB is pure waste. The cap
      * here is deliberately generous relative to the collector's own so the .so
-     * stays the single place the real limit is configured.
+     * stays the single place the real limit is configured. `text/html` is allowed
+     * up to 100 MiB to match the native HTML ceiling (error pages and rendered
+     * views), everything else stays at 1 MiB.
      */
     /** @param array<string, string> $headers */
     public static function setResponseBody(
@@ -350,8 +352,10 @@ final class NativeExtension
         if ($body === '' && $headers === []) {
             return;
         }
+        $media = strtolower(trim(explode(';', $contentType, 2)[0]));
+        $maxBytes = $media === 'text/html' ? 100 * 1024 * 1024 : 1_048_576;
         try {
-            \chronos_set_http_response_body(substr($body, 0, 1048576), $contentType, $headers);
+            \chronos_set_http_response_body(substr($body, 0, $maxBytes), $contentType, $headers);
         } catch (\Throwable) {
         }
     }

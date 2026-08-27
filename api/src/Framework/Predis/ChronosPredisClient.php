@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Predis;
 
+use Chronos\Collector\Service\CacheCapture;
 use Chronos\Collector\Service\Span;
 use Chronos\Collector\Service\SpanManager;
 use Throwable;
@@ -24,7 +25,12 @@ final class ChronosPredisClient extends \Predis\Client
     {
         $span = self::beginSpan((string) $commandID, is_array($arguments) ? $arguments : []);
         try {
-            return parent::__call($commandID, $arguments);
+            $result = parent::__call($commandID, $arguments);
+            if ($span instanceof Span) {
+                self::stampRead($span, strtoupper((string) $commandID), $result);
+            }
+
+            return $result;
         } finally {
             if ($span instanceof Span) {
                 try {
@@ -33,6 +39,19 @@ final class ChronosPredisClient extends \Predis\Client
                 }
             }
         }
+    }
+
+    /**
+     * Redis GET (and GETEX) are the commands whose reply is the cached document.
+     * A nil/false reply is a miss; an empty string is a stored empty value, so a hit.
+     */
+    private static function stampRead(Span $span, string $operation, mixed $result): void
+    {
+        if ($operation !== 'GET' && $operation !== 'GETEX') {
+            return;
+        }
+        $hit = $result !== null && $result !== false;
+        CacheCapture::stamp($span, $hit, $hit ? $result : null);
     }
 
     /** @param array<int,mixed> $arguments */

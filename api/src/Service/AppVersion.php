@@ -49,6 +49,34 @@ final class AppVersion
     }
 
     /**
+     * Full git object name when CI exposed one (`GIT_COMMIT` / `SOURCE_COMMIT`).
+     *
+     * Unlike {@see resolve()}, this is NOT shortened: DST recordings and agents
+     * looking across worktrees need a stable object id to fetch historical source
+     * (`git show <commit>:path`), and a 12-char prefix is ambiguous across forks.
+     * Returns null when only an image tag / explicit app version is known — those
+     * are not checkoutable commits.
+     */
+    public static function commitSha(): ?string
+    {
+        $commit = self::firstPresent(self::GIT_COMMIT);
+        if ($commit === null) {
+            return null;
+        }
+        $trimmed = trim($commit);
+        if ($trimmed === '') {
+            return null;
+        }
+        // Accept full or abbreviated hex; refuse tags / branches that happen to
+        // share the GIT_COMMIT env name in a misconfigured deploy.
+        if (preg_match('/^[a-f0-9]{7,64}$/Di', $trimmed) !== 1) {
+            return null;
+        }
+
+        return strtolower($trimmed);
+    }
+
+    /**
      * Discards the memoised value so the next resolve() re-reads the environment. Intended for
      * the verification harness, which exercises the precedence chain under different env sets;
      * production code resolves exactly once.

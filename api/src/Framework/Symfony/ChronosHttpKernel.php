@@ -60,6 +60,10 @@ final class ChronosHttpKernel implements HttpKernelInterface
                 : '',
         );
 
+        // ChronosCacheAdapter owns cache-pool spans with hit/miss and the
+        // unserialized value — native Redis/Memcached fallbacks stand down.
+        NativeExtension::suppressNative('cache');
+
         // Container boot, bundle registration and kernel warmup are behind us; the
         // kernel call below is the application's own work. Marks the boundary the
         // Timeline tab draws between "bootstrap" and "dispatch".

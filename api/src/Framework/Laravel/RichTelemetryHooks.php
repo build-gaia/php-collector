@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Laravel;
 
+use Chronos\Collector\Service\AppVersion;
+use Chronos\Collector\Service\CacheCapture;
+use Chronos\Collector\Service\CallSite;
 use Chronos\Collector\Service\NativeExtension;
 use Chronos\Collector\Service\QueryPlan;
 use Chronos\Collector\Service\Severity;
@@ -130,13 +133,14 @@ final class RichTelemetryHooks
         }
         $span->finish();
         // Pair for replay: query then a result placeholder (row bodies stay privacy-gated).
-        NativeExtension::recordDstEffect('database_query', [
+        $site = self::dstCallSitePayload($span);
+        NativeExtension::recordDstEffect('database_query', array_merge([
             'statement' => self::clip($sql, 4096),
-        ]);
-        NativeExtension::recordDstEffect('database_result', [
+        ], $site));
+        NativeExtension::recordDstEffect('database_result', array_merge([
             'statement' => self::clip($sql, 4096),
             'duration_ms' => (string) ($query->time ?? 0),
-        ]);
+        ], $site));
     }
 
     private static function traceCacheRead(object $event): void
@@ -158,15 +162,16 @@ final class RichTelemetryHooks
                 $span->add('code.lineno', (string) $line);
             }
             $span->add('cache_key', $key);
-            $span->add('cache.hit', $event instanceof CacheHit ? 'true' : 'false');
+            $hit = $event instanceof CacheHit;
+            CacheCapture::stamp($span, $hit, $hit ? ($event->value ?? null) : null);
         }
         $span->finish();
         $hit = $event instanceof CacheHit ? '1' : '0';
-        NativeExtension::recordDstEffect('cache_read', [
+        NativeExtension::recordDstEffect('cache_read', array_merge([
             'key' => self::clip($key, 256),
             'hit' => $hit,
             'store' => $store,
-        ]);
+        ], self::dstCallSitePayload($span)));
     }
 
     private static function traceCacheWrite(object $event): void
@@ -193,10 +198,10 @@ final class RichTelemetryHooks
             }
         }
         $span->finish();
-        NativeExtension::recordDstEffect('cache_write', [
+        NativeExtension::recordDstEffect('cache_write', array_merge([
             'key' => self::clip($key, 256),
             'store' => $store,
-        ]);
+        ], self::dstCallSitePayload($span)));
     }
 
     private static function traceCacheForget(object $event): void
@@ -238,10 +243,10 @@ final class RichTelemetryHooks
                 if (!$span->isVoid()) {
                     self::attachOutboundRequest($span, $request, $method);
                 }
-                NativeExtension::recordDstEffect('http_request', [
+                NativeExtension::recordDstEffect('http_request', array_merge([
                     'method' => $method !== '' ? $method : 'GET',
                     'url' => self::clip($url, 2048),
-                ]);
+                ], self::dstCallSitePayload($span)));
 
                 return $handler($request, $options)->then(
                     static function ($response) use ($span) {
@@ -252,17 +257,17 @@ final class RichTelemetryHooks
                         if (is_object($response) && method_exists($response, 'getStatusCode')) {
                             $status = (string) $response->getStatusCode();
                         }
-                        NativeExtension::recordDstEffect('http_response', [
+                        NativeExtension::recordDstEffect('http_response', array_merge([
                             'status' => $status,
-                        ]);
+                        ], self::dstCallSitePayload($span)));
                         $span->finish();
                         return $response;
                     },
                     static function ($reason) use ($span) {
-                        NativeExtension::recordDstEffect('http_response', [
+                        NativeExtension::recordDstEffect('http_response', array_merge([
                             'status' => '0',
                             'error' => '1',
-                        ]);
+                        ], self::dstCallSitePayload($span)));
                         $span->finish();
                         throw $reason;
                     },
@@ -301,10 +306,10 @@ final class RichTelemetryHooks
         }
         // Finish happens on ResponseReceived; if that never fires, request_end still flushes.
         self::$pendingHttpSpans[] = $span;
-        NativeExtension::recordDstEffect('http_request', [
+        NativeExtension::recordDstEffect('http_request', array_merge([
             'method' => $method !== '' ? $method : 'GET',
             'url' => self::clip($url, 2048),
-        ]);
+        ], self::dstCallSitePayload($span)));
     }
 
     /** @var list<object> */
@@ -326,9 +331,10 @@ final class RichTelemetryHooks
             }
             $span->finish();
         }
-        NativeExtension::recordDstEffect('http_response', [
+        $siteSpan = is_object($span) && method_exists($span, 'isVoid') ? $span : null;
+        NativeExtension::recordDstEffect('http_response', array_merge([
             'status' => $status,
-        ]);
+        ], self::dstCallSitePayload($siteSpan instanceof Span ? $siteSpan : null)));
     }
 
     private static function attachOutboundRequest(Span $span, object $request, string $method): void
@@ -449,34 +455,55 @@ final class RichTelemetryHooks
         }
     }
 
-    /** @return array{0: string|null, 1: int, 2: string|null} */
-    private static function callSite(): array
+    /**
+     * Call-site + correlation attributes for DST effect payloads so the
+     * investigation UI can open historical source and jump to the matching span
+     * without joining indexes by hand.
+     *
+     * - `file` / `line` / `function` — first-party call site
+     * - `commit` — full git SHA when CI exposed one (worktree-safe history)
+     * - `span_id` — the APM span opened for this effect (same request / trace)
+     *
+     * @return array{file?: string, line?: string, function?: string, commit?: string, span_id?: string}
+     */
+    private static function dstCallSitePayload(?Span $span = null): array
     {
-        try {
-            $frames = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 40);
-            foreach ($frames as $index => $frame) {
-                $file = $frame['file'] ?? null;
-                if (is_string($file) && $file !== '' && !str_contains($file, '/vendor/')) {
-                    return [$file, (int) ($frame['line'] ?? 0), self::frameFunction($frames[$index + 1] ?? null)];
-                }
+        [$file, $line, $function] = self::callSite();
+        $payload = [];
+        if (is_string($file) && $file !== '') {
+            $payload['file'] = self::clip($file, 512);
+            if ($line > 0) {
+                $payload['line'] = (string) $line;
             }
-        } catch (Throwable) {
         }
-        return [null, 0, null];
+        if (is_string($function) && $function !== '') {
+            $payload['function'] = self::clip($function, 256);
+        }
+        $commit = AppVersion::commitSha();
+        if ($commit !== null) {
+            $payload['commit'] = self::clip($commit, 64);
+        }
+        $linked = $span;
+        if ($linked === null || $linked->isVoid()) {
+            $linked = SpanManager::active();
+        }
+        if ($linked !== null && !$linked->isVoid() && $linked->id !== '') {
+            $payload['span_id'] = $linked->id;
+        }
+        return $payload;
     }
 
-    /** @param array<string, mixed>|null $frame */
-    private static function frameFunction(?array $frame): ?string
+    /** @return array{0: string|null, 1: int, 2: string|null} */
+    /**
+     * The first application frame, shared with the activity catalogs so a span's
+     * `code.*` attributes and a catalog entry's agree on what "the call site"
+     * means.
+     *
+     * @return array{0: ?string, 1: int, 2: ?string}
+     */
+    private static function callSite(): array
     {
-        if ($frame === null) {
-            return null;
-        }
-        $function = is_string($frame['function'] ?? null) ? $frame['function'] : '';
-        if ($function === '') {
-            return null;
-        }
-        $class = is_string($frame['class'] ?? null) ? $frame['class'] : '';
-        return $class === '' ? $function : $class . '::' . $function;
+        return CallSite::firstApplicationFrame();
     }
 
     private static function sqlVerb(string $sql): string
