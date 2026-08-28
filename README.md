@@ -78,6 +78,24 @@ The extension works without it; the package adds what only userland can know:
   user id and peak memory, plus the `messaging.events` / `messaging.jobs`
   catalogs.
 
+  Spans, not just counts, for the work that takes the time: **template renders**
+  (one span per view, nested the way `@include` nests them), **transaction
+  boundaries** (the queries inside nest under the `BEGIN`, and a transaction the
+  request abandoned is closed and marked rather than dropped), **Redis commands**
+  the cache layer did not issue — the facade, locks, sessions, the rate limiter —
+  and **framework bootstrap**, measured from `LARAVEL_START` to the container's
+  `booted` callback. Every exception the application *reports* becomes a span too,
+  including the ones it recovered from and never showed the user; the request root
+  carries only the one that reached the response.
+
+  **Queued jobs are one trace, end to end.** The W3C context is stamped into the
+  job payload at dispatch (through Laravel's own `createPayloadUsing` seam, so it
+  survives retries, releases and any queue driver), and the worker opens a
+  job-scoped request against it — so the job's queries, HTTP calls and failures
+  hang beneath the request that queued it. Workers need
+  `CHRONOS_PHP_CLI_ENABLED=1`; the extension's RINIT hook skips CLI processes by
+  default, and without it the worker half stays inert.
+
   The catalogs are the part worth reading twice. An event or a queued job is
   recorded with its **destination, transport, encoding and dispatch call site**,
   not just its name — and a message that actually leaves the process (a broadcast

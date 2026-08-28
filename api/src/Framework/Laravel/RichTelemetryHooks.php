@@ -16,8 +16,12 @@ use Illuminate\Cache\Events\CacheHit;
 use Illuminate\Cache\Events\CacheMissed;
 use Illuminate\Cache\Events\KeyForgotten;
 use Illuminate\Cache\Events\KeyWritten;
+use Illuminate\Database\Events\TransactionBeginning;
+use Illuminate\Database\Events\TransactionCommitted;
+use Illuminate\Database\Events\TransactionRolledBack;
 use Illuminate\Http\Client\Events\RequestSending;
 use Illuminate\Http\Client\Events\ResponseReceived;
+use Illuminate\Redis\Events\CommandExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
@@ -49,6 +53,17 @@ final class RichTelemetryHooks
                     self::traceDatabaseQuery($query);
                 });
             }
+            if (class_exists(Event::class) && class_exists(TransactionBeginning::class)) {
+                Event::listen(TransactionBeginning::class, static function (object $event): void {
+                    self::openTransaction($event);
+                });
+                Event::listen(TransactionCommitted::class, static function (object $event): void {
+                    self::closeTransaction($event, 'commit');
+                });
+                Event::listen(TransactionRolledBack::class, static function (object $event): void {
+                    self::closeTransaction($event, 'rollback');
+                });
+            }
             if (class_exists(Log::class)) {
                 Log::listen(static function (object $event): void {
                     self::recordLog($event);
@@ -76,6 +91,11 @@ final class RichTelemetryHooks
             if (class_exists(Event::class) && class_exists(KeyForgotten::class)) {
                 Event::listen(KeyForgotten::class, static function (object $event): void {
                     self::traceCacheForget($event);
+                });
+            }
+            if (class_exists(Event::class) && class_exists(CommandExecuted::class)) {
+                Event::listen(CommandExecuted::class, static function (object $event): void {
+                    self::traceRedisCommand($event);
                 });
             }
             // Prefer Laravel HTTP client events: Facade::method_exists is false for
@@ -143,12 +163,296 @@ final class RichTelemetryHooks
         ], $site));
     }
 
+    /**
+     * The duration of the last Redis command the cache layer issued, in
+     * milliseconds, waiting to be claimed by the cache event that follows it.
+     *
+     * Laravel raises the two halves of one cache operation separately: the Redis
+     * event knows what the round trip COST, the cache event knows what it MEANT
+     * (hit or miss, the logical key, the store). Neither alone is the span a
+     * reader wants, so the cost is parked here for the few microseconds until the
+     * cache event claims it.
+     */
+    private static ?float $lastCacheCommandMs = null;
+
+    /**
+     * One Redis round trip, from Laravel's own command event.
+     *
+     * `suppressNative('cache')` stands the native Redis observer down for the
+     * whole request (observer.rs `cache_io_method`), because the userland cache
+     * spans carry hit/miss and the logical key the .so cannot see. That trade
+     * silently took every NON-cache Redis command with it — the facade, locks,
+     * sessions, the rate limiter, Horizon — because Laravel's cache events only
+     * fire for `Cache::*`. This listener puts them back, carrying the real
+     * round-trip duration.
+     *
+     * Commands the cache layer issued are not spanned twice. `RedisStore`
+     * prefixes every key it touches with `cache.prefix`, which makes the prefix
+     * an exact discriminator; their duration is handed to the cache span instead,
+     * so one operation stays one span and gains the timing it never had.
+     */
+    private static function traceRedisCommand(object $event): void
+    {
+        try {
+            $command = strtoupper((string) ($event->command ?? ''));
+            if ($command === '') {
+                return;
+            }
+            $parameters = is_array($event->parameters ?? null) ? $event->parameters : [];
+            $durationMs = is_numeric($event->time ?? null) ? (float) $event->time : null;
+            $connection = is_string($event->connectionName ?? null) ? $event->connectionName : '';
+            if (self::isCacheLayerCommand($parameters, $connection)) {
+                self::$lastCacheCommandMs = $durationMs;
+
+                return;
+            }
+            $span = SpanManager::open('REDIS '.$command);
+            if ($durationMs !== null) {
+                $span->backdateStart($durationMs);
+            }
+            if (!$span->isVoid()) {
+                $span->add('span.kind', 'client');
+                $span->add('db.system', 'redis');
+                $span->add('db.operation', $command);
+                if ($connection !== '') {
+                    $span->add('db.redis.connection', $connection);
+                }
+                $key = self::redisKey($parameters);
+                if ($key !== '') {
+                    $span->add('db.redis.key', $key);
+                }
+                $span->add('db.parameters.count', (string) count($parameters));
+                self::addRedisConnectionMetadata($span, $connection);
+                [$file, $line, $function] = self::callSite();
+                if ($file !== null) {
+                    $span->add('code.filepath', $file);
+                    $span->add('code.lineno', (string) $line);
+                }
+                if ($function !== null) {
+                    $span->add('code.function', $function);
+                }
+            }
+            $span->finish();
+        } catch (Throwable) {
+        }
+    }
+
+    /**
+     * Whether this command came from the cache layer, and so is already
+     * represented by a cache-event span.
+     *
+     * The key prefix is the discriminator because it is the thing `RedisStore`
+     * actually does to every key. When no prefix is configured it cannot
+     * discriminate at all — an empty prefix matches everything — so it falls back
+     * to the connection the cache store is configured to use.
+     */
+    private static function isCacheLayerCommand(array $parameters, string $connection): bool
+    {
+        try {
+            if (!function_exists('config')) {
+                return false;
+            }
+            $prefix = config('cache.prefix');
+            if (is_string($prefix) && $prefix !== '') {
+                $key = self::redisKey($parameters);
+
+                return $key !== '' && str_starts_with($key, $prefix);
+            }
+
+            return $connection !== '' && $connection === self::cacheConnectionName();
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    /** The connection name the default cache store is configured against. */
+    private static function cacheConnectionName(): string
+    {
+        try {
+            $store = config('cache.default');
+            if (!is_string($store) || $store === '') {
+                return '';
+            }
+            $connection = config("cache.stores.{$store}.connection");
+
+            return is_string($connection) ? $connection : '';
+        } catch (Throwable) {
+            return '';
+        }
+    }
+
+    /**
+     * The key a Redis command operated on: its first argument, or the first
+     * member when that argument is itself a key list (`MGET`, `DEL`).
+     */
+    private static function redisKey(array $parameters): string
+    {
+        $first = $parameters[0] ?? null;
+        if (is_array($first)) {
+            $first = $first[0] ?? (array_key_first($first) !== null ? array_key_first($first) : null);
+        }
+
+        return is_scalar($first) ? self::clip((string) $first, 256) : '';
+    }
+
+    /** Host and database for a named Redis connection, for the service map. */
+    private static function addRedisConnectionMetadata(object $span, string $connection): void
+    {
+        try {
+            if ($connection === '' || !function_exists('config')) {
+                return;
+            }
+            foreach (['cache.host' => 'host', 'cache.db' => 'database'] as $attr => $key) {
+                $value = config("database.redis.{$connection}.{$key}");
+                if (is_scalar($value) && (string) $value !== '') {
+                    $span->add($attr, (string) $value);
+                    if ($attr === 'cache.host') {
+                        $span->add('server.address', (string) $value);
+                    }
+                }
+            }
+        } catch (Throwable) {
+        }
+    }
+
+    /**
+     * Claim the round-trip duration parked by the Redis command this cache event
+     * describes, so the cache span shows what it cost rather than reading as
+     * instantaneous. Null when the store is not Redis-backed (file, array,
+     * database), where there was no round trip to time.
+     */
+    private static function claimCacheCommandMs(): ?float
+    {
+        $duration = self::$lastCacheCommandMs;
+        self::$lastCacheCommandMs = null;
+
+        return $duration;
+    }
+
+    /**
+     * Open transaction spans, innermost last.
+     *
+     * Held OPEN for the life of the transaction rather than stamped after the
+     * fact, which is what makes the queries inside nest under it: SpanManager
+     * parents every new span to the top of the stack, so a transaction that is on
+     * the stack adopts its own statements. That nesting is the whole point — forty
+     * loose sibling queries and forty queries under one BEGIN read very
+     * differently when you are looking for a lock held too long.
+     *
+     * @var list<Span>
+     */
+    private static array $transactionSpans = [];
+
+    /**
+     * A transaction, or a savepoint inside one.
+     *
+     * Laravel raises the same event for both and distinguishes them by
+     * `transactionLevel()`, so the level is recorded rather than flattened: a
+     * rollback to a savepoint is a different event from a rollback of the
+     * transaction, and a trace that showed them alike would hide the one that
+     * matters.
+     */
+    private static function openTransaction(object $event): void
+    {
+        try {
+            $level = self::transactionLevel($event);
+            $span = SpanManager::open($level > 1 ? 'SQL SAVEPOINT' : 'SQL TRANSACTION');
+            if (!$span->isVoid()) {
+                $span->add('span.kind', 'client');
+                $span->add('db.system', 'sql');
+                $span->add('db.operation', $level > 1 ? 'SAVEPOINT' : 'TRANSACTION');
+                $span->add('db.transaction.level', (string) $level);
+                self::addConnectionMetadata($span, $event);
+                [$file, $line, $function] = self::callSite();
+                if ($file !== null) {
+                    $span->add('code.filepath', $file);
+                    $span->add('code.lineno', (string) $line);
+                }
+                if ($function !== null) {
+                    $span->add('code.function', $function);
+                }
+            }
+            self::$transactionSpans[] = $span;
+        } catch (Throwable) {
+        }
+    }
+
+    /** Close the innermost open transaction span, recording how it ended. */
+    private static function closeTransaction(object $event, string $outcome): void
+    {
+        try {
+            $span = array_pop(self::$transactionSpans);
+            if (!$span instanceof Span) {
+                return;
+            }
+            if (!$span->isVoid()) {
+                $span->add('db.transaction.outcome', $outcome);
+                // A rollback is not an error — application code rolls back on
+                // purpose — but it is the thing a reader scanning a trace is
+                // looking for, so it is marked as a status rather than left to be
+                // found by reading attributes.
+                if ($outcome === 'rollback') {
+                    $span->markError();
+                }
+            }
+            $span->finish();
+        } catch (Throwable) {
+        }
+    }
+
+    /**
+     * Close transaction spans still open at request end.
+     *
+     * A transaction abandoned by a fatal error never raises a commit or a
+     * rollback, and an unfinished span is never written at all — so without this
+     * the queries beneath it would vanish along with it, which is the opposite of
+     * what a trace of a failing request should do.
+     */
+    public static function closeDanglingTransactions(): void
+    {
+        while (self::$transactionSpans !== []) {
+            $span = array_pop(self::$transactionSpans);
+            if (!$span instanceof Span) {
+                continue;
+            }
+            try {
+                if (!$span->isVoid()) {
+                    $span->add('db.transaction.outcome', 'abandoned');
+                    $span->markError();
+                }
+                $span->finish();
+            } catch (Throwable) {
+            }
+        }
+    }
+
+    /** The nesting depth this event was raised at; 1 is the outermost transaction. */
+    private static function transactionLevel(object $event): int
+    {
+        try {
+            $connection = $event->connection ?? null;
+            if (is_object($connection) && method_exists($connection, 'transactionLevel')) {
+                $level = $connection->transactionLevel();
+                if (is_int($level) && $level > 0) {
+                    return $level;
+                }
+            }
+        } catch (Throwable) {
+        }
+
+        return 1;
+    }
+
     private static function traceCacheRead(object $event): void
     {
         $store = isset($event->storeName) && is_string($event->storeName) && $event->storeName !== ''
             ? $event->storeName
             : 'cache';
         $span = SpanManager::open($store . ' GET');
+        $commandMs = self::claimCacheCommandMs();
+        if ($commandMs !== null) {
+            $span->backdateStart($commandMs);
+        }
         $key = (string) ($event->key ?? '');
         if (!$span->isVoid()) {
             $span->add('span.kind', 'client');
@@ -181,6 +485,10 @@ final class RichTelemetryHooks
             : 'cache';
         $key = (string) ($event->key ?? '');
         $span = SpanManager::open($store . ' SET');
+        $commandMs = self::claimCacheCommandMs();
+        if ($commandMs !== null) {
+            $span->backdateStart($commandMs);
+        }
         if (!$span->isVoid()) {
             $span->add('span.kind', 'client');
             $span->add('cache.system', 'redis');
@@ -211,6 +519,10 @@ final class RichTelemetryHooks
             : 'cache';
         $key = (string) ($event->key ?? '');
         $span = SpanManager::open($store . ' DEL');
+        $commandMs = self::claimCacheCommandMs();
+        if ($commandMs !== null) {
+            $span->backdateStart($commandMs);
+        }
         if (!$span->isVoid()) {
             $span->add('span.kind', 'client');
             $span->add('cache.system', 'redis');

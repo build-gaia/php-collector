@@ -71,6 +71,16 @@ final class RecordChronosRequest
         // request on exactly this boundary.
         NativeExtension::markPhase('dispatch');
 
+        // Per-request state for the Laravel-side collectors. BootTiming is
+        // deliberately NOT reset here: what it holds was measured during the
+        // bootstrap that just finished, and clearing it now would throw away the
+        // only reading of it. It is cleared at request end instead.
+        ChronosViewEngine::resetRequestState();
+        ExceptionCapture::reset();
+        // Emitted now rather than at boot because a span needs a trace context to
+        // belong to, and this is the first moment one exists.
+        BootTiming::emitBootSpan();
+
         try {
             $response = $next($request);
 
@@ -138,6 +148,11 @@ final class RecordChronosRequest
 
     private function hydrateRoot(Request $request): void
     {
+        // Before the facts are flushed: a transaction still open at request end was
+        // abandoned by a failure, and closing it is what keeps the queries beneath
+        // it in the trace at all.
+        RichTelemetryHooks::closeDanglingTransactions();
+        BootTiming::reset();
         try {
             $identity = $this->requestIdentity($request);
             $action = $identity['http.route.action'] ?? '';

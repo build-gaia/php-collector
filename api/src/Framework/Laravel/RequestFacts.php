@@ -47,6 +47,12 @@ final class RequestFacts
     /** @var array<string, int> */
     private static array $gates = [];
 
+    /** @var array<string, int> */
+    private static array $modelWrites = [];
+
+    /** @var array<string, int> */
+    private static array $exceptions = [];
+
     private static ?ActivityCatalog $events = null;
 
     private static ?ActivityCatalog $jobs = null;
@@ -59,12 +65,20 @@ final class RequestFacts
 
     private static int $droppedGates = 0;
 
+    private static int $droppedModelWrites = 0;
+
+    private static int $droppedExceptions = 0;
+
     public static function reset(): void
     {
         self::$views = [];
         self::$models = [];
         self::$mail = [];
         self::$gates = [];
+        self::$modelWrites = [];
+        self::$exceptions = [];
+        self::$droppedModelWrites = 0;
+        self::$droppedExceptions = 0;
         self::$droppedViews = 0;
         self::$droppedModels = 0;
         self::$droppedMail = 0;
@@ -86,6 +100,36 @@ final class RequestFacts
     public static function noteMail(string $type): void
     {
         self::note(self::$mail, self::$droppedMail, $type);
+    }
+
+    /**
+     * One Eloquent write, as `App\\Models\\User:created`.
+     *
+     * Kept apart from `framework.models` rather than folded into it, because the
+     * two answer different questions. That map counts HYDRATION — how many rows
+     * this request turned into objects, which is the N+1 question. This one counts
+     * PERSISTENCE, which is the "what did this request change" question, and a
+     * single number covering both would answer neither.
+     */
+    public static function noteModelWrite(string $class, string $operation): void
+    {
+        if ($class === '' || $operation === '') {
+            return;
+        }
+        self::note(self::$modelWrites, self::$droppedModelWrites, $class.':'.$operation);
+    }
+
+    /**
+     * One reported exception, by class.
+     *
+     * The spans ExceptionCapture emits carry the stack and the position in time;
+     * this count is what makes a recovered failure visible on the root without
+     * opening the trace, so a request that swallowed six timeouts does not read
+     * like one that did nothing.
+     */
+    public static function noteException(string $class): void
+    {
+        self::note(self::$exceptions, self::$droppedExceptions, $class);
     }
 
     /**
@@ -229,6 +273,8 @@ final class RequestFacts
         self::putCounts($attributes, 'framework.models', self::$models, self::$droppedModels);
         self::putCounts($attributes, 'framework.mail', self::$mail, self::$droppedMail);
         self::putCounts($attributes, 'framework.authorization', self::$gates, self::$droppedGates);
+        self::putCounts($attributes, 'framework.model.writes', self::$modelWrites, self::$droppedModelWrites);
+        self::putCounts($attributes, 'framework.exceptions', self::$exceptions, self::$droppedExceptions);
         self::events()->putInto($attributes, 'messaging.events');
         self::jobs()->putInto($attributes, 'messaging.jobs');
 
@@ -264,6 +310,21 @@ final class RequestFacts
                     $model = $observed->model ?? null;
                     if (is_object($model)) {
                         self::noteModel($model::class);
+                    }
+                });
+            }
+            foreach ([
+                \Illuminate\Database\Eloquent\Events\Created::class => 'created',
+                \Illuminate\Database\Eloquent\Events\Updated::class => 'updated',
+                \Illuminate\Database\Eloquent\Events\Deleted::class => 'deleted',
+            ] as $class => $operation) {
+                if (!class_exists($class)) {
+                    continue;
+                }
+                $event::listen($class, static function (object $observed) use ($operation): void {
+                    $model = $observed->model ?? null;
+                    if (is_object($model)) {
+                        self::noteModelWrite($model::class, $operation);
                     }
                 });
             }
@@ -517,6 +578,21 @@ final class RequestFacts
         return null;
     }
 
+    /**
+     * What was sent, named the way the application names it.
+     *
+     * A notification says so in the message data. A plain Mailable does not: by
+     * the time `MessageSent` fires, Laravel has reduced the Mailable to a view
+     * name and a data array, and the class is nowhere in the event — it is still
+     * on the CALL STACK, though, because `Mailable::send()` is what is running.
+     * Reading it back from there is the only way to record `App\\Mail\\OrderShipped`
+     * instead of the literal string `mail`, and it is bounded work: one
+     * argument-free backtrace, walked until the first Mailable frame.
+     *
+     * The subject line would have been the easy answer and is deliberately not
+     * used — subjects carry order numbers and customer names, and this class does
+     * not record payloads.
+     */
     private static function mailType(object $event): string
     {
         $data = is_array($event->data ?? null) ? $event->data : [];
@@ -526,7 +602,26 @@ final class RequestFacts
             }
         }
 
-        return 'mail';
+        return self::mailableFromCallStack() ?? 'mail';
+    }
+
+    /** The first `Illuminate\Mail\Mailable` subclass on the stack, if one is sending. */
+    private static function mailableFromCallStack(): ?string
+    {
+        try {
+            if (!class_exists(\Illuminate\Mail\Mailable::class)) {
+                return null;
+            }
+            foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 40) as $frame) {
+                $class = $frame['class'] ?? null;
+                if (is_string($class) && $class !== '' && is_subclass_of($class, \Illuminate\Mail\Mailable::class)) {
+                    return $class;
+                }
+            }
+        } catch (Throwable) {
+        }
+
+        return null;
     }
 
     /** @param array<string, int> $bucket */

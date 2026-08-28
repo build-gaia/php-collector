@@ -36,6 +36,7 @@ use Chronos\Collector\Replay\Report;
 use Chronos\Collector\Replay\Vocabulary;
 use Chronos\Collector\Framework\Guzzle\ImmediatePromise;
 use Chronos\Collector\Framework\Guzzle\ReplayMiddleware;
+use Chronos\Collector\Framework\Laravel\ExceptionCapture;
 use Chronos\Collector\Framework\Laravel\RequestFacts;
 use Chronos\Collector\Service\CacheCapture;
 use Chronos\Collector\Service\Span;
@@ -891,6 +892,58 @@ $runner->test('Laravel request facts hydrate the root with names and counts only
     $runner->assertSame('App\\Jobs\\IndexUser', $jobs[0]['name'] ?? null, 'job name');
     $runner->assertSame('default', $jobs[0]['queue'] ?? null, 'queue');
     $runner->assertTrue(!isset($attributes['laravel.jobs']), 'the old count dictionary is gone');
+});
+
+$runner->test('reads and writes are counted apart, because they answer different questions', static function (Runner $runner): void {
+    RequestFacts::reset();
+    RequestFacts::noteModel('App\\Models\\User');
+    RequestFacts::noteModel('App\\Models\\User');
+    RequestFacts::noteModelWrite('App\\Models\\User', 'updated');
+    RequestFacts::noteModelWrite('App\\Models\\Order', 'created');
+    RequestFacts::noteModelWrite('App\\Models\\Order', 'created');
+
+    $attributes = RequestFacts::snapshot();
+
+    // Hydration is the N+1 question; persistence is the "what changed" question.
+    // Folding them into one number would answer neither.
+    $runner->assertSame('{"App\\\\Models\\\\User":2}', $attributes['framework.models'] ?? null, 'hydration is unchanged');
+    $runner->assertSame(
+        '{"App\\\\Models\\\\Order:created":2,"App\\\\Models\\\\User:updated":1}',
+        $attributes['framework.model.writes'] ?? null,
+        'writes carry the operation',
+    );
+    $runner->assertTrue(!isset($attributes['framework.exceptions']), 'no exceptions, no key');
+});
+
+$runner->test('a recovered exception is on the root even though it never reached the response', static function (Runner $runner): void {
+    RequestFacts::reset();
+    ExceptionCapture::reset();
+
+    ExceptionCapture::record(new \RuntimeException('upstream timeout'));
+    ExceptionCapture::record(new \RuntimeException('upstream timeout again'));
+    ExceptionCapture::record(new \LogicException('bad state'));
+
+    $attributes = RequestFacts::snapshot();
+    $runner->assertSame(
+        '{"RuntimeException":2,"LogicException":1}',
+        $attributes['framework.exceptions'] ?? null,
+        'reported exceptions are counted by class',
+    );
+    $runner->assertSame(0, ExceptionCapture::droppedCount(), 'nothing dropped under the cap');
+});
+
+$runner->test('a request throwing in a loop reports its overflow instead of flooding the trace', static function (Runner $runner): void {
+    RequestFacts::reset();
+    ExceptionCapture::reset();
+    for ($i = 0; $i < 25; ++$i) {
+        ExceptionCapture::record(new \RuntimeException('again'));
+    }
+
+    // The cap bounds SPANS, not the count: the root still says it happened 25
+    // times, which is the number that tells you it is a loop.
+    $runner->assertSame(9, ExceptionCapture::droppedCount(), 'the overflow is reported, not hidden');
+    $attributes = RequestFacts::snapshot();
+    $runner->assertSame('{"RuntimeException":25}', $attributes['framework.exceptions'] ?? null, 'every occurrence is still counted');
 });
 
 $runner->test('the activity catalog counts repeats instead of duplicating them', static function (Runner $runner): void {
