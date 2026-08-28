@@ -94,6 +94,9 @@ final class RequestFacts
 
     public static function noteModel(string $class): void
     {
+        if ($class === '') {
+            return;
+        }
         self::note(self::$models, self::$droppedModels, $class);
     }
 
@@ -305,28 +308,29 @@ final class RequestFacts
         }
         try {
             $event = \Illuminate\Support\Facades\Event::class;
-            if (class_exists(\Illuminate\Database\Eloquent\Events\Retrieved::class)) {
-                $event::listen(\Illuminate\Database\Eloquent\Events\Retrieved::class, static function (object $observed): void {
-                    $model = $observed->model ?? null;
-                    if (is_object($model)) {
-                        self::noteModel($model::class);
-                    }
-                });
-            }
-            foreach ([
-                \Illuminate\Database\Eloquent\Events\Created::class => 'created',
-                \Illuminate\Database\Eloquent\Events\Updated::class => 'updated',
-                \Illuminate\Database\Eloquent\Events\Deleted::class => 'deleted',
-            ] as $class => $operation) {
-                if (!class_exists($class)) {
-                    continue;
-                }
-                $event::listen($class, static function (object $observed) use ($operation): void {
-                    $model = $observed->model ?? null;
-                    if (is_object($model)) {
-                        self::noteModelWrite($model::class, $operation);
-                    }
-                });
+            // The STRING events, not the Events\Retrieved class.
+            //
+            // Eloquent only dispatches its class-based events for a model that
+            // declares $dispatchesEvents for that hook; every ordinary model
+            // dispatches `eloquent.retrieved: App\Models\User` and nothing else
+            // (HasEvents::fireModelEvent). Listening for the class therefore heard
+            // nothing at all from a normal application, which is why this map
+            // could be empty on a request that hydrated thousands of rows.
+            //
+            // Only the string form is subscribed: a model that DOES declare
+            // $dispatchesEvents fires the class event and, when its listener
+            // returns nothing, the string event as well — so listening for both
+            // would count those models twice.
+            $event::listen('eloquent.retrieved: *', static function (string $name, array $payload = []): void {
+                self::noteModel(self::modelClassFromEvent($name, $payload));
+            });
+            foreach (['created', 'updated', 'deleted'] as $operation) {
+                $event::listen(
+                    'eloquent.'.$operation.': *',
+                    static function (string $name, array $payload = []) use ($operation): void {
+                        self::noteModelWrite(self::modelClassFromEvent($name, $payload), $operation);
+                    },
+                );
             }
             $event::listen('composing:*', static function (string $name, array $payload = []): void {
                 $view = $payload[0] ?? null;
@@ -425,6 +429,30 @@ final class RequestFacts
             });
         } catch (Throwable) {
         }
+    }
+
+    /**
+     * The model class behind an `eloquent.<hook>: App\Models\User` event.
+     *
+     * The name carries the class, and the payload carries the instance; the name
+     * is preferred because it is a string already and reading it cannot touch the
+     * model. The payload is the fallback for any dispatcher that delivers a bare
+     * hook name.
+     *
+     * @param array<mixed> $payload
+     */
+    private static function modelClassFromEvent(string $name, array $payload): string
+    {
+        $separator = strpos($name, ': ');
+        if ($separator !== false) {
+            $class = trim(substr($name, $separator + 2));
+            if ($class !== '') {
+                return $class;
+            }
+        }
+        $model = $payload[0] ?? null;
+
+        return is_object($model) ? $model::class : '';
     }
 
     /**

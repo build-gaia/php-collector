@@ -915,6 +915,17 @@ $runner->test('reads and writes are counted apart, because they answer different
     $runner->assertTrue(!isset($attributes['framework.exceptions']), 'no exceptions, no key');
 });
 
+$runner->test('a model with no resolvable class is dropped, not counted as blank', static function (Runner $runner): void {
+    RequestFacts::reset();
+    RequestFacts::noteModel('');
+    RequestFacts::noteModel('App\\Models\\User');
+    RequestFacts::noteModelWrite('', 'created');
+
+    $attributes = RequestFacts::snapshot();
+    $runner->assertSame('{"App\\\\Models\\\\User":1}', $attributes['framework.models'] ?? null, 'only the real class');
+    $runner->assertTrue(!isset($attributes['framework.model.writes']), 'a write with no class is not a write');
+});
+
 $runner->test('a recovered exception is on the root even though it never reached the response', static function (Runner $runner): void {
     RequestFacts::reset();
     ExceptionCapture::reset();
