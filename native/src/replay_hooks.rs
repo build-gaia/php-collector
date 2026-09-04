@@ -25,15 +25,42 @@ struct HookSlot {
 
 #[cfg(feature = "zend-observer")]
 static SLOTS: [HookSlot; 9] = [
-    HookSlot { name: "time", original: AtomicPtr::new(std::ptr::null_mut()) },
-    HookSlot { name: "microtime", original: AtomicPtr::new(std::ptr::null_mut()) },
-    HookSlot { name: "hrtime", original: AtomicPtr::new(std::ptr::null_mut()) },
-    HookSlot { name: "mt_rand", original: AtomicPtr::new(std::ptr::null_mut()) },
-    HookSlot { name: "rand", original: AtomicPtr::new(std::ptr::null_mut()) },
-    HookSlot { name: "random_int", original: AtomicPtr::new(std::ptr::null_mut()) },
-    HookSlot { name: "random_bytes", original: AtomicPtr::new(std::ptr::null_mut()) },
-    HookSlot { name: "uniqid", original: AtomicPtr::new(std::ptr::null_mut()) },
-    HookSlot { name: "getenv", original: AtomicPtr::new(std::ptr::null_mut()) },
+    HookSlot {
+        name: "time",
+        original: AtomicPtr::new(std::ptr::null_mut()),
+    },
+    HookSlot {
+        name: "microtime",
+        original: AtomicPtr::new(std::ptr::null_mut()),
+    },
+    HookSlot {
+        name: "hrtime",
+        original: AtomicPtr::new(std::ptr::null_mut()),
+    },
+    HookSlot {
+        name: "mt_rand",
+        original: AtomicPtr::new(std::ptr::null_mut()),
+    },
+    HookSlot {
+        name: "rand",
+        original: AtomicPtr::new(std::ptr::null_mut()),
+    },
+    HookSlot {
+        name: "random_int",
+        original: AtomicPtr::new(std::ptr::null_mut()),
+    },
+    HookSlot {
+        name: "random_bytes",
+        original: AtomicPtr::new(std::ptr::null_mut()),
+    },
+    HookSlot {
+        name: "uniqid",
+        original: AtomicPtr::new(std::ptr::null_mut()),
+    },
+    HookSlot {
+        name: "getenv",
+        original: AtomicPtr::new(std::ptr::null_mut()),
+    },
 ];
 
 const DELEGATE_NAME: &str = "chronos_replay_effect_delegate";
@@ -52,7 +79,9 @@ pub fn arm() {
             }
             let original = (*func).internal_function.handler;
             slot.original.store(
-                original.map(|f| f as *mut ()).unwrap_or(std::ptr::null_mut()),
+                original
+                    .map(|f| f as *mut ())
+                    .unwrap_or(std::ptr::null_mut()),
                 Ordering::SeqCst,
             );
             (*func).internal_function.handler = handler_for(slot.name);
@@ -190,14 +219,16 @@ unsafe fn write_scalar_return(return_value: *mut zval, function: &str, raw: &str
     let built: Zval = match function {
         "time" | "mt_rand" | "rand" | "random_int" => {
             if let Ok(n) = raw.parse::<i64>() {
-                n.into_zval(false).unwrap_or_else(|_| raw.into_zval(false).unwrap_or_default())
+                n.into_zval(false)
+                    .unwrap_or_else(|_| raw.into_zval(false).unwrap_or_default())
             } else {
                 raw.into_zval(false).unwrap_or_default()
             }
         }
         "microtime" | "hrtime" => {
             if let Ok(n) = raw.parse::<f64>() {
-                n.into_zval(false).unwrap_or_else(|_| raw.into_zval(false).unwrap_or_default())
+                n.into_zval(false)
+                    .unwrap_or_else(|_| raw.into_zval(false).unwrap_or_default())
             } else {
                 raw.into_zval(false).unwrap_or_default()
             }
@@ -210,7 +241,10 @@ unsafe fn write_scalar_return(return_value: *mut zval, function: &str, raw: &str
 #[cfg(feature = "zend-observer")]
 macro_rules! define_hook {
     ($fn_name:ident, $symbol:expr, $kind:expr) => {
-        unsafe extern "C" fn $fn_name(execute_data: *mut zend_execute_data, return_value: *mut zval) {
+        unsafe extern "C" fn $fn_name(
+            execute_data: *mut zend_execute_data,
+            return_value: *mut zval,
+        ) {
             if let Some(raw) = try_delegate($kind, $symbol) {
                 write_scalar_return(return_value, $symbol, &raw);
                 return;
@@ -239,7 +273,8 @@ define_hook!(hook_uniqid, "uniqid", "random");
 
 #[cfg(feature = "zend-observer")]
 unsafe extern "C" fn hook_getenv(execute_data: *mut zend_execute_data, return_value: *mut zval) {
-    let name = crate::observer::zend_helpers::arg_scalar_string(execute_data, 0, 4096).unwrap_or_default();
+    let name =
+        crate::observer::zend_helpers::arg_scalar_string(execute_data, 0, 4096).unwrap_or_default();
     if let Some(raw) = try_delegate("env", &name) {
         write_scalar_return(return_value, "getenv", &raw);
         return;

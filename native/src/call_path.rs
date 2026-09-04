@@ -43,8 +43,11 @@ impl Default for Caps {
 impl Caps {
     pub fn from_env() -> Self {
         Self {
-            max_events: crate::settings::u32_value("CHRONOS_PHP_DST_CALL_PATH_MAX", DEFAULT_MAX_EVENTS)
-                .max(1),
+            max_events: crate::settings::u32_value(
+                "CHRONOS_PHP_DST_CALL_PATH_MAX",
+                DEFAULT_MAX_EVENTS,
+            )
+            .max(1),
             max_depth: crate::settings::u32_value(
                 "CHRONOS_PHP_DST_CALL_PATH_MAX_DEPTH",
                 DEFAULT_MAX_DEPTH,
@@ -180,6 +183,9 @@ mod tests {
         let excluded = vec!["/vendor/".to_owned(), "/node_modules/".to_owned()];
         assert!(is_first_party(None, &excluded));
         assert!(is_first_party(Some("/app/Http/Kernel.php"), &excluded));
-        assert!(!is_first_party(Some("/app/vendor/laravel/framework/x.php"), &excluded));
+        assert!(!is_first_party(
+            Some("/app/vendor/laravel/framework/x.php"),
+            &excluded
+        ));
     }
 }
