@@ -41,9 +41,26 @@ pub const SETTING_NAMES: &[&str] = &[
     "CHRONOS_PHP_LOGS_ENABLED",
     "CHRONOS_PHP_PROFILER_ENABLED",
     "CHRONOS_PHP_PROFILE_SAMPLE_RATE",
+    "CHRONOS_PHP_PROFILE_REQUEST_RATE",
+    "CHRONOS_PHP_PROFILE_JOB_RATE",
+    "CHRONOS_PHP_PROFILE_TOKEN",
+    "CHRONOS_PHP_SAMPLE_RATE_DENOMINATOR",
     "CHRONOS_PHP_PROFILE_TYPES",
     "CHRONOS_PHP_PROFILE_SERIES_ID",
     "CHRONOS_PHP_PROFILE_IO_MIN_US",
+    // Deterministic (counted) profile aggregates — ADR 0029. Nine names, and all nine
+    // must be here: `get()` reads process env unconditionally, so an unregistered name
+    // APPEARS to work while `chronos.*` INI and `.chronos` support silently do not
+    // exist for it. That is the quiet failure mode.
+    "CHRONOS_PHP_PROFILE_DETERMINISTIC",
+    "CHRONOS_PHP_PROFILE_DETERMINISTIC_MAX_FUNCTIONS",
+    "CHRONOS_PHP_PROFILE_EDGES",
+    "CHRONOS_PHP_PROFILE_EDGES_MAX",
+    "CHRONOS_PHP_PROFILE_ARGS",
+    "CHRONOS_PHP_PROFILE_ARGS_MAX_ARGS",
+    "CHRONOS_PHP_PROFILE_ARGS_MAX_ARG_BYTES",
+    "CHRONOS_PHP_PROFILE_ARGS_MAX_TOTAL_BYTES",
+    "CHRONOS_PHP_PROFILE_ARGS_MAX_INVOCATIONS",
     "CHRONOS_PHP_DST_ENABLED",
     "CHRONOS_PHP_ENV",
     "CHRONOS_PHP_DST_CALL_PATH_MAX",
@@ -118,11 +135,24 @@ pub fn flag(env_name: &str, default: bool) -> bool {
 }
 
 pub fn u32_value(env_name: &str, default: u32) -> u32 {
-    get(env_name).and_then(|v| v.parse().ok()).unwrap_or(default)
+    get(env_name)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// A written sample rate. Parsed as a float because rates are fractions now
+/// (`0.1`), while the legacy basis-point spelling (`10000`) is a whole number —
+/// `rate::resolve` tells the two apart, so both have to survive parsing here.
+pub fn f64_value(env_name: &str, default: f64) -> f64 {
+    get(env_name)
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 pub fn u64_value(env_name: &str, default: u64) -> u64 {
-    get(env_name).and_then(|v| v.parse().ok()).unwrap_or(default)
+    get(env_name)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 pub fn string(env_name: &str, default: &str) -> String {
@@ -153,7 +183,9 @@ fn read_chronos_file() -> HashMap<String, String> {
         if !value.is_empty() {
             let path = Path::new(value);
             starts.push(if key == "SCRIPT_FILENAME" {
-                path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf())
+                path.parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| path.to_path_buf())
             } else {
                 path.to_path_buf()
             });
@@ -183,7 +215,9 @@ fn parse_chronos_file(body: &str) -> HashMap<String, String> {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line).trim();
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         let mut value = value.trim();
         if value.len() >= 2

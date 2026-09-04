@@ -59,8 +59,16 @@ pub struct CallFrame {
     trace_id: String,
     span_id: String,
     parent_span_id: Option<String>,
-    name: String,
+    /// The canonical function identity, INTERNED. An `Rc<str>` rather than a `String`
+    /// because this used to be the second of two heap allocations every observed call
+    /// paid before anything was decided (see `deterministic::NameInterner`); cloning the
+    /// interned handle is a refcount bump and the allocation is gone from the hot path.
+    name: std::rc::Rc<str>,
     started_at: String,
+    /// The SPAN clock. Zero on an `ObserveOnly` frame, deliberately and still: this
+    /// field feeds `on_end`'s duration and min-duration logic, and an `ObserveOnly`
+    /// frame must never become a span. The deterministic clock is `timing` below —
+    /// two fields, two purposes, no possibility of confusing them.
     start_hrtime: u128,
     /// If this call is a network function, the traceparent we injected.
     injected_traceparent: Option<String>,
@@ -74,6 +82,11 @@ pub struct CallFrame {
     attributes: Vec<(String, String)>,
     /// A known I/O call, so its measured duration also becomes an I/O profile sample.
     io: bool,
+    /// The DETERMINISTIC clock and this frame's child-time accumulator (ADR 0029).
+    /// Carried on the observer's own frame stack so the aggregate never maintains a
+    /// parallel stack of its own — which is what would desync it on the requests where
+    /// the `ObserveOnly` push is skipped.
+    timing: crate::deterministic::FrameTiming,
 }
 
 impl CallFrame {
@@ -81,12 +94,12 @@ impl CallFrame {
     /// (and to carry the name for DST result recording). Skips span-id generation,
     /// wall-clock formatting, and parent lookup — this runs for every unlisted
     /// userland call, so it must stay cheap.
-    fn observe_only(name: &str) -> Self {
+    fn observe_only(name: std::rc::Rc<str>) -> Self {
         CallFrame {
             trace_id: String::new(),
             span_id: String::new(),
             parent_span_id: None,
-            name: name.to_owned(),
+            name,
             started_at: String::new(),
             start_hrtime: 0,
             injected_traceparent: None,
@@ -95,6 +108,9 @@ impl CallFrame {
             kept_child: false,
             attributes: Vec::new(),
             io: false,
+            // Stamped by `push_frame`, which is the only thing allowed to create a
+            // counted frame. See its doc comment for why it cannot be stamped here.
+            timing: crate::deterministic::FrameTiming::default(),
         }
     }
 }
@@ -135,6 +151,21 @@ pub fn trace_function(name: &str) {
     if let Ok(mut set) = traced_functions().write() {
         set.insert(name.to_owned());
     }
+    // Invalidate every cached policy verdict. `observe_policy` is otherwise pure in the
+    // inputs the interner already holds, and the manifest is its ONE mutable input —
+    // so bumping a generation here is what makes caching the verdict exactly equivalent
+    // to recomputing it, rather than a behaviour change that only shows up on a worker
+    // whose manifest registered after its first call to the function.
+    MANIFEST_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bumped by [`trace_function`]. Monotonic per process, and only ever advanced during
+/// manifest registration — so in steady state every cached verdict is a hit.
+static MANIFEST_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "zend-observer")]
+fn manifest_generation() -> u64 {
+    MANIFEST_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// PHP identifiers are case-insensitive, so fall back to a linear case-insensitive
@@ -201,14 +232,19 @@ pub fn clear_request_context() {
     CURL_HEADERS.with(|h| h.borrow_mut().clear());
 }
 
-fn on_begin(context: &TraceContext, function_name: &str, policy: SpanPolicy) -> CallFrame {
+fn on_begin(
+    context: &TraceContext,
+    function_name: &std::rc::Rc<str>,
+    policy: SpanPolicy,
+) -> CallFrame {
     let span_id = hex_bytes(8);
     let emit_span = policy != SpanPolicy::ObserveOnly;
-    let parent_span_id = SPAN_STACK.with(|stack| {
-        let stack = stack.borrow();
-        stack.last().cloned()
-    })
-    .or_else(|| Some(context.span_id.clone()));
+    let parent_span_id = SPAN_STACK
+        .with(|stack| {
+            let stack = stack.borrow();
+            stack.last().cloned()
+        })
+        .or_else(|| Some(context.span_id.clone()));
 
     if emit_span {
         SPAN_STACK.with(|stack| stack.borrow_mut().push(span_id.clone()));
@@ -229,7 +265,7 @@ fn on_begin(context: &TraceContext, function_name: &str, policy: SpanPolicy) -> 
         trace_id: context.trace_id.clone(),
         span_id,
         parent_span_id,
-        name: function_name.to_owned(),
+        name: function_name.clone(),
         started_at: now_utc(),
         start_hrtime: monotonic_nanos(),
         injected_traceparent: traceparent,
@@ -238,6 +274,8 @@ fn on_begin(context: &TraceContext, function_name: &str, policy: SpanPolicy) -> 
         kept_child: false,
         attributes: Vec::new(),
         io: policy == SpanPolicy::IoSpan,
+        // Stamped by `push_frame`. See its doc comment.
+        timing: crate::deterministic::FrameTiming::default(),
     }
 }
 
@@ -288,7 +326,10 @@ fn on_end(frame: CallFrame, threw: bool) -> bool {
         trace_id: frame.trace_id,
         span_id: frame.span_id,
         parent_span_id: frame.parent_span_id,
-        name: frame.name,
+        // The one place the interned identity is copied into an owned String: a span
+        // that actually survives the keep rule. Rare by construction, unlike the
+        // per-call allocation this replaced.
+        name: frame.name.to_string(),
         started_at: frame.started_at,
         ended_at: now_utc(),
         status: if threw { "error".into() } else { "ok".into() },
@@ -369,7 +410,11 @@ pub fn root_http_span(
         trace_id: context.trace_id.clone(),
         span_id: context.span_id.clone(),
         parent_span_id: context.parent_span_id.clone(),
-        name: if name.is_empty() { "request".to_owned() } else { name.to_owned() },
+        name: if name.is_empty() {
+            "request".to_owned()
+        } else {
+            name.to_owned()
+        },
         started_at,
         ended_at: now_utc(),
         status: if !status.is_empty() {
@@ -385,11 +430,7 @@ pub fn root_http_span(
 }
 
 /// Functions that make outbound network calls and need traceparent injection.
-const NETWORK_FUNCTIONS: &[&str] = &[
-    "curl_exec",
-    "curl_multi_exec",
-    "file_get_contents",
-];
+const NETWORK_FUNCTIONS: &[&str] = &["curl_exec", "curl_multi_exec", "file_get_contents"];
 
 fn is_network_function(name: &str) -> bool {
     NETWORK_FUNCTIONS.contains(&name)
@@ -410,16 +451,17 @@ fn is_dual_purpose_stream_function(name: &str) -> bool {
 /// `data://`, `compress.*://`, a bare relative path and everything else unnamed here
 /// are local, and a wrapper nobody listed should read as local rather than quietly
 /// producing a client span for a file read.
-const REMOTE_STREAM_SCHEMES: &[&str] =
-    &["http://", "https://", "ftp://", "ftps://", "sftp://", "ssh2."];
+const REMOTE_STREAM_SCHEMES: &[&str] = &[
+    "http://", "https://", "ftp://", "ftps://", "sftp://", "ssh2.",
+];
 
 /// Whether a stream target actually goes over the network. Scheme comparison is
 /// case-insensitive because PHP's wrapper lookup is.
 fn is_remote_stream_target(target: &str) -> bool {
     let target = target.trim_start();
-    REMOTE_STREAM_SCHEMES
-        .iter()
-        .any(|scheme| target.len() >= scheme.len() && target[..scheme.len()].eq_ignore_ascii_case(scheme))
+    REMOTE_STREAM_SCHEMES.iter().any(|scheme| {
+        target.len() >= scheme.len() && target[..scheme.len()].eq_ignore_ascii_case(scheme)
+    })
 }
 
 /// SQL calls that ARE the I/O. Method-scoped, not class-scoped: PDO/PDOStatement
@@ -520,7 +562,10 @@ fn excluded_paths() -> &'static Vec<String> {
     static PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     PATHS.get_or_init(|| match crate::settings::get("CHRONOS_PHP_EXCLUDE_PATHS") {
         Some(list) => parse_excluded_paths(&list),
-        None => DEFAULT_EXCLUDED_PATHS.iter().map(|s| (*s).to_owned()).collect(),
+        None => DEFAULT_EXCLUDED_PATHS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
     })
 }
 
@@ -542,7 +587,9 @@ fn is_excluded_path(file: &str, excluded: &[String]) -> bool {
     if file.is_empty() {
         return false;
     }
-    excluded.iter().any(|fragment| file.contains(fragment.as_str()))
+    excluded
+        .iter()
+        .any(|fragment| file.contains(fragment.as_str()))
 }
 
 /// Decide what to do with an observed call. `is_internal` is true for engine
@@ -607,8 +654,7 @@ pub fn install_observer() {
         ext_php_rs::ffi::zend_throw_exception_hook = Some(chronos_throw_trampoline);
     }
     #[cfg(not(feature = "zend-observer"))]
-    {
-    }
+    {}
 }
 
 #[cfg(feature = "zend-observer")]
@@ -699,25 +745,199 @@ unsafe extern "C" fn chronos_observer_factory(
     }
 }
 
-#[cfg(feature = "zend-observer")]
-
 /// ADR 0021 Phase 2: retain a first-party call visit when DST is armed.
+///
+/// ADR 0029 Tier 3 deepens the same event rather than adding a parallel one:
+/// `arguments` (already allowlisted, typed, redacted and capped by
+/// `capture_tier_three_arguments`) ride the existing `call` payload as
+/// `arg<N>.name` / `arg<N>.type` / `arg<N>.value` keys. A path-diff that can say WHICH
+/// argument the two runs disagreed on is a materially deeper execution graph than one
+/// that can only say the same function was reached, and it costs no new event kind, no
+/// new spool schema and no second budget.
 #[cfg(feature = "zend-observer")]
-fn record_call_path_enter(name: &str, is_internal: bool, defining_file: Option<&str>) {
+fn record_call_path_enter(
+    name: &str,
+    is_internal: bool,
+    defining_file: Option<&str>,
+    arguments: &[crate::deterministic::CapturedArgument],
+) {
     if is_internal || !crate::dst_spool::is_active() {
         return;
     }
     let first_party = crate::call_path::is_first_party(defining_file, excluded_paths());
     let caps = crate::call_path::caps();
     if let Some(depth) = crate::call_path::on_enter(&caps, first_party) {
-        crate::dst_spool::record(
-            crate::dst_spool::DstEventKind::Call,
-            vec![
-                ("name".to_owned(), name.to_owned()),
-                ("depth".to_owned(), depth.to_string()),
-            ],
-        );
+        let mut payload = vec![
+            ("name".to_owned(), name.to_owned()),
+            ("depth".to_owned(), depth.to_string()),
+        ];
+        for argument in arguments {
+            let prefix = format!("arg{}", argument.position);
+            if !argument.name.is_empty() {
+                payload.push((format!("{prefix}.name"), argument.name.clone()));
+            }
+            // The TYPE is always recorded, including for a composite whose value was
+            // refused: "argument 3 was an array" is evidence about the path and leaks
+            // nothing.
+            payload.push((
+                format!("{prefix}.type"),
+                argument.argument_type.proto_name().to_owned(),
+            ));
+            if !argument.value.is_empty() {
+                payload.push((format!("{prefix}.value"), argument.value.clone()));
+            }
+            if argument.redacted {
+                payload.push((format!("{prefix}.redacted"), "true".to_owned()));
+            }
+            if argument.truncated {
+                payload.push((format!("{prefix}.truncated"), "true".to_owned()));
+            }
+        }
+        crate::dst_spool::record(crate::dst_spool::DstEventKind::Call, payload);
     }
+}
+
+/// One call's function identity, resolved through the per-process interner.
+///
+/// This is where the two heap allocations every observed call used to pay before
+/// anything was decided are removed: `zend_helpers::function_name`'s
+/// `format!("{class}::{method}")` and `CallFrame::observe_only`'s owned copy now happen
+/// once per FUNCTION per PROCESS. A hit costs one map probe and three refcount bumps.
+///
+/// Returns `None` only when the runtime has no function to describe at all, which is
+/// also the case in which the old code produced an empty name and `observe_policy`
+/// refused it.
+#[cfg(feature = "zend-observer")]
+unsafe fn interned_function(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+) -> Option<crate::deterministic::InternedFunction> {
+    let handle = zend_helpers::function_ptr(execute_data);
+    if handle == 0 {
+        // No stable key to intern against. Fall back to interning by NAME — a string
+        // comparison per call rather than per function, which is the price of not
+        // having a key, but never a wrong identity and never a missing row.
+        return Some(crate::deterministic::intern_named(
+            zend_helpers::function_facts(execute_data)?,
+        ));
+    }
+    Some(crate::deterministic::intern(handle, || {
+        zend_helpers::function_facts(execute_data).unwrap_or_default()
+    }))
+}
+
+/// The observer's span verdict for an interned function, cached per function.
+///
+/// WHY THIS IS SAFE TO CACHE, given the warning on `observe_policy` itself. That
+/// warning is about the ZEND factory's cache, which decides whether handlers are
+/// attached AT ALL and cannot be revisited. This cache is ours, it is keyed by
+/// [`crate::deterministic::FunctionId`], and it is invalidated by
+/// [`MANIFEST_GENERATION`] — the only mutable input `observe_policy` has. Every other
+/// input (the name, the internal flag, `span_all_userland`'s `OnceLock`) is fixed for
+/// the life of the process, so a generation-matched hit is byte-identical to a
+/// recomputation.
+///
+/// A `Vec` indexed by id rather than a second map: ids are dense and monotonic, so this
+/// is an array index, and it keeps the deterministic module free of any knowledge of
+/// `SpanPolicy`.
+#[cfg(feature = "zend-observer")]
+fn cached_policy(
+    id: crate::deterministic::FunctionId,
+    name: &str,
+    is_internal: bool,
+) -> Option<SpanPolicy> {
+    let generation = manifest_generation();
+    let index = id as usize;
+    let hit = POLICY_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(index)
+            .copied()
+            .flatten()
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.policy)
+    });
+    if let Some(policy) = hit {
+        return policy;
+    }
+    let policy = observe_policy(name, is_internal);
+    POLICY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() <= index {
+            cache.resize(index + 1, None);
+        }
+        cache[index] = Some(CachedPolicy { generation, policy });
+    });
+    policy
+}
+
+#[cfg(feature = "zend-observer")]
+#[derive(Clone, Copy)]
+struct CachedPolicy {
+    generation: u64,
+    policy: Option<SpanPolicy>,
+}
+
+/// Tier 3: bounded, redacted, scalar-only arguments for a manifest-allowlisted call.
+///
+/// FOUR independent gates, all of which must pass, and none of which this function is
+/// allowed to skip: the request must have armed Tier 3 (a forced profile or an armed
+/// DST recording), the function must be userland, and it must be named by the
+/// instrumentation manifest. `CHRONOS_PHP_PROFILE_ARGS` is the fourth and is checked
+/// inside `arguments_active`.
+///
+/// Returns the captured arguments so the caller can ALSO hang them on the DST
+/// call-path event — the same evidence, once, in both places a reader looks.
+#[cfg(feature = "zend-observer")]
+unsafe fn capture_tier_three_arguments(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    interned: &crate::deterministic::InternedFunction,
+) -> Vec<crate::deterministic::CapturedArgument> {
+    if interned.internal || !crate::deterministic::arguments_active() {
+        return Vec::new();
+    }
+    // The manifest allowlist, re-checked here rather than trusted from the policy:
+    // `ManifestSpan` is not the only policy an allowlisted function can end up with
+    // (an allowlisted I/O method keeps `IoSpan`), and Tier 3 follows the ALLOWLIST, not
+    // the span decision.
+    if !is_traced(&interned.name) {
+        return Vec::new();
+    }
+    let config = crate::deterministic::config();
+    let (arguments, dropped) = zend_helpers::capture_scalar_arguments(
+        execute_data,
+        config.max_arguments,
+        config.max_argument_bytes,
+    );
+    if arguments.is_empty() && dropped == 0 {
+        return Vec::new();
+    }
+    if crate::deterministic::record_arguments(interned.id, arguments.clone(), dropped) {
+        arguments
+    } else {
+        // Refused by a budget. The refusal is already counted in `truncation`; handing
+        // the arguments to the DST graph anyway would route around the byte cap.
+        Vec::new()
+    }
+}
+
+/// Push a prepared frame onto the observer's stack, stamping the deterministic clock in
+/// the same breath.
+///
+/// THE ONE PLACE a counted frame comes into existence, and that is the point:
+/// `deterministic::on_enter` increments a call count and a recursion depth that only the
+/// matching pop can unwind, so an enter that is not immediately followed by a push is a
+/// frame the end trampoline can never balance.
+///
+/// It also has to be LAST rather than merely paired. `inject_curl_traceparent` calls back
+/// into PHP — `curl_setopt`, which is itself an observed function with its own
+/// trampolines — so a start stamped before the frame was assembled would charge our own
+/// header injection to the observed call, and would hand the injected call's duration to
+/// this frame's parent while this frame's inclusive time covered it too. Double counted,
+/// plausible-looking, and invisible.
+#[cfg(feature = "zend-observer")]
+fn push_frame(mut frame: CallFrame, function: crate::deterministic::FunctionId) {
+    frame.timing = crate::deterministic::on_enter(function, monotonic_nanos_u64());
+    CALL_FRAMES.with(|frames| frames.borrow_mut().push(frame));
 }
 
 #[cfg(feature = "zend-observer")]
@@ -728,6 +948,7 @@ fn record_call_path_leave(is_internal: bool) {
     crate::call_path::on_leave();
 }
 
+#[cfg(feature = "zend-observer")]
 unsafe extern "C" fn chronos_begin_trampoline(
     execute_data: *mut ext_php_rs::ffi::zend_execute_data,
 ) {
@@ -737,12 +958,21 @@ unsafe extern "C" fn chronos_begin_trampoline(
 
     // Consume any profiler ticks the SIGPROF handler queued since the last
     // function-call boundary. This is the safe walk point: we are at a Zend
-    // instruction boundary, never inside a signal handler.
+    // instruction boundary, never inside a signal handler. MUST stay first: ticks are
+    // drained at the instruction boundary, not deferred behind our own bookkeeping.
     crate::sampler::consume_pending_ticks();
 
-    let name = zend_helpers::function_name(execute_data).unwrap_or_default();
-    let is_internal = zend_helpers::is_internal_function(execute_data);
-    let Some(mut policy) = observe_policy(&name, is_internal) else { return };
+    // ONE dereference of `(*execute_data).func`, cached per function: name, defining
+    // file, line and the internal flag all come off the same struct, and the old shape
+    // re-walked the pointer once per helper once per call.
+    let Some(interned) = interned_function(execute_data) else {
+        return;
+    };
+    let name = interned.name.clone();
+    let is_internal = interned.internal;
+    let Some(mut policy) = cached_policy(interned.id, &name, is_internal) else {
+        return;
+    };
 
     // Userland SQL/cache instrumentation is active for this request: its spans
     // are richer (host/db/bound params), so the native ones stand down. The
@@ -768,26 +998,24 @@ unsafe extern "C" fn chronos_begin_trampoline(
     // Where the observed userland function is DEFINED — the file that owns the code,
     // not the file that called it. Used both to drop dependency internals and, when a
     // span survives, to tell the reader which source file it came from.
-    let defining_file = if is_internal {
-        None
-    } else {
-        zend_helpers::defining_file(execute_data)
-    };
+    //
+    // Read off the INTERNED origin rather than re-resolved per call: a function's
+    // defining file is fixed for the life of the process, so this was a third heap
+    // allocation on every observed call for a string that never changes.
+    let defining_file: Option<&str> = if is_internal { None } else { interned.file() };
     // Manifest spans are explicit intent (`chronos_trace_function`) and are NEVER
     // dropped by the path rule: someone asked for that function by name, and a
     // dependency they chose to instrument is theirs to see.
     if policy == SpanPolicy::UserSpan
-        && defining_file
-            .as_deref()
-            .is_some_and(|file| is_excluded_path(file, excluded_paths()))
+        && defining_file.is_some_and(|file| is_excluded_path(file, excluded_paths()))
     {
         policy = SpanPolicy::ObserveOnly;
     }
 
     // Track curl header configuration so traceparent injection is merge-safe.
-    if name == "curl_setopt" {
+    if &*name == "curl_setopt" {
         track_curl_setopt(execute_data);
-    } else if name == "curl_setopt_array" {
+    } else if &*name == "curl_setopt_array" {
         track_curl_setopt_array(execute_data);
     }
 
@@ -798,9 +1026,18 @@ unsafe extern "C" fn chronos_begin_trampoline(
         let has_context = REQUEST_CONTEXT.with(|ctx| ctx.borrow().is_some());
         // Pair begin/end whenever we have a request context OR DST is armed: call-path
         // depth must stay balanced with leave in the end trampoline.
+        //
+        // The deterministic aggregate rides STRICTLY inside this guard, and that is
+        // load-bearing. The end trampoline pops unconditionally, so counting an enter
+        // the guard refused to push would leave a frame the pop can never balance —
+        // and the aggregate would drift a little further wrong on every request. The
+        // buffer therefore never owns a stack; it is handed back the timing this frame
+        // carries. `has_context` is true for every request the collector actually
+        // started, sampled or not, which is exactly Tier 1's always-on scope.
         if has_context || crate::dst_spool::is_active() {
-            record_call_path_enter(&name, is_internal, defining_file.as_deref());
-            CALL_FRAMES.with(|frames| frames.borrow_mut().push(CallFrame::observe_only(&name)));
+            let arguments = capture_tier_three_arguments(execute_data, &interned);
+            record_call_path_enter(&name, is_internal, defining_file, &arguments);
+            push_frame(CallFrame::observe_only(name), interned.id);
         }
         return;
     }
@@ -819,8 +1056,10 @@ unsafe extern "C" fn chronos_begin_trampoline(
             // The source file behind a userland span. Internal functions have none,
             // and this is the same identity the profiler already reports per frame —
             // never an argument or a captured value.
-            if let Some(ref file) = defining_file {
-                frame.attributes.push(("code.filepath".into(), file.clone()));
+            if let Some(file) = defining_file {
+                frame
+                    .attributes
+                    .push(("code.filepath".into(), file.to_owned()));
             }
             if policy == SpanPolicy::ManifestSpan {
                 // Explicit user intent: the attribute both marks provenance for the UI
@@ -832,15 +1071,19 @@ unsafe extern "C" fn chronos_begin_trampoline(
             }
 
             if let Some(ref traceparent) = frame.injected_traceparent {
-                if name == "curl_exec" {
+                if &*name == "curl_exec" {
                     inject_curl_traceparent(execute_data, traceparent);
                 }
                 // curl_multi_exec / file_get_contents: covered by the pending-
                 // traceparent userland seam (Guzzle middleware, Http facade).
             }
 
-            record_call_path_enter(&name, is_internal, defining_file.as_deref());
-            CALL_FRAMES.with(|frames| frames.borrow_mut().push(frame));
+            let arguments = capture_tier_three_arguments(execute_data, &interned);
+            record_call_path_enter(&name, is_internal, defining_file, &arguments);
+            // Same enter-and-push as the ObserveOnly branch above, through the same
+            // helper, so Tier 1 covers ALL observed calls rather than only the unlisted
+            // ones — and so neither branch can drift from the other.
+            push_frame(frame, interned.id);
         }
     });
 }
@@ -853,21 +1096,28 @@ unsafe fn capture_io_detail(
     execute_data: *mut ext_php_rs::ffi::zend_execute_data,
     frame: &mut CallFrame,
 ) {
-    let name = frame.name.as_str();
+    let name: &str = &frame.name;
     frame.attributes.push(("span.kind".into(), "client".into()));
     // Arg 0 is a cache KEY only on data operations — on lifecycle methods
     // (__construct, connect, auth, …) it is a host or credential, not a key.
-    let lifecycle_method = name
-        .rsplit("::")
-        .next()
-        .is_some_and(|method| {
-            matches!(
-                method,
-                "__construct" | "__destruct" | "connect" | "pconnect" | "open"
-                    | "auth" | "select" | "close" | "setOption" | "getOption"
-                    | "addServer" | "addServers" | "quit"
-            )
-        });
+    let lifecycle_method = name.rsplit("::").next().is_some_and(|method| {
+        matches!(
+            method,
+            "__construct"
+                | "__destruct"
+                | "connect"
+                | "pconnect"
+                | "open"
+                | "auth"
+                | "select"
+                | "close"
+                | "setOption"
+                | "getOption"
+                | "addServer"
+                | "addServers"
+                | "quit"
+        )
+    });
     if name.starts_with("Redis::") || name.starts_with("RedisCluster::") {
         frame.attributes.push(("db.system".into(), "redis".into()));
         if !lifecycle_method {
@@ -876,14 +1126,20 @@ unsafe fn capture_io_detail(
             }
         }
     } else if name.starts_with("Memcached::") {
-        frame.attributes.push(("db.system".into(), "memcached".into()));
+        frame
+            .attributes
+            .push(("db.system".into(), "memcached".into()));
         if !lifecycle_method {
             if let Some(key) = zend_helpers::arg_scalar_string(execute_data, 0, 256) {
                 frame.attributes.push(("cache.key".into(), key));
             }
         }
-    } else if name == "PDO::query" || name == "PDO::exec" || name == "PDO::prepare"
-        || name == "mysqli::query" || name == "SQLite3::query" || name == "SQLite3::exec"
+    } else if name == "PDO::query"
+        || name == "PDO::exec"
+        || name == "PDO::prepare"
+        || name == "mysqli::query"
+        || name == "SQLite3::query"
+        || name == "SQLite3::exec"
     {
         if let Some(statement) = zend_helpers::arg_scalar_string(execute_data, 0, 4096) {
             frame.attributes.push(("db.statement".into(), statement));
@@ -907,10 +1163,37 @@ unsafe extern "C" fn chronos_end_trampoline(
     CALL_FRAMES.with(|frames| {
         let frame = frames.borrow_mut().pop();
         if let Some(mut frame) = frame {
+            // The DETERMINISTIC clock is read FIRST, before any of the bookkeeping
+            // below: curl result capture calls back into PHP (`curl_getinfo`) and DST
+            // recording formats strings, and charging our own instrumentation's cost to
+            // the observed function would be the one bias a counted profiler must not
+            // have.
+            let leave_nanos = monotonic_nanos_u64();
+
+            // Bank the deterministic aggregate immediately, BEFORE the curl/DST
+            // bookkeeping below and before `on_end` consumes the frame.
+            //
+            // Ordering, not taste: `capture_curl_result` calls back into PHP
+            // (`curl_getinfo`), and doing our own accounting first means no
+            // re-entrant observed call can interleave with it. The caller is read off
+            // the frame BELOW this one on the observer's OWN stack — the same stack the
+            // pop came from — so a Tier 2 edge can never name a caller the frame stack
+            // does not actually have.
+            let timing = frame.timing;
+            let caller = frames.borrow().last().map(|parent| parent.timing.function);
+            let duration = crate::deterministic::on_leave(&timing, caller, leave_nanos);
+            // Exclusive time is `duration - child_nanoseconds`, so every frame hands its
+            // inclusive duration up to its parent as it leaves. Done even when the
+            // aggregate refused to count THIS frame (the function cap), because the
+            // parent's exclusive time is still wrong without it.
+            if let Some(parent) = frames.borrow_mut().last_mut() {
+                parent.timing.child_nanoseconds =
+                    parent.timing.child_nanoseconds.saturating_add(duration);
+            }
             // Everything an outbound HTTP call knows is only knowable now: curl fills
             // its timing and response info in during the transfer, and the body is the
             // return value we are holding.
-            if frame.name == "curl_exec" {
+            if &*frame.name == "curl_exec" {
                 capture_curl_result(execute_data, retval, &mut frame);
             }
             // DST: record the observed result of known non-deterministic builtins.
@@ -922,14 +1205,11 @@ unsafe extern "C" fn chronos_end_trampoline(
                         let name_arg = zend_helpers::arg_scalar_string(execute_data, 0, 4096)
                             .unwrap_or_default();
                         let value = zend_helpers::scalar_to_string(retval).unwrap_or_default();
-                        vec![
-                            ("name".to_owned(), name_arg),
-                            ("value".to_owned(), value),
-                        ]
+                        vec![("name".to_owned(), name_arg), ("value".to_owned(), value)]
                     } else {
                         let value = zend_helpers::scalar_to_string(retval).unwrap_or_default();
                         vec![
-                            ("function".to_owned(), frame.name.clone()),
+                            ("function".to_owned(), frame.name.to_string()),
                             ("result".to_owned(), value),
                         ]
                     };
@@ -951,6 +1231,11 @@ unsafe extern "C" fn chronos_end_trampoline(
 #[cfg(feature = "zend-observer")]
 thread_local! {
     static CALL_FRAMES: RefCell<Vec<CallFrame>> = const { RefCell::new(Vec::new()) };
+    /// Cached `observe_policy` verdicts, indexed by interned function id. Per PROCESS
+    /// in spirit (PHP-FPM is one request per worker), and deliberately NOT reset
+    /// between requests: the verdict depends only on the function and the manifest
+    /// generation, both of which outlive the request. See `cached_policy`.
+    static POLICY_CACHE: RefCell<Vec<Option<CachedPolicy>>> = const { RefCell::new(Vec::new()) };
     /// Per-curl-handle custom header lists observed via curl_setopt, keyed by the
     /// CurlHandle object handle id. Injection merges with these instead of clobbering.
     static CURL_HEADERS: RefCell<std::collections::HashMap<u32, Vec<String>>> =
@@ -995,22 +1280,25 @@ unsafe fn capture_curl_result(
                 .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
                 .collect();
             if let Some(json) = crate::http_capture::encode_header_map(pairs, &config) {
-                frame.attributes.push((crate::http_capture::REQUEST_HEADERS.into(), json));
+                frame
+                    .attributes
+                    .push((crate::http_capture::REQUEST_HEADERS.into(), json));
             }
         }
     }
 
-    let content_type = info
-        .get("content_type")
-        .cloned()
-        .unwrap_or_default();
+    let content_type = info.get("content_type").cloned().unwrap_or_default();
     if let Some(code) = info.get("http_code").and_then(|c| c.parse::<i64>().ok()) {
         if code > 0 {
-            frame.attributes.push(("http.status_code".into(), code.to_string()));
+            frame
+                .attributes
+                .push(("http.status_code".into(), code.to_string()));
         }
     }
     if !content_type.is_empty() {
-        frame.attributes.push(("http.response.content_type".into(), content_type.clone()));
+        frame
+            .attributes
+            .push(("http.response.content_type".into(), content_type.clone()));
     }
     if let Some(ip) = info.get("primary_ip").filter(|ip| !ip.is_empty()) {
         frame.attributes.push(("server.address".into(), ip.clone()));
@@ -1019,7 +1307,9 @@ unsafe fn capture_curl_result(
         frame.attributes.push(("server.port".into(), port.clone()));
     }
     if let Some(method) = info.get("effective_method").filter(|m| !m.is_empty()) {
-        frame.attributes.push(("http.method".into(), method.clone()));
+        frame
+            .attributes
+            .push(("http.method".into(), method.clone()));
     }
 
     // The body, but only when CURLOPT_RETURNTRANSFER made curl_exec return one; a
@@ -1042,7 +1332,9 @@ unsafe fn capture_curl_result(
     }
 
     if let Some(timeline) = curl_timeline(&info) {
-        frame.attributes.push((crate::http_capture::TIMELINE.into(), timeline));
+        frame
+            .attributes
+            .push((crate::http_capture::TIMELINE.into(), timeline));
     }
 }
 
@@ -1056,7 +1348,9 @@ unsafe fn capture_curl_result(
 #[cfg(feature = "zend-observer")]
 fn curl_timeline(info: &std::collections::HashMap<String, String>) -> Option<String> {
     let seconds = |key: &str| -> Option<f64> {
-        info.get(key).and_then(|value| value.parse::<f64>().ok()).filter(|v| *v > 0.0)
+        info.get(key)
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
     };
     let total = seconds("total_time")?;
     let namelookup = seconds("namelookup_time").unwrap_or(0.0);
@@ -1070,7 +1364,14 @@ fn curl_timeline(info: &std::collections::HashMap<String, String>) -> Option<Str
     let marks: Vec<(&str, f64)> = vec![
         ("dns", namelookup),
         ("connect", connect),
-        ("tls", if appconnect > 0.0 { appconnect } else { connect }),
+        (
+            "tls",
+            if appconnect > 0.0 {
+                appconnect
+            } else {
+                connect
+            },
+        ),
         ("send", pretransfer),
         ("wait", starttransfer),
         ("download", total),
@@ -1104,8 +1405,12 @@ const CURLOPT_HTTPHEADER: i64 = 10023;
 /// `curl_setopt($ch, CURLOPT_HTTPHEADER, [...])`.
 #[cfg(feature = "zend-observer")]
 unsafe fn track_curl_setopt(execute_data: *mut ext_php_rs::ffi::zend_execute_data) {
-    let Some(handle) = zend_helpers::arg_object_handle(execute_data, 0) else { return };
-    let Some(option) = zend_helpers::arg_long(execute_data, 1) else { return };
+    let Some(handle) = zend_helpers::arg_object_handle(execute_data, 0) else {
+        return;
+    };
+    let Some(option) = zend_helpers::arg_long(execute_data, 1) else {
+        return;
+    };
     if option != CURLOPT_HTTPHEADER {
         return;
     }
@@ -1118,8 +1423,11 @@ unsafe fn track_curl_setopt(execute_data: *mut ext_php_rs::ffi::zend_execute_dat
 /// Record headers set through `curl_setopt_array($ch, [CURLOPT_HTTPHEADER => [...]])`.
 #[cfg(feature = "zend-observer")]
 unsafe fn track_curl_setopt_array(execute_data: *mut ext_php_rs::ffi::zend_execute_data) {
-    let Some(handle) = zend_helpers::arg_object_handle(execute_data, 0) else { return };
-    let Some(headers) = zend_helpers::arg_array_key_string_array(execute_data, 1, CURLOPT_HTTPHEADER)
+    let Some(handle) = zend_helpers::arg_object_handle(execute_data, 0) else {
+        return;
+    };
+    let Some(headers) =
+        zend_helpers::arg_array_key_string_array(execute_data, 1, CURLOPT_HTTPHEADER)
     else {
         return;
     };
@@ -1144,7 +1452,9 @@ unsafe fn inject_curl_traceparent(
     // Publish for userland retrieval regardless of whether direct injection works.
     PENDING_TRACEPARENT.with(|tp| *tp.borrow_mut() = Some(traceparent.to_owned()));
 
-    let Some(handle) = zend_helpers::arg_object_handle(execute_data, 0) else { return };
+    let Some(handle) = zend_helpers::arg_object_handle(execute_data, 0) else {
+        return;
+    };
 
     let mut headers = CURL_HEADERS
         .with(|map| map.borrow().get(&handle).cloned())
@@ -1205,6 +1515,66 @@ pub(crate) mod zend_helpers {
             }
         }
         Some(name.into_owned())
+    }
+
+    /// The runtime's own handle for the observed function, as an opaque `usize`.
+    ///
+    /// THE interning key. `zend_function` is allocated once per function and lives as
+    /// long as the process (op arrays and internal function structs are engine-owned and
+    /// cached), which is exactly the property an interner needs — and it is the same key
+    /// the Zend observer factory itself caches its verdict on, so a hit here is a hit
+    /// there. `0` means "no handle", never a valid function.
+    ///
+    /// Returned as a `usize` rather than a pointer so the interner can live in a module
+    /// with no Zend types and stay unit-testable without PHP.
+    pub unsafe fn function_ptr(execute_data: *mut ext_php_rs::ffi::zend_execute_data) -> usize {
+        if execute_data.is_null() {
+            return 0;
+        }
+        (*execute_data).func as usize
+    }
+
+    /// Everything the interner needs about a function, from ONE walk of its
+    /// `zend_function`: canonical name, module, defining file, declaring line, and
+    /// whether it is engine-internal.
+    ///
+    /// Called only on an interner MISS, which is what makes it affordable to be this
+    /// thorough. Every pointer is null-checked before dereference — `panic = "abort"` is
+    /// set for the release profile, so an unwrap here is a worker crash, not an error.
+    pub unsafe fn function_facts(
+        execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    ) -> Option<crate::deterministic::FunctionFacts> {
+        if execute_data.is_null() {
+            return None;
+        }
+        let func = (*execute_data).func;
+        if func.is_null() {
+            return None;
+        }
+        let name = function_name(execute_data)?;
+        let internal = (*func).type_ != ext_php_rs::ffi::ZEND_USER_FUNCTION as u8;
+        // `module` uses the same vocabulary the sampler's stack walk writes to
+        // `SampleFrame::module`, so a counted row and a sampled frame describe their
+        // origin identically.
+        let module: std::rc::Rc<str> = if internal {
+            std::rc::Rc::from("internal")
+        } else {
+            std::rc::Rc::from("php")
+        };
+        let (file, line) = if internal {
+            (std::rc::Rc::from(""), 0)
+        } else {
+            let file: std::rc::Rc<str> = match defining_file(execute_data) {
+                Some(file) => std::rc::Rc::from(file.as_str()),
+                None => std::rc::Rc::from(""),
+            };
+            (file, (*func).op_array.line_start)
+        };
+        Some(crate::deterministic::FunctionFacts {
+            name,
+            origin: crate::deterministic::FunctionOrigin { module, file, line },
+            internal,
+        })
     }
 
     /// The compiled-file path of a userland function's op array — where the function is
@@ -1272,7 +1642,11 @@ pub(crate) mod zend_helpers {
         if class_name.is_null() {
             return None;
         }
-        Some(CStr::from_ptr((*class_name).val.as_ptr()).to_string_lossy().into_owned())
+        Some(
+            CStr::from_ptr((*class_name).val.as_ptr())
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     /// Read one of a `Throwable`'s own properties (`message`, `code`, `file`, `line`) at
@@ -1335,11 +1709,13 @@ pub(crate) mod zend_helpers {
         (execute_data.add(1) as *mut ext_php_rs::ffi::zval).add(index)
     }
 
+    const IS_NULL: u8 = 1;
     const IS_LONG: u8 = 4;
     const IS_DOUBLE: u8 = 5;
     const IS_STRING: u8 = 6;
     const IS_ARRAY: u8 = 7;
     const IS_OBJECT: u8 = 8;
+    const IS_RESOURCE: u8 = 9;
     const IS_TRUE: u8 = 3;
     const IS_FALSE: u8 = 2;
 
@@ -1425,6 +1801,109 @@ pub(crate) mod zend_helpers {
         })
     }
 
+    /// Map a zval's type tag onto the Tier 3 argument vocabulary.
+    ///
+    /// Anything unrecognised reads as `Null`, which carries a type and no value — the
+    /// conservative answer, and never a guess at content.
+    unsafe fn argument_type_of(
+        zv: *const ext_php_rs::ffi::zval,
+    ) -> crate::deterministic::ArgumentType {
+        use crate::deterministic::ArgumentType;
+        match zval_type(zv) {
+            IS_TRUE | IS_FALSE => ArgumentType::Bool,
+            IS_LONG => ArgumentType::Int,
+            IS_DOUBLE => ArgumentType::Float,
+            IS_STRING => ArgumentType::Str,
+            IS_ARRAY => ArgumentType::Array,
+            IS_OBJECT => ArgumentType::Object,
+            IS_RESOURCE => ArgumentType::Resource,
+            IS_NULL => ArgumentType::Null,
+            // IS_UNDEF, IS_REFERENCE and anything a future PHP adds. Never a guess at
+            // content: an unrecognised tag reports a type and no value.
+            _ => ArgumentType::Null,
+        }
+    }
+
+    /// The declared parameter name at `index`, when the runtime exposes one.
+    ///
+    /// Only read for USER functions: an internal function's `arg_info` is a
+    /// `zend_internal_arg_info` whose `name` is a plain `char*`, a different layout at
+    /// the same offset, and reading one as the other would be a wild dereference.
+    unsafe fn declared_argument_name(
+        func: *mut ext_php_rs::ffi::zend_function,
+        index: usize,
+    ) -> String {
+        if func.is_null() || (*func).type_ != ext_php_rs::ffi::ZEND_USER_FUNCTION as u8 {
+            return String::new();
+        }
+        let arg_info = (*func).common.arg_info;
+        if arg_info.is_null() || index >= (*func).common.num_args as usize {
+            return String::new();
+        }
+        let info = arg_info.add(index);
+        let name = (*info).name;
+        if name.is_null() {
+            return String::new();
+        }
+        CStr::from_ptr((*name).val.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// TIER 3: this call's arguments as bounded, typed, redacted records.
+    ///
+    /// SCALARS ONLY. An object, array or resource records its TYPE and never its value:
+    /// "argument 3 was an array" is evidence and leaks nothing, while the array itself is
+    /// unbounded application data that ADR 0017 refuses. The refusal lives in
+    /// `deterministic::capture_argument`, before redaction, so no reordering of this
+    /// function can serialise an object's contents.
+    ///
+    /// Redaction reuses the collector's existing pattern list, so an `$apiToken`
+    /// parameter is masked by exactly the rule that masks an `Authorization` header.
+    ///
+    /// Returns `(captured, dropped_by_count)`. The caller is responsible for having
+    /// checked the manifest allowlist and the Tier 3 arming gate — this function is a
+    /// reader, not a policy.
+    pub unsafe fn capture_scalar_arguments(
+        execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+        max_arguments: usize,
+        max_bytes: usize,
+    ) -> (Vec<crate::deterministic::CapturedArgument>, u32) {
+        if execute_data.is_null() {
+            return (Vec::new(), 0);
+        }
+        let func = (*execute_data).func;
+        let argc = (*execute_data).This.u2.num_args as usize;
+        let taken = argc.min(max_arguments);
+        let dropped = u32::try_from(argc.saturating_sub(taken)).unwrap_or(u32::MAX);
+        let mut captured = Vec::with_capacity(taken);
+        for index in 0..taken {
+            let zv = arg_zval(execute_data, index);
+            let (argument_type, raw) = if zv.is_null() {
+                (crate::deterministic::ArgumentType::Null, None)
+            } else {
+                let argument_type = argument_type_of(zv);
+                let raw = if argument_type.carries_value() {
+                    zval_to_owned_string(zv)
+                } else {
+                    None
+                };
+                (argument_type, raw)
+            };
+            let name = declared_argument_name(func, index);
+            let redact = crate::http_capture::redacts_identifier(&name);
+            captured.push(crate::deterministic::capture_argument(
+                u32::try_from(index).unwrap_or(u32::MAX),
+                name,
+                argument_type,
+                raw,
+                redact,
+                max_bytes,
+            ));
+        }
+        (captured, dropped)
+    }
+
     /// Read arg `index` as a PHP list of strings.
     pub unsafe fn arg_string_array(
         execute_data: *mut ext_php_rs::ffi::zend_execute_data,
@@ -1460,9 +1939,7 @@ pub(crate) mod zend_helpers {
         array_string_values((*vz).value.arr)
     }
 
-    unsafe fn array_string_values(
-        arr: *mut ext_php_rs::ffi::zend_array,
-    ) -> Option<Vec<String>> {
+    unsafe fn array_string_values(arr: *mut ext_php_rs::ffi::zend_array) -> Option<Vec<String>> {
         if arr.is_null() {
             return None;
         }
@@ -1520,7 +1997,9 @@ pub(crate) mod zend_helpers {
         let Ok(result) = func.try_call(vec![ch_ref]) else {
             return out;
         };
-        let Some(table) = result.array() else { return out };
+        let Some(table) = result.array() else {
+            return out;
+        };
         for (key, value) in table.iter() {
             let key = match key {
                 ArrayKey::String(k) => k,
@@ -1551,7 +2030,9 @@ pub(crate) mod zend_helpers {
             return None;
         }
         let zv = &*(retval as *const ext_php_rs::types::Zval);
-        zv.str().map(std::borrow::ToOwned::to_owned).filter(|s| !s.is_empty())
+        zv.str()
+            .map(std::borrow::ToOwned::to_owned)
+            .filter(|s| !s.is_empty())
     }
 
     /// The URL configured on the curl handle in arg 0 of the observed
@@ -1578,13 +2059,31 @@ pub(crate) mod zend_helpers {
 }
 
 fn now_utc() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+        .to_string()
 }
 
 fn monotonic_nanos() -> u128 {
     use std::time::Instant;
     thread_local! { static ORIGIN: Instant = Instant::now(); }
     ORIGIN.with(|origin| origin.elapsed().as_nanos())
+}
+
+/// The deterministic aggregate's clock, in `u64` nanoseconds.
+///
+/// THE SAME ORIGIN as [`monotonic_nanos`] above, and that matters: there are three
+/// independent `monotonic_nanos` implementations in this crate (here, `sampler.rs`,
+/// `lib.rs`), each with its own private origin, so values are NOT comparable across
+/// modules. Frame durations are already computed against this one, so the counted
+/// aggregate uses it too — a begin stamped by one clock and an end by another would
+/// produce durations that are plausible, wrong, and impossible to spot.
+///
+/// Saturating rather than wrapping on the cast: `u64` nanoseconds is 584 years of
+/// process uptime, so the clamp is unreachable, and a wrap would silently produce a
+/// negative-looking duration where a clamp produces an obviously stuck one.
+fn monotonic_nanos_u64() -> u64 {
+    u64::try_from(monotonic_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1602,7 +2101,10 @@ mod tests {
             "sftp://files.internal/report.csv",
             "ssh2.sftp://files.internal/report.csv",
         ] {
-            assert!(is_remote_stream_target(target), "{target} is a network fetch");
+            assert!(
+                is_remote_stream_target(target),
+                "{target} is a network fetch"
+            );
         }
     }
 
@@ -1635,13 +2137,28 @@ mod tests {
 
     #[test]
     fn dependency_paths_are_excluded_and_application_paths_are_not() {
-        let excluded = DEFAULT_EXCLUDED_PATHS.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        assert!(is_excluded_path("/srv/app/vendor/symfony/Kernel.php", &excluded));
-        assert!(is_excluded_path("/srv/app/node_modules/x/index.php", &excluded));
-        assert!(!is_excluded_path("/srv/app/src/Orders/Controller.php", &excluded));
+        let excluded = DEFAULT_EXCLUDED_PATHS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
+        assert!(is_excluded_path(
+            "/srv/app/vendor/symfony/Kernel.php",
+            &excluded
+        ));
+        assert!(is_excluded_path(
+            "/srv/app/node_modules/x/index.php",
+            &excluded
+        ));
+        assert!(!is_excluded_path(
+            "/srv/app/src/Orders/Controller.php",
+            &excluded
+        ));
         // "vendor" as part of an application's own name is not the dependency tree;
         // the fragments carry their separators for exactly this reason.
-        assert!(!is_excluded_path("/srv/app/src/VendorPayouts.php", &excluded));
+        assert!(!is_excluded_path(
+            "/srv/app/src/VendorPayouts.php",
+            &excluded
+        ));
     }
 
     #[test]
@@ -1657,7 +2174,10 @@ mod tests {
         // A stray comma would otherwise contribute an empty fragment, which
         // `contains` matches against every path — silencing the whole service.
         let parsed = parse_excluded_paths("/vendor/, ,/node_modules/,");
-        assert_eq!(parsed, vec!["/vendor/".to_owned(), "/node_modules/".to_owned()]);
+        assert_eq!(
+            parsed,
+            vec!["/vendor/".to_owned(), "/node_modules/".to_owned()]
+        );
         assert!(!is_excluded_path("/srv/app/src/Controller.php", &parsed));
     }
 
@@ -1665,7 +2185,10 @@ mod tests {
     fn an_empty_exclude_list_excludes_nothing() {
         let parsed = parse_excluded_paths("");
         assert!(parsed.is_empty());
-        assert!(!is_excluded_path("/srv/app/vendor/symfony/Kernel.php", &parsed));
+        assert!(!is_excluded_path(
+            "/srv/app/vendor/symfony/Kernel.php",
+            &parsed
+        ));
     }
 
     // --- Policy ------------------------------------------------------------
@@ -1681,6 +2204,9 @@ mod tests {
         // The factory's verdict is cached per function by Zend, so the policy here must
         // stay IoSpan; the per-call demotion to ObserveOnly happens in the begin
         // handler, which is the only place the argument exists.
-        assert_eq!(observe_policy("file_get_contents", true), Some(SpanPolicy::IoSpan));
+        assert_eq!(
+            observe_policy("file_get_contents", true),
+            Some(SpanPolicy::IoSpan)
+        );
     }
 }

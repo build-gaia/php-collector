@@ -16,19 +16,30 @@
 //! The `zend-observer` feature gate controls unsafe FFI. Without it the extension loads
 //! inert (smoke-testable on any PHP version).
 
+// Without `zend-observer` the observer's begin/end trampolines are not compiled, so
+// everything only they call — `CallFrame`, `on_begin`, `on_end`, the span clocks — reads
+// as dead. That build exists to smoke-load the extension on an unsupported PHP and to run
+// the crate's pure unit tests; treating its unused-code warnings as findings would mean
+// gating half the observer on a feature it has nothing to do with. The DEFAULT build
+// still warns normally, which is the build that ships.
+#![cfg_attr(not(feature = "zend-observer"), allow(dead_code))]
+
 use ext_php_rs::prelude::*;
 
+pub mod call_path;
 pub mod config;
 pub mod context;
-pub mod call_path;
+pub mod deterministic;
+pub mod deterministic_spool;
 pub mod dst_spool;
 pub mod http_capture;
 pub mod log_spool;
 pub mod metrics_spool;
 pub mod observer;
 pub mod profile_spool;
-pub mod request_attributes;
+pub mod rate;
 pub mod replay_hooks;
+pub mod request_attributes;
 pub mod sampler;
 pub mod settings;
 pub mod spool;
@@ -75,7 +86,11 @@ unsafe extern "C" fn request_startup(_ty: i32, _mod_num: i32) -> i32 {
 /// fatal-error net) run BEFORE module RSHUTDOWN, so when the SDK is present this is
 /// a no-op on the already-ended request; without the SDK it is the flush.
 unsafe extern "C" fn request_shutdown(_ty: i32, _mod_num: i32) -> i32 {
-    let status = i64::from(ext_php_rs::zend::SapiGlobals::get().sapi_headers().http_response_code);
+    let status = i64::from(
+        ext_php_rs::zend::SapiGlobals::get()
+            .sapi_headers()
+            .http_response_code,
+    );
     chronos_request_end(status, String::new(), None, None, None, None, None, None);
     0
 }
@@ -107,8 +122,30 @@ fn native_request_start() {
             header.to_owned()
         }
     };
+    // The forced-profile directive, read the same way and in the same breath:
+    // header first, then cookie, so a browser session can carry it hands-free
+    // once while a one-off curl can pass it per request.
+    let profile_directive = {
+        let header = http_capture::lookup(&server, "HTTP_X_CHRONOS_PROFILE");
+        if header.is_empty() {
+            cookie_value(
+                http_capture::lookup(&server, "HTTP_COOKIE"),
+                "chronos_profile",
+            )
+        } else {
+            header.to_owned()
+        }
+    };
 
-    start_request(&traceparent, &session_id, &dst_directive, method, "", String::new());
+    start_request(
+        &traceparent,
+        &session_id,
+        &dst_directive,
+        &profile_directive,
+        method,
+        "",
+        String::new(),
+    );
 }
 
 /// Extract one cookie's value from a raw `Cookie:` header line.
@@ -120,29 +157,109 @@ fn cookie_value(raw: &str, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Head-sampling decision for a locally-rooted trace: `bps` basis points out of 10_000.
-fn head_sample(bps: u32) -> bool {
-    if bps >= 10_000 {
-        return true;
-    }
-    if bps == 0 {
+/// Does this request's profile directive arm a forced profile?
+///
+/// The directive must carry the configured shared secret. An EMPTY `token`
+/// disables the mechanism outright — that is the default, and it is why a
+/// service has to opt in before any header can make it do extra work. Compared
+/// in constant time: the comparison is against a secret, and a length-or-prefix
+/// early exit leaks it a byte at a time to anyone who can time responses.
+///
+/// The value may be the bare token or `profile=<token>`, so the directive can
+/// ride the same `a=b;c=d` shape the DST one uses when a cookie carries both.
+fn profile_forced(directive: &str, token: &str) -> bool {
+    if token.is_empty() || directive.is_empty() {
         return false;
     }
-    rand::thread_rng().gen_range(0..10_000u32) < bps
+    directive.split(&[';', ','][..]).any(|part| {
+        let part = part.trim();
+        let offered = part.strip_prefix("profile=").unwrap_or(part);
+        constant_time_eq(offered.as_bytes(), token.as_bytes())
+    })
+}
+
+/// Length-independent byte comparison. Returns false for differing lengths, but
+/// only after a fixed-cost pass over the offered value, so neither the answer
+/// nor the timing narrows the secret.
+fn constant_time_eq(offered: &[u8], secret: &[u8]) -> bool {
+    let mut difference = u8::from(offered.len() != secret.len());
+    for (index, byte) in offered.iter().enumerate() {
+        // Index into the secret cyclically on a length mismatch: the loop must
+        // not shorten to the common prefix, which is what would time-leak it.
+        difference |= byte ^ secret[index % secret.len().max(1)];
+    }
+    difference == 0 && !secret.is_empty()
+}
+
+/// Roll a resolved rate's die: `parts` faces out of `denominator` sample.
+fn head_sample(rate: rate::SampleRate) -> bool {
+    if rate.parts == 0 {
+        return false;
+    }
+    if rate.parts >= rate.denominator {
+        return true;
+    }
+    rand::thread_rng().gen_range(0..rate.denominator) < rate.parts
+}
+
+/// The HTTP verbs a real web request arrives with. Anything else in the method
+/// slot is a BACKGROUND JOB — `QUEUE` from the Laravel bridge, an empty string
+/// from a native CLI start, `CRON`/`CONSUME` from whatever bridge lands next.
+///
+/// Deliberately a positive list of web verbs rather than a list of job words:
+/// a new job vocabulary that nobody remembered to register here would otherwise
+/// be silently profiled at the WEB rate, which is zero by default — a worker
+/// that quietly reports nothing is exactly the failure this default exists to
+/// prevent, and a new HTTP verb is far rarer than a new kind of worker.
+const WEB_METHODS: [&str; 9] = [
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+];
+
+fn is_background_job(http_method: &str) -> bool {
+    let method = http_method.trim();
+    !WEB_METHODS
+        .iter()
+        .any(|verb| verb.eq_ignore_ascii_case(method))
 }
 
 fn heartbeat(config: &CollectorConfig) {
     if HEARTBEAT_SENT.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    // Rates are printed as the fraction actually IN FORCE, not as written. A
+    // value quantised away by the resolution, or read back as legacy basis
+    // points, differs from what the file says — and the whole point of saying
+    // it out loud once per process is that the difference is findable in a log
+    // rather than in a bill.
+    let legacy = [
+        ("apm_sample_rate", config.apm_sample_rate),
+        ("profile_request_rate", config.profile_request_rate),
+        ("profile_job_rate", config.profile_job_rate),
+    ]
+    .iter()
+    .filter(|(_, rate)| rate.spelling == rate::Spelling::LegacyBasisPoints)
+    .map(|(name, _)| *name)
+    .collect::<Vec<_>>();
     let summary = format!(
-        "chronos-collector active: apm={} sample_bps={} logs={} profiler={} dst={} metrics={}",
+        "chronos-collector active: apm={} apm_rate={} logs={} profiler={} \
+         profile_request_rate={} profile_job_rate={} rate_denominator={} dst={} metrics={}{}",
         config.apm_enabled,
-        config.apm_sample_rate_bps,
+        config.apm_sample_rate.effective_fraction(),
         config.logs_enabled,
         config.profiler_enabled,
+        config.profile_request_rate.effective_fraction(),
+        config.profile_job_rate.effective_fraction(),
+        config.apm_sample_rate.denominator,
         config.dst_enabled,
         config.runtime_metrics_enabled,
+        if legacy.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " | read as legacy basis points (write these as fractions, 0.1 = a tenth): {}",
+                legacy.join(", ")
+            )
+        },
     );
     // Lands in the SAPI error log (docker logs) even when log shipping is off.
     eprintln!("[chronos-ext] {summary}");
@@ -153,7 +270,9 @@ fn heartbeat(config: &CollectorConfig) {
             body: summary,
             trace_id: String::new(),
             span_id: String::new(),
-            observed_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+            observed_at: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                .to_string(),
             attributes: vec![("chronos.heartbeat".into(), "true".into())],
         });
     }
@@ -179,13 +298,24 @@ pub fn chronos_request_start(
     service_name: String,
 ) {
     if REQUEST_CONFIG.with(|c| c.borrow().is_some()) {
-        enrich_request(&session_id, &dst_directive, &http_method, &route_pattern, &service_name);
+        enrich_request(
+            &session_id,
+            &dst_directive,
+            &http_method,
+            &route_pattern,
+            &service_name,
+        );
         return;
     }
     start_request(
         &traceparent,
         &session_id,
         &dst_directive,
+        // No profile directive on this path, and the PHP signature stays as it
+        // is: reaching here means RINIT did NOT start the request, which is the
+        // CLI/worker case — there are no request headers or cookies to carry a
+        // directive. Every web request is armed natively before PHP runs.
+        "",
         http_method,
         &route_pattern,
         service_name,
@@ -197,12 +327,21 @@ fn start_request(
     traceparent: &str,
     session_id: &str,
     dst_directive: &str,
+    profile_directive: &str,
     http_method: String,
     route_pattern: &str,
     service_name: String,
 ) {
-    let tp = if traceparent.is_empty() { None } else { Some(traceparent) };
-    let sid = if session_id.is_empty() { None } else { Some(session_id) };
+    let tp = if traceparent.is_empty() {
+        None
+    } else {
+        Some(traceparent)
+    };
+    let sid = if session_id.is_empty() {
+        None
+    } else {
+        Some(session_id)
+    };
     let mut context = TraceContext::from_header(tp, sid);
 
     let config = CollectorConfig::resolve();
@@ -217,10 +356,55 @@ fn start_request(
 
     heartbeat(&config);
 
+    // The profile decision, made BEFORE the trace decision because it can force it.
+    //
+    //   forced  — the directive carried the shared secret. Always profiles.
+    //   rolled  — the rate die for this workload came up. Independent of the
+    //             APM rate, so "1% profiling" means 1% of requests rather than
+    //             1% of whatever APM already kept.
+    //
+    // A profile with no sampled trace to hang off is an orphan: the desktop
+    // reaches a profile THROUGH its request, so anything that profiles must also
+    // trace. Hence the upgrade below rather than an `&& context.sampled` gate.
+    let forced_profile =
+        config.profiler_enabled && profile_forced(profile_directive, &config.profile_token);
+    // Web requests and background jobs get their own rates. Which one applies is
+    // read off the method: see `is_background_job`.
+    // Captured before `http_method` is moved into thread-local state below.
+    let background_job = is_background_job(&http_method);
+    let profile_rate = if background_job {
+        config.profile_job_rate
+    } else {
+        config.profile_request_rate
+    };
+    let profile_this_request = if !config.profiler_enabled {
+        false
+    } else if forced_profile {
+        true
+    } else if context.parent_span_id.is_none() {
+        head_sample(profile_rate)
+    } else {
+        // An inbound traceparent already decided whether this trace is kept, and
+        // rolling our own die on a child would force-sample one service of a
+        // distributed trace against its root's decision. So a child profiles only
+        // within a trace that is already sampled — which does mean the effective
+        // rate here is the profile rate TIMES the caller's, and that is stated in
+        // the install guide rather than silently surprising someone.
+        context.sampled && head_sample(profile_rate)
+    };
+
     // Head sampling: only a locally-rooted trace makes its own decision; an inbound
     // traceparent's sampled flag is always honored so traces stay whole across services.
     if context.parent_span_id.is_none() {
-        context.sampled = head_sample(config.apm_sample_rate_bps);
+        context.sampled = head_sample(config.apm_sample_rate);
+    }
+    // A profiled request is always a traced one — see above. On a child request
+    // this can only be reached by a FORCED profile, which is an explicit human
+    // instruction and so is allowed to override the root's sampling decision;
+    // the result is a partial distributed trace, which is the honest outcome of
+    // asking one service for a profile the caller never asked for.
+    if profile_this_request {
+        context.sampled = true;
     }
 
     let envelope = config.envelope.clone();
@@ -229,7 +413,9 @@ fn start_request(
     REQUEST_CONTEXT.with(|c| *c.borrow_mut() = Some(context.clone()));
     REQUEST_START_NS.with(|s| *s.borrow_mut() = monotonic_nanos());
     REQUEST_STARTED_AT.with(|s| {
-        *s.borrow_mut() = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+        *s.borrow_mut() = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string();
     });
     REQUEST_HTTP_METHOD.with(|m| *m.borrow_mut() = http_method);
     REQUEST_SERVICE_NAME.with(|n| *n.borrow_mut() = service_name.clone());
@@ -237,6 +423,12 @@ fn start_request(
     observer::set_request_context(context.clone());
     log_spool::reset();
     request_attributes::reset();
+    // Deterministic aggregates (ADR 0029) are armed on EVERY request the collector
+    // starts, not on the sample verdict and not behind `profiler_enabled`. Tier 1's
+    // buffer is O(distinct functions), so "always on with a kill switch" is affordable
+    // where the sampler's timer and stack walks are not — and a service that samples 1%
+    // of requests still gets exact call counts for 100% of them.
+    deterministic::reset_request(config.deterministic);
 
     // Full HTTP stack capture rides the head-sampling decision for the same reason
     // profiling does: an unsampled request has no span to hang headers off, so
@@ -252,19 +444,40 @@ fn start_request(
     let directive_records = dst_directive
         .split(&[';', ','][..])
         .any(|part| matches!(part.trim(), "record" | "record=1" | "record=true"));
-    if config.dst_enabled || directive_records {
+    let dst_armed = config.dst_enabled || directive_records;
+    if dst_armed {
         dst_spool::activate();
     } else {
         dst_spool::reset();
     }
 
-    // Profiling rides the APM head-sampling decision: `context.sampled` is the
-    // `CHRONOS_PHP_APM_SAMPLE_RATE` verdict (or an inbound traceparent's), so a profiled
-    // request is always one that also has a trace, and an unsampled request arms no
-    // timer and walks no stacks.
-    if config.profiler_enabled && context.sampled {
+    // TIER 3 (bounded, redacted, scalar-only argument capture on manifest-allowlisted
+    // functions) needs TWO independent gates and this is the second one.
+    // `CHRONOS_PHP_PROFILE_ARGS` says the deployment ALLOWS it; this says the REQUEST
+    // asked for it — either by carrying the forced-profile secret, or by arming a DST
+    // recording that a replay will need argument-level path detail from. A flag alone
+    // never turns argument capture on for ordinary traffic, deliberately.
+    if forced_profile || dst_armed {
+        deterministic::arm_arguments();
+    }
+
+    // Profiling runs on its OWN verdict (decided above), not on the APM one. An
+    // unprofiled request arms no timer and walks no stacks.
+    if profile_this_request {
         if let Some(sampler_config) = sampler::SamplerConfig::resolve() {
             sampler::on_request_start(&context, &sampler_config);
+            // Why this profile exists, on the profile itself: a reader looking at
+            // a flame graph needs to know whether they are seeing a representative
+            // sample or the one request somebody forced, because the two answer
+            // completely different questions about the service.
+            sampler::set_label("trigger", if forced_profile { "forced" } else { "sampled" });
+            // Jobs and web requests are sampled at different rates, so a reader
+            // aggregating profiles has to be able to separate the populations —
+            // mixing a tenth of the jobs into a percent of the requests would
+            // over-weight the jobs by a factor nobody can see on a flame graph.
+            if background_job {
+                sampler::set_label("workload", "job");
+            }
             // Frameworks that resolve their route before dispatch (or a static entry
             // point) can tag now; the rest are tagged at flush from request_end.
             if !route_pattern.is_empty() {
@@ -410,9 +623,7 @@ pub fn chronos_request_end(
         if let Some(ctx) = &context {
             // The request root span is always emitted so observer/userland spans have
             // an in-batch ancestor and the request carries its HTTP identity.
-            let mut attributes: Vec<(String, String)> = vec![
-                ("span.kind".into(), "server".into()),
-            ];
+            let mut attributes: Vec<(String, String)> = vec![("span.kind".into(), "server".into())];
             if !http_method.is_empty() {
                 attributes.push(("http.method".into(), http_method.clone()));
             }
@@ -441,7 +652,11 @@ pub fn chronos_request_end(
                 if let Some(handled) = error_handled {
                     attributes.push((
                         "error.handled".into(),
-                        if handled { "true".into() } else { "false".into() },
+                        if handled {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        },
                     ));
                 }
             }
@@ -489,7 +704,7 @@ pub fn chronos_request_end(
                         .sum::<usize>();
                 if !chunk.is_empty() && chunk_bytes + span_bytes > TARGET_CHUNK_BYTES {
                     let body = spool::serialise_batch(&envelope, &chunk, &name);
-                    let _ = spool::write_atomic(&envelope.spool_directory, &body);
+                    let _ = spool::write_atomic(&envelope.tenant_spool_directory(), &body);
                     chunk.clear();
                     chunk_bytes = 0;
                 }
@@ -498,10 +713,18 @@ pub fn chronos_request_end(
             }
             if !chunk.is_empty() {
                 let body = spool::serialise_batch(&envelope, &chunk, &name);
-                let _ = spool::write_atomic(&envelope.spool_directory, &body);
+                let _ = spool::write_atomic(&envelope.tenant_spool_directory(), &body);
             }
         }
     }
+
+    // Userland tags (`Chronos\profile_tag`, e.g. Laravel's `action`) live in the
+    // sampler's label map, and the profiler's flush below TAKES that map. Snapshot
+    // it first so the counted profile can carry the same tags: without this, a
+    // profile opened by `action` filtered the counted read to a tag counted rows
+    // never had, and the Functions panel reported "nothing counted" for a signal
+    // that was collecting normally.
+    let userland_tags = sampler::labels_snapshot();
 
     if config.profiler_enabled {
         // Tags are resolved HERE, at flush, not at capture: a framework does not know
@@ -516,7 +739,14 @@ pub fn chronos_request_end(
             sampler::set_label("http.method", &method);
         }
         if error_type.is_empty() {
-            sampler::set_label("outcome", if http_status_code >= 500 { "error" } else { "ok" });
+            sampler::set_label(
+                "outcome",
+                if http_status_code >= 500 {
+                    "error"
+                } else {
+                    "ok"
+                },
+            );
         } else {
             sampler::set_label("outcome", "error");
         }
@@ -544,6 +774,77 @@ pub fn chronos_request_end(
         let _ = profile_spool::flush(&envelope, &samples, &labels);
     }
 
+    // DETERMINISTIC PROFILE AGGREGATES (ADR 0029) — the counted sibling of the block
+    // above, and gated differently on purpose. Not on `sampled`, because Tier 1 is
+    // always-on and must not inherit the profiler's rate verdict; not on
+    // `profiler_enabled`, because the two signals share a name and nothing else. The
+    // only switch is the tier's own kill switch, already resolved into
+    // `config.deterministic`.
+    if config.deterministic.aggregates {
+        let window = deterministic::drain_window();
+        // An empty window writes nothing (see `deterministic_spool::flush_with_budget`):
+        // a document claiming coverage of a request in which nothing was observed is a
+        // different fact from "not covered", and a reader cannot tell them apart.
+        if !window.is_empty() {
+            // Labels are resolved HERE, at flush, for the same reason the sampler's are:
+            // a framework does not know its route until routing has run, long after the
+            // first calls were counted. Built independently of `sampler::take_labels`
+            // (which the profiler block already consumed, and which does not exist at
+            // all when the profiler is off) but spelled with the SAME keys, so a reader
+            // can pivot a counted read and a sampled one on one vocabulary.
+            //
+            // Seeded from the userland tags so `action` (and anything else the
+            // application tagged) is pivotable on BOTH signals — the keys below
+            // are inserted after, and win, because a route resolved here is
+            // authoritative over one a caller tagged by hand.
+            let mut labels: std::collections::BTreeMap<String, String> = userland_tags;
+            if !route_pattern.is_empty() {
+                labels.insert("route".to_owned(), route_pattern.clone());
+            }
+            if !http_method.is_empty() {
+                labels.insert("http.method".to_owned(), http_method.clone());
+            }
+            labels.insert(
+                "outcome".to_owned(),
+                if errored || http_status_code >= 500 {
+                    "error".to_owned()
+                } else {
+                    "ok".to_owned()
+                },
+            );
+            // Memoised per process by `vcs::revision`, so this is two map inserts rather
+            // than a filesystem walk — and it is what lets a reader compare exact call
+            // counts across two commits.
+            let revision = vcs::revision(&envelope.spool_directory);
+            if !revision.commit.is_empty() {
+                labels.insert("app.commit".to_owned(), revision.commit.clone());
+            }
+            if !revision.branch.is_empty() {
+                labels.insert("app.branch".to_owned(), revision.branch.clone());
+            }
+            let interval = deterministic_spool::Window {
+                from: REQUEST_STARTED_AT.with(|started| started.borrow().clone()),
+                to: chrono::Utc::now()
+                    .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                    .to_string(),
+                // Off the MONOTONIC clock, not by subtracting the two wall-clock strings
+                // above: those can straddle an NTP correction, and a negative window
+                // would be indistinguishable from a very large one.
+                wall_nanoseconds: request_end_ns.saturating_sub(request_start_ns),
+            };
+            let _ = deterministic_spool::flush(
+                &envelope,
+                &window,
+                &interval,
+                context.as_ref(),
+                &labels,
+            );
+        }
+    }
+    // Disarm for the gap between requests. A call observed outside a request must record
+    // nothing, and the next request re-arms with its own freshly resolved config.
+    deterministic::reset_request(deterministic::DeterministicConfig::off());
+
     if config.logs_enabled {
         let logs = log_spool::drain();
         let _ = log_spool::flush(&envelope, &logs);
@@ -554,7 +855,10 @@ pub fn chronos_request_end(
             dst_spool::record(
                 dst_spool::DstEventKind::Custom("call_path_truncated".to_owned()),
                 vec![
-                    ("retained".to_owned(), call_path::retained_count().to_string()),
+                    (
+                        "retained".to_owned(),
+                        call_path::retained_count().to_string(),
+                    ),
                     ("max".to_owned(), call_path::caps().max_events.to_string()),
                 ],
             );
@@ -598,8 +902,11 @@ pub fn chronos_record_span(
     attributes: std::collections::HashMap<String, String>,
     status: Option<String>,
 ) {
-    let status = status.filter(|s| !s.is_empty()).unwrap_or_else(|| "ok".to_owned());
-    let enabled = REQUEST_CONFIG.with(|c| c.borrow().as_ref().map(|c| c.apm_enabled).unwrap_or(false));
+    let status = status
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ok".to_owned());
+    let enabled =
+        REQUEST_CONFIG.with(|c| c.borrow().as_ref().map(|c| c.apm_enabled).unwrap_or(false));
     if !enabled {
         return;
     }
@@ -646,9 +953,7 @@ pub fn chronos_capture_log(
         return;
     }
     let context = REQUEST_CONTEXT.with(|c| c.borrow().clone());
-    let (trace_id, span_id) = context
-        .map(|c| (c.trace_id, c.span_id))
-        .unwrap_or_default();
+    let (trace_id, span_id) = context.map(|c| (c.trace_id, c.span_id)).unwrap_or_default();
 
     log_spool::capture(log_spool::LogRecord {
         severity_text,
@@ -656,7 +961,9 @@ pub fn chronos_capture_log(
         body,
         trace_id,
         span_id,
-        observed_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+        observed_at: chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string(),
         attributes: attributes.into_iter().collect(),
     });
 }
@@ -702,7 +1009,6 @@ pub fn chronos_record_dst(kind: String, payload: std::collections::HashMap<Strin
     };
     dst_spool::record(event_kind, payload.into_iter().collect());
 }
-
 
 /// PHP-callable: arm scalar builtin overrides for replay (time/random/getenv → Effect).
 /// Requires userland `chronos_replay_effect_delegate($kind, $selector)` from bootstrap.
@@ -758,15 +1064,18 @@ pub fn chronos_pending_traceparent() -> String {
 #[php_function]
 pub fn chronos_child_traceparent() -> String {
     REQUEST_CONTEXT.with(|c| {
-        c.borrow().as_ref().map(|ctx| {
-            let child_span_id = context::hex_bytes(8);
-            format!(
-                "00-{}-{}-{}",
-                ctx.trace_id,
-                child_span_id,
-                if ctx.sampled { "01" } else { "00" }
-            )
-        }).unwrap_or_default()
+        c.borrow()
+            .as_ref()
+            .map(|ctx| {
+                let child_span_id = context::hex_bytes(8);
+                format!(
+                    "00-{}-{}-{}",
+                    ctx.trace_id,
+                    child_span_id,
+                    if ctx.sampled { "01" } else { "00" }
+                )
+            })
+            .unwrap_or_default()
     })
 }
 
@@ -792,7 +1101,9 @@ pub fn chronos_set_http_response_body(
     http_capture::set_response(
         body,
         content_type.unwrap_or_default(),
-        headers.map(|map| map.into_iter().collect()).unwrap_or_default(),
+        headers
+            .map(|map| map.into_iter().collect())
+            .unwrap_or_default(),
     );
 }
 
@@ -861,4 +1172,55 @@ fn monotonic_nanos() -> u128 {
     use std::time::Instant;
     thread_local! { static ORIGIN: Instant = Instant::now(); }
     ORIGIN.with(|origin| origin.elapsed().as_nanos())
+}
+
+#[cfg(test)]
+mod directive_tests {
+    use super::{constant_time_eq, cookie_value, profile_forced};
+
+    #[test]
+    fn a_matching_token_arms_a_forced_profile() {
+        assert!(profile_forced("s3cret", "s3cret"));
+        // The `key=value` spelling, so one cookie can carry several directives.
+        assert!(profile_forced("profile=s3cret", "s3cret"));
+        assert!(profile_forced("record; profile=s3cret", "s3cret"));
+    }
+
+    #[test]
+    fn no_configured_token_means_the_directive_does_nothing() {
+        // The default posture. Without this, enabling the profiler would silently
+        // hand every caller on the internet a switch for the expensive path.
+        assert!(!profile_forced("1", ""));
+        assert!(!profile_forced("anything", ""));
+    }
+
+    #[test]
+    fn a_wrong_or_absent_token_does_not_arm_it() {
+        assert!(!profile_forced("", "s3cret"));
+        assert!(!profile_forced("1", "s3cret"));
+        assert!(!profile_forced("s3cre", "s3cret"));
+        assert!(!profile_forced("s3crett", "s3cret"));
+        assert!(!profile_forced("S3CRET", "s3cret"));
+    }
+
+    #[test]
+    fn the_comparison_does_not_stop_at_the_first_wrong_byte() {
+        // A guess sharing a long prefix must be no cheaper to reject than one
+        // that differs immediately — that difference is the timing oracle.
+        assert!(!constant_time_eq(b"s3cre_", b"s3cret"));
+        assert!(!constant_time_eq(b"______", b"s3cret"));
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        // An empty secret can never match, including against an empty offer.
+        assert!(!constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn the_profile_cookie_is_read_out_of_a_shared_cookie_header() {
+        let raw = "session=abc; chronos_profile=s3cret; theme=dark";
+        assert_eq!(cookie_value(raw, "chronos_profile"), "s3cret");
+        assert!(profile_forced(
+            &cookie_value(raw, "chronos_profile"),
+            "s3cret"
+        ));
+    }
 }

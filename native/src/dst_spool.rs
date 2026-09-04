@@ -150,7 +150,13 @@ pub fn flush(
     trace_id: &str,
     session_id: Option<&str>,
 ) -> std::io::Result<()> {
-    flush_with_budget(envelope, events, trace_id, session_id, spool_common::max_body_bytes())
+    flush_with_budget(
+        envelope,
+        events,
+        trace_id,
+        session_id,
+        spool_common::max_body_bytes(),
+    )
 }
 
 /// `flush` with the per-document byte budget supplied rather than read from the environment.
@@ -220,7 +226,7 @@ pub fn flush_with_budget(
     header.insert("eventCount".into(), Value::String(events.len().to_string()));
 
     spool_common::write_chunked(
-        &envelope.spool_directory,
+        &envelope.tenant_spool_directory(),
         "dst",
         &header,
         "events",
@@ -275,7 +281,8 @@ mod tests {
     use super::*;
 
     fn temp_spool(name: &str) -> String {
-        let root = std::env::temp_dir().join(format!("chronos-dst-spool-{}-{name}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("chronos-dst-spool-{}-{name}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         root.to_string_lossy().into_owned()
     }
@@ -376,7 +383,10 @@ mod tests {
     fn a_payload_value_over_the_length_cap_is_truncated_not_dropped() {
         activate();
         let long_value = "x".repeat(MAX_PAYLOAD_VALUE_LENGTH + 500);
-        record(DstEventKind::Custom("probe".into()), vec![("result".into(), long_value)]);
+        record(
+            DstEventKind::Custom("probe".into()),
+            vec![("result".into(), long_value)],
+        );
         let events = drain();
         assert_eq!(events[0].payload[0].1.len(), MAX_PAYLOAD_VALUE_LENGTH);
     }
@@ -392,12 +402,22 @@ mod tests {
     fn a_small_recording_flushes_to_one_file_with_the_full_header() {
         activate();
         record(DstEventKind::Time, vec![("function".into(), "time".into())]);
-        record(DstEventKind::EnvRead, vec![("function".into(), "getenv".into())]);
+        record(
+            DstEventKind::EnvRead,
+            vec![("function".into(), "getenv".into())],
+        );
         let events = drain();
         deactivate();
 
         let dir = temp_spool("single-chunk");
-        flush_with_budget(&envelope(&dir), &events, "trace-1", Some("session-1"), spool_common::DEFAULT_MAX_BODY_BYTES).expect("flush");
+        flush_with_budget(
+            &envelope(&dir),
+            &events,
+            "trace-1",
+            Some("session-1"),
+            spool_common::DEFAULT_MAX_BODY_BYTES,
+        )
+        .expect("flush");
         let chunks = read_chunks(&dir);
         assert_eq!(chunks.len(), 1);
         let doc = &chunks[0];
@@ -418,7 +438,14 @@ mod tests {
         deactivate();
 
         let dir = temp_spool("no-session");
-        flush_with_budget(&envelope(&dir), &events, "trace-1", None, spool_common::DEFAULT_MAX_BODY_BYTES).expect("flush");
+        flush_with_budget(
+            &envelope(&dir),
+            &events,
+            "trace-1",
+            None,
+            spool_common::DEFAULT_MAX_BODY_BYTES,
+        )
+        .expect("flush");
         let chunks = read_chunks(&dir);
         assert_eq!(chunks[0]["sessionId"], "");
     }
@@ -434,7 +461,10 @@ mod tests {
                 DstEventKind::DatabaseQuery,
                 vec![
                     ("function".into(), "PDO::query".into()),
-                    ("statement".into(), format!("SELECT * FROM orders WHERE id = {i}")),
+                    (
+                        "statement".into(),
+                        format!("SELECT * FROM orders WHERE id = {i}"),
+                    ),
                 ],
             );
         }
@@ -449,7 +479,11 @@ mod tests {
         flush_with_budget(&envelope(&dir), &events, "trace-1", None, budget).expect("flush");
 
         let chunks = read_chunks(&dir);
-        assert!(chunks.len() > 1, "expected more than one chunk file, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "expected more than one chunk file, got {}",
+            chunks.len()
+        );
 
         let recording_id = chunks[0]["recordingId"].as_str().unwrap().to_owned();
         let group_id = chunks[0]["chunk"]["groupId"].as_str().unwrap().to_owned();
@@ -475,7 +509,10 @@ mod tests {
         for path in std::fs::read_dir(&dir).unwrap() {
             let path = path.unwrap().path();
             let len = std::fs::metadata(&path).unwrap().len() as usize;
-            assert!(len <= budget, "{path:?} is {len} bytes, over the {budget}-byte budget");
+            assert!(
+                len <= budget,
+                "{path:?} is {len} bytes, over the {budget}-byte budget"
+            );
         }
     }
 }
