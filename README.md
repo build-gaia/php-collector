@@ -190,9 +190,15 @@ one is added without a row here.
 |---|---|---|
 | `enabled` | `CHRONOS_PHP_ENABLED` | `0` — the master switch |
 | `organisation` | `CHRONOS_PHP_ORGANISATION` | — (required) |
-| `project` | `CHRONOS_PHP_PROJECT` | — (required) |
+| `team_id` | `CHRONOS_PHP_TEAM_ID` | — the team owning this service; overrides `project` |
+| `project` | `CHRONOS_PHP_PROJECT` | — (required, unless `team_id` is set) |
 | `application` | `CHRONOS_PHP_APPLICATION` | — (required) |
 | `spool_directory` | `CHRONOS_PHP_SPOOL_DIRECTORY` | — (required) |
+
+A team and a project are the same thing under two names. `team_id` is the
+current spelling: a service declares its owning team by writing it into its own
+`.chronos`, and the estate allocates the service to that team on sight. Setting
+both names is not a conflict — `team_id` is taken and `project` ignored.
 
 ### Deploy identity — resolved from `.git` when unset
 

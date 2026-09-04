@@ -28,6 +28,7 @@ pub const SETTING_NAMES: &[&str] = &[
     "CHRONOS_PHP_CLI_ENABLED",
     "CHRONOS_PHP_ORGANISATION",
     "CHRONOS_PHP_PROJECT",
+    "CHRONOS_PHP_TEAM_ID",
     "CHRONOS_PHP_APPLICATION",
     "CHRONOS_PHP_SPOOL_DIRECTORY",
     "CHRONOS_APP_VERSION",
@@ -126,6 +127,12 @@ pub fn get(env_name: &str) -> Option<String> {
         .or_else(|| file.get(&short_key(env_name)))
         .filter(|value| !value.is_empty())
         .cloned()
+}
+
+/// The first of several names that resolves, so one setting can be spelled more than
+/// one way and the earlier spelling wins outright rather than merging.
+pub fn first(env_names: &[&str]) -> Option<String> {
+    env_names.iter().find_map(|name| get(name))
 }
 
 pub fn flag(env_name: &str, default: bool) -> bool {
@@ -258,6 +265,27 @@ mod tests {
         assert_eq!(short_key("CHRONOS_PHP_APM_ENABLED"), "apm_enabled");
         assert_eq!(short_key("CHRONOS_APP_VERSION"), "app_version");
         assert_eq!(ini_name("CHRONOS_PHP_ENABLED"), "chronos.enabled");
+    }
+
+    #[test]
+    fn team_id_is_registered_and_derives_its_other_spellings() {
+        assert!(SETTING_NAMES.contains(&"CHRONOS_PHP_TEAM_ID"));
+        assert_eq!(short_key("CHRONOS_PHP_TEAM_ID"), "team_id");
+        assert_eq!(ini_name("CHRONOS_PHP_TEAM_ID"), "chronos.team_id");
+    }
+
+    #[test]
+    fn declared_team_wins_over_the_older_project_spelling() {
+        let names = ["CHRONOS_PHP_TEAM_ID", "CHRONOS_PHP_PROJECT"];
+        std::env::set_var("CHRONOS_PHP_PROJECT", "mercury");
+        std::env::remove_var("CHRONOS_PHP_TEAM_ID");
+        assert_eq!(first(&names).as_deref(), Some("mercury"));
+
+        std::env::set_var("CHRONOS_PHP_TEAM_ID", "team-platform");
+        assert_eq!(first(&names).as_deref(), Some("team-platform"));
+
+        std::env::remove_var("CHRONOS_PHP_TEAM_ID");
+        std::env::remove_var("CHRONOS_PHP_PROJECT");
     }
 
     #[test]

@@ -128,7 +128,12 @@ impl CollectorEnvelope {
     /// required identity is missing, so the caller can stay inert rather than emit anonymous spans.
     pub fn resolve() -> Option<Self> {
         let organisation_id = setting("chronos.organisation", "CHRONOS_PHP_ORGANISATION")?;
-        let project_id = setting("chronos.project", "CHRONOS_PHP_PROJECT")?;
+        // A team IS a project; `team_id` is the spelling the product uses now, and the
+        // one a service writes into its own `.chronos` to declare who owns it. `project`
+        // stays readable — deployments are already carrying it — but loses to `team_id`
+        // so adding the new name to a file that still has the old one is unambiguous.
+        let project_id = crate::settings::first(&["CHRONOS_PHP_TEAM_ID", "CHRONOS_PHP_PROJECT"])
+            .filter(|v| !v.is_empty())?;
         let application_id = setting("chronos.application", "CHRONOS_PHP_APPLICATION")?;
         let spool_directory = setting("chronos.spool_directory", "CHRONOS_PHP_SPOOL_DIRECTORY")?;
         let app_version = setting("chronos.app_version", "CHRONOS_APP_VERSION");
