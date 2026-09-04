@@ -1,0 +1,15 @@
+# macOS-only link flag for LOCAL development builds.
+#
+# A PHP extension resolves its `zend_*` / `php_*` symbols from the PHP binary
+# that dlopen()s it, so the shared object is expected to link with those symbols
+# undefined. ELF permits that by default, which is why the container builds this
+# cdylib is really meant for (see the note at the top of Cargo.toml) need no
+# flag. Mach-O does not: without `-undefined dynamic_lookup`, `cargo build` on
+# macOS fails with "ld: symbol(s) not found for architecture arm64" and every
+# missing symbol is a Zend one.
+#
+# Scoped to macOS targets so Linux container builds are byte-for-byte unaffected.
+# NOTE: a `RUSTFLAGS` environment variable REPLACES these rather than merging,
+# so export it and you must include this flag yourself.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]

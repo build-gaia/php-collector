@@ -1,0 +1,52 @@
+# Standalone by design: this cdylib is built inside the app containers against their
+# own PHP headers, never as part of the collector workspace (whose members target the
+# sidecar). The empty [workspace] table keeps cargo from walking up to
+# collector/Cargo.toml and refusing to build.
+[workspace]
+
+[package]
+name = "chronos-ext"
+version = "0.0.0"
+edition = "2021"
+description = "Chronos native PHP collector extension (ext-php-rs). Intended replacement for the C stub."
+license = "Apache-2.0"
+publish = false
+
+[features]
+# zend-observer is DEFAULT-ON: a build without it loads inert and profiles/observes
+# nothing, silently — the exact failure mode the heartbeat exists to prevent. Opt out
+# explicitly with --no-default-features for smoke builds on unsupported PHP versions.
+default = ["zend-observer"]
+# Enable the Zend observer FFI seams (observer registration, stack walk, timer arming).
+# Requires compilation against PHP 8.0..=8.4 headers.
+zend-observer = []
+
+[lib]
+name = "chronos"
+crate-type = ["cdylib"]
+
+[dependencies]
+# ext-php-rs generates the zend_module_entry, INI wiring, and #[php_module] glue. It supports PHP
+# 8.0..=8.4 at the time of writing; local PHP 8.5.8 is OUTSIDE that range (see BUILD.md), so this
+# crate is authorable here but must be compiled against php@8.2 / php@8.4.
+ext-php-rs = "0.15"
+
+# Envelope serialisation, byte-for-byte compatible with LocalSpanRecorder::write().
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Content addressing (sha256 of the body) and message/batch id entropy, matching the userland spool.
+sha2 = "0.10"
+rand = "0.8"
+
+# UTC timestamps formatted as the collector's 'Y-m-d\TH:i:s.u\Z'.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Timer arming (setitimer/SIGPROF) for the statistical profiler.
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

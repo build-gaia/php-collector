@@ -1,0 +1,16 @@
+ARG PHP_VERSION=8.4
+FROM php:${PHP_VERSION}-cli-alpine
+
+# bash so this builder is drop-in interchangeable with Dockerfile.builder:
+# the build scripts invoke `bash -lc`, and alpine ships only busybox ash.
+RUN apk add --no-cache \
+    bash curl build-base pkgconf clang-dev clang-static clang llvm-dev musl-dev linux-headers
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+ENV LIBCLANG_PATH=/usr/lib
+ENV C_INCLUDE_PATH=/usr/include
+ENV BINDGEN_EXTRA_CLANG_ARGS="--sysroot=/ -isystem /usr/include"
+
+WORKDIR /build
