@@ -56,7 +56,7 @@ final class RedisCommandSpan
                 isset($arguments[0])
                 && is_scalar($arguments[0])
             ) {
-                $span->add('db.redis.key', (string) $arguments[0]);
+                $span->add('cache.key', (string) $arguments[0]);
             }
         }
 

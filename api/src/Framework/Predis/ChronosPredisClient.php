@@ -47,6 +47,16 @@ final class ChronosPredisClient extends \Predis\Client
      */
     private static function stampRead(Span $span, string $operation, mixed $result): void
     {
+        // EXISTS asks the same question a GET does - is this cached - and a
+        // contains-check is normally the guard immediately before the read it
+        // protects, so recording its answer is what lets the pair be read
+        // together. Its reply is a count, not the document, so there is no value
+        // to stamp and none is invented.
+        if ($operation === 'EXISTS') {
+            $span->add('cache.hit', is_numeric($result) && (int) $result > 0 ? 'true' : 'false');
+
+            return;
+        }
         if ($operation !== 'GET' && $operation !== 'GETEX') {
             return;
         }
@@ -67,7 +77,7 @@ final class ChronosPredisClient extends \Predis\Client
             $span->add('cache.store', 'redis');
             $span->add('db.operation', $operation);
             if (isset($arguments[0]) && is_scalar($arguments[0]) && (string) $arguments[0] !== '') {
-                $span->add('db.redis.key', (string) $arguments[0]);
+                $span->add('cache.key', (string) $arguments[0]);
             }
             $this->addConnectionMetadata($span);
             [$file, $line] = self::callSite();
@@ -126,5 +136,36 @@ final class ChronosPredisClient extends \Predis\Client
         }
 
         return [null, 0];
+    }
+    /**
+     * Hand back a pipeline that reports its own flush.
+     *
+     * Only the plain pipeline is substituted. The atomic (MULTI/EXEC),
+     * fire-and-forget and Relay variants are their own classes with their own
+     * flush semantics, and quietly swapping one for something else to gain a span
+     * would be trading correctness for telemetry — those defer to Predis
+     * untouched and stay uninstrumented, which is the honest outcome.
+     *
+     * @param  array<string, mixed>|null $options
+     * @param  mixed                     $callable
+     * @return mixed
+     */
+    protected function createPipeline(?array $options = null, $callable = null)
+    {
+        try {
+            $plain = empty($options['atomic']) && empty($options['fire-and-forget']);
+            $relay = class_exists('\\Predis\\Connection\\RelayConnection')
+                && $this->getConnection() instanceof \Predis\Connection\RelayConnection;
+            if (!$plain || $relay) {
+                return parent::createPipeline($options, $callable);
+            }
+            $pipeline = new ChronosPipeline($this);
+
+            return $callable !== null ? $pipeline->execute($callable) : $pipeline;
+        } catch (Throwable) {
+            // Any surprise in the substitution falls back to stock Predis: a
+            // pipeline that works untraced beats one that does not work.
+            return parent::createPipeline($options, $callable);
+        }
     }
 }

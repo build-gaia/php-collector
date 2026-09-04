@@ -132,7 +132,7 @@ class ChronosCacheAdapter implements AdapterInterface, ResetInterface
                 $span->add('cache.system', 'cache');
                 $span->add('cache.store', $this->store);
                 $span->add('db.operation', 'GET');
-                $span->add('cache_key', $key);
+                $span->add('cache.key', $key);
                 CacheCapture::stamp($span, $hit, $value);
             }
             $span->finish();

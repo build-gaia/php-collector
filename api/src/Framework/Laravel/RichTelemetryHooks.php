@@ -219,7 +219,7 @@ final class RichTelemetryHooks
                 }
                 $key = self::redisKey($parameters);
                 if ($key !== '') {
-                    $span->add('db.redis.key', $key);
+                    $span->add('cache.key', $key);
                 }
                 $span->add('db.parameters.count', (string) count($parameters));
                 self::addRedisConnectionMetadata($span, $connection);
@@ -465,7 +465,7 @@ final class RichTelemetryHooks
                 $span->add('code.filepath', $file);
                 $span->add('code.lineno', (string) $line);
             }
-            $span->add('cache_key', $key);
+            $span->add('cache.key', $key);
             $hit = $event instanceof CacheHit;
             CacheCapture::stamp($span, $hit, $hit ? ($event->value ?? null) : null);
         }
@@ -500,7 +500,7 @@ final class RichTelemetryHooks
                 $span->add('code.filepath', $file);
                 $span->add('code.lineno', (string) $line);
             }
-            $span->add('cache_key', $key);
+            $span->add('cache.key', $key);
             if (isset($event->seconds) && is_numeric($event->seconds)) {
                 $span->add('cache.ttl', (string) $event->seconds);
             }
@@ -534,7 +534,7 @@ final class RichTelemetryHooks
                 $span->add('code.filepath', $file);
                 $span->add('code.lineno', (string) $line);
             }
-            $span->add('cache_key', $key);
+            $span->add('cache.key', $key);
         }
         $span->finish();
     }
