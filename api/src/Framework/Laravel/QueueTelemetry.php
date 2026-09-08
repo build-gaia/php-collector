@@ -43,6 +43,9 @@ final class QueueTelemetry
     /** The payload key the trace context travels under. */
     public const PAYLOAD_KEY = 'chronos';
 
+    /** The key, inside `PAYLOAD_KEY`, holding the dispatch instant as epoch seconds. */
+    public const ENQUEUED_AT_KEY = 'enqueued_at';
+
     private static bool $installed = false;
 
     /** True while a job-scoped request is open, so the close is never doubled. */
@@ -92,33 +95,94 @@ final class QueueTelemetry
     }
 
     /**
-     * The trace context stamped into every outgoing job payload.
+     * The trace context and dispatch instant stamped into every outgoing payload.
      *
      * A CHILD traceparent, not this request's own: the job is caused by the
      * dispatching request but is not part of it, so it hangs beneath the
      * dispatch rather than claiming to be the same span — the same shape an
      * outbound HTTP call gets.
      *
+     * `enqueued_at` rides alongside it because the wait is the fact a queue is
+     * usually judged on and NOTHING else can supply it: the two halves of a job
+     * run in different processes, so the worker cannot know when the message was
+     * pushed unless the message says. A backed-up queue and a slow job produce
+     * the same job duration and are told apart only by this number.
+     *
+     * A WALL clock, deliberately, despite being the worse clock: a monotonic
+     * reading is meaningless in another process, so the only comparable instant
+     * is the one both machines claim about the same world. That makes the
+     * difference vulnerable to clock skew between dispatcher and worker, which is
+     * why the consumer side treats a negative wait as unknown rather than
+     * clamping it to zero — see [`waitMilliseconds`].
+     *
+     * Present even when there is no traceparent: a job dispatched from a CLI
+     * command with no open request has no trace to continue but has waited just
+     * as long, and dropping the whole key would leave that wait unmeasurable.
+     *
      * @return array<string, array<string, string>>
      */
     public static function payloadContext(): array
     {
         try {
+            $context = [self::ENQUEUED_AT_KEY => \sprintf('%.6F', \microtime(true))];
             $traceparent = NativeExtension::childTraceparent() ?? NativeExtension::traceparent();
-            if ($traceparent === null || $traceparent === '') {
-                return [];
+            if (is_string($traceparent) && $traceparent !== '') {
+                $context['traceparent'] = $traceparent;
             }
 
-            return [self::PAYLOAD_KEY => ['traceparent' => $traceparent]];
+            return [self::PAYLOAD_KEY => $context];
         } catch (Throwable) {
             return [];
         }
+    }
+
+    /**
+     * How long the message waited, in milliseconds, or null when that cannot be
+     * said honestly.
+     *
+     * Null rather than zero in every unknowable case — a payload pushed before
+     * this SDK was installed, a stamp another producer wrote in some other
+     * format, or a clock difference that puts the dispatch AFTER the start. Zero
+     * is a measurement meaning "picked up instantly", and a queue that is
+     * actually unmeasured must not be able to report the healthiest possible
+     * value. That is also why a negative reading is discarded whole instead of
+     * clamped: skew of a second in one direction is skew of a second in the
+     * other, so the positive readings from a skewed pair are wrong by as much as
+     * the negative ones — the difference is only that clamping HIDES it.
+     *
+     * This is dispatch-to-start, so a deliberately delayed job counts its delay
+     * as wait. The intent lives on the dispatching request instead, as the
+     * `delay_ms` of its `messaging.jobs` catalog record: the two are in one trace
+     * and can be read together, whereas a worker holding only the payload cannot
+     * tell an intentional delay from a backlog.
+     */
+    public static function waitMilliseconds(mixed $enqueuedAt, float $startedAt): ?int
+    {
+        if (!is_string($enqueuedAt) && !is_int($enqueuedAt) && !is_float($enqueuedAt)) {
+            return null;
+        }
+        if (is_string($enqueuedAt) && !is_numeric($enqueuedAt)) {
+            return null;
+        }
+        $enqueued = (float) $enqueuedAt;
+        if (!\is_finite($enqueued) || $enqueued <= 0.0) {
+            return null;
+        }
+        $waited = ($startedAt - $enqueued) * 1000.0;
+        if (!\is_finite($waited) || $waited < 0.0) {
+            return null;
+        }
+
+        return (int) \round($waited);
     }
 
     /** Begin a job-scoped request, continuing the dispatcher's trace when it left one. */
     private static function openJob(object $event): void
     {
         try {
+            // Read before any of the work below, so the wait is not inflated by
+            // the cost of measuring it.
+            $startedAt = \microtime(true);
             $job = $event->job ?? null;
             if (!is_object($job)) {
                 return;
@@ -139,7 +203,10 @@ final class QueueTelemetry
                 // workers use.
                 'QUEUE',
                 $name,
-                (string) config('app.name', 'laravel'),
+                // Empty service name → native falls back to
+                // CHRONOS_PHP_APPLICATION, so a job and the web requests of the
+                // same service land on ONE service map node.
+                '',
             );
             if (!NativeExtension::active()) {
                 return;
@@ -156,9 +223,54 @@ final class QueueTelemetry
             NativeExtension::suppressNative('cache');
             ChronosViewEngine::resetRequestState();
             ExceptionCapture::reset();
-            NativeExtension::setRequestAttributes(self::jobAttributes($event, $job, $name));
+            $attributes = self::jobAttributes($event, $job, $name, $payload, $startedAt);
+            NativeExtension::setRequestAttributes($attributes);
+            // Announced AFTER requestStart, never before: the marker's whole job
+            // is to name the span that will later close it, and that span does
+            // not exist until the request is open.
+            NativeExtension::jobStarted($name, self::timeoutSeconds($job), $attributes);
         } catch (Throwable) {
         }
+    }
+
+    /**
+     * The job's own timeout in seconds, or 0 when the framework reports none.
+     *
+     * Zero rather than a default, and the difference matters: this becomes the
+     * deadline after which a job whose worker died is presumed dead, so a guessed
+     * timeout reaps jobs that are still working. A queue whose jobs declare no
+     * timeout gets in-flight rows that only a completing span closes, which is
+     * the honest consequence of the application not saying.
+     *
+     * `retryUntil` wins where both exist: a job with a retry horizon may
+     * legitimately be re-attempted past a single attempt's timeout, so the
+     * horizon is the later — and therefore the safer — of the two.
+     */
+    private static function timeoutSeconds(object $job): int
+    {
+        try {
+            if (method_exists($job, 'retryUntil')) {
+                $until = $job->retryUntil();
+                if (is_int($until) && $until > 0) {
+                    $remaining = $until - time();
+                    if ($remaining > 0) {
+                        return $remaining;
+                    }
+                }
+            }
+        } catch (Throwable) {
+        }
+        try {
+            if (method_exists($job, 'timeout')) {
+                $timeout = $job->timeout();
+                if (is_int($timeout) && $timeout > 0) {
+                    return $timeout;
+                }
+            }
+        } catch (Throwable) {
+        }
+
+        return 0;
     }
 
     /** End the job-scoped request, recording the throwable when there was one. */
@@ -188,16 +300,30 @@ final class QueueTelemetry
      * OTel `messaging.*` vocabulary MessagingSpan uses for the publish side — so
      * the producer and consumer halves of one queue join on the same keys.
      *
+     * @param array<string, mixed> $payload the message as the broker carried it
+     *
      * @return array<string, string>
      */
-    private static function jobAttributes(object $event, object $job, string $name): array
-    {
+    private static function jobAttributes(
+        object $event,
+        object $job,
+        string $name,
+        array $payload,
+        float $startedAt,
+    ): array {
         $attributes = [
             'span.kind' => 'consumer',
             'messaging.operation' => 'process',
             'messaging.message.name' => $name,
         ];
         try {
+            $waited = self::waitMilliseconds(
+                $payload[self::PAYLOAD_KEY][self::ENQUEUED_AT_KEY] ?? null,
+                $startedAt,
+            );
+            if ($waited !== null) {
+                $attributes['messaging.message.queue_time_ms'] = (string) $waited;
+            }
             $connection = is_string($event->connectionName ?? null) ? $event->connectionName : '';
             $transport = self::queueDriver($connection);
             if ($transport !== '') {

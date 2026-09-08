@@ -99,6 +99,15 @@ The extension works without it; the package adds what only userland can know:
   `CHRONOS_PHP_CLI_ENABLED=1`; the extension's RINIT hook skips CLI processes by
   default, and without it the worker half stays inert.
 
+  The dispatch instant rides in the payload beside the context, so the job root
+  also carries `messaging.message.queue_time_ms`: **how long the message waited**,
+  which is the one number that separates a backed-up queue from a slow job — they
+  produce identical job durations. It is dispatch-to-start (a deliberately delayed
+  job counts its delay as wait; the intent is on the dispatching request as its
+  `messaging.jobs` record's `delay_ms`), and it is absent rather than zero when
+  the wait cannot be proven — an older payload with no stamp, or a dispatcher
+  whose clock runs ahead of the worker's.
+
   The catalogs are the part worth reading twice. An event or a queued job is
   recorded with its **destination, transport, encoding and dispatch call site**,
   not just its name — and a message that actually leaves the process (a broadcast

@@ -13,6 +13,16 @@ pub struct TraceContext {
     pub parent_span_id: Option<String>,
     pub sampled: bool,
     pub session_id: Option<String>,
+    /// The inbound `tracestate` header, VERBATIM. W3C Trace Context requires a
+    /// participant to forward tracestate it does not understand — the vendor
+    /// entries belong to other tracers sharing the trace, and dropping them
+    /// severs their correlation. Never parsed here: the collector adds no entry
+    /// of its own, so pass-through is the whole contract. Bounded at capture
+    /// (see `lib.rs`), because a header is caller-controlled input.
+    pub tracestate: Option<String>,
+    /// The inbound W3C `baggage` header, VERBATIM, for the same forward-as-is
+    /// reason as `tracestate` above.
+    pub baggage: Option<String>,
 }
 
 impl TraceContext {
@@ -35,6 +45,8 @@ impl TraceContext {
             parent_span_id: None,
             sampled: true,
             session_id,
+            tracestate: None,
+            baggage: None,
         }
     }
 
@@ -63,6 +75,10 @@ impl TraceContext {
             parent_span_id: Some(parent.to_ascii_lowercase()),
             sampled,
             session_id,
+            // Stamped by `start_request` after parsing: propagation headers ride
+            // NEXT TO the trace identity, they are not derived from it.
+            tracestate: None,
+            baggage: None,
         })
     }
 

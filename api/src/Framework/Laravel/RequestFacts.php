@@ -15,8 +15,9 @@ use Throwable;
  *
  * This is the Debugbar-shaped hydration that belongs on a trace: which action
  * ran, who was authenticated, which views/models/mail/authorization checks
- * participated — names and counts only. View data, cache values, session
- * contents, notification bodies and Gate arguments stay out.
+ * participated. View data, cache values, session contents, notification bodies
+ * and Gate argument *values* stay out. Target classes and argument types are
+ * cheap and in.
  *
  * The attribute names are FRAMEWORK-GENERIC (`framework.views`, not
  * `laravel.views`) per ADR 0024 §1: a Symfony request renders views and hydrates
@@ -57,6 +58,8 @@ final class RequestFacts
 
     private static ?ActivityCatalog $jobs = null;
 
+    private static ?ActivityCatalog $authorizations = null;
+
     private static int $droppedViews = 0;
 
     private static int $droppedModels = 0;
@@ -85,11 +88,35 @@ final class RequestFacts
         self::$droppedGates = 0;
         self::events()->reset();
         self::jobs()->reset();
+        self::authorizations()->reset();
     }
 
     public static function noteView(string $name): void
     {
         self::note(self::$views, self::$droppedViews, $name);
+    }
+
+    /**
+     * A view the framework just started composing.
+     *
+     * When the view is Inertia's root, the Blade name is the layout and the page
+     * the author wrote (`Profile/Edit`) lives on the view data. Prefer that.
+     */
+    public static function noteComposedView(string $eventName, mixed $view = null): void
+    {
+        $viewName = is_object($view) && method_exists($view, 'name') ? (string) $view->name() : '';
+        if ($viewName === '' && str_starts_with($eventName, 'composing: ')) {
+            $viewName = substr($eventName, 11);
+        }
+        $component = self::inertiaComponent($view);
+        if ($component !== '') {
+            self::noteView($component);
+
+            return;
+        }
+        if ($viewName !== '') {
+            self::noteView($viewName);
+        }
     }
 
     public static function noteModel(string $class): void
@@ -168,10 +195,38 @@ final class RequestFacts
         );
     }
 
-    public static function noteGate(string $ability, bool $allowed): void
-    {
-        $label = $ability.':'.($allowed ? 'allow' : 'deny');
+    /**
+     * One authorization check.
+     *
+     * The count key stays `ability:allow` when nothing else is known, so existing
+     * traces keep their shape. A target — the first argument's class, which is
+     * cheap and not the object's contents — is appended as `ability@User:allow`,
+     * which is what turns "a gate named accessBackoffice" into Debugbar's
+     * `accessBackoffice App\Models\User`. Argument *values* stay out of the count
+     * key; a cheap type/class summary lives on the catalog record instead.
+     */
+    public static function noteGate(
+        string $ability,
+        bool $allowed,
+        string $target = '',
+        string $argumentSummary = '',
+    ): void {
+        if ($ability === '') {
+            return;
+        }
+        $result = $allowed ? 'allow' : 'deny';
+        $shortTarget = self::shortClass($target);
+        $label = $shortTarget === '' ? $ability.':'.$result : $ability.'@'.$shortTarget.':'.$result;
         self::note(self::$gates, self::$droppedGates, $label);
+        self::authorizations()->record(
+            $label,
+            static fn (): array => [
+                'name' => $ability,
+                'result' => $result,
+                'target' => $target,
+                'arguments' => $argumentSummary,
+            ],
+        );
     }
 
     /**
@@ -213,6 +268,11 @@ final class RequestFacts
     private static function jobs(): ActivityCatalog
     {
         return self::$jobs ??= new ActivityCatalog();
+    }
+
+    private static function authorizations(): ActivityCatalog
+    {
+        return self::$authorizations ??= new ActivityCatalog();
     }
 
     /**
@@ -280,6 +340,7 @@ final class RequestFacts
         self::putCounts($attributes, 'framework.exceptions', self::$exceptions, self::$droppedExceptions);
         self::events()->putInto($attributes, 'messaging.events');
         self::jobs()->putInto($attributes, 'messaging.jobs');
+        self::authorizations()->putInto($attributes, 'framework.authorization.checks');
 
         return $attributes;
     }
@@ -298,8 +359,9 @@ final class RequestFacts
     }
 
     /**
-     * Subscribe to Laravel events that hydrate the request root. Names and counts
-     * only; payloads, view data and Gate arguments are never read.
+     * Subscribe to Laravel events that hydrate the request root. Names, counts,
+     * target classes and argument types; payloads, view data and Gate argument
+     * values are never read.
      */
     public static function listen(): void
     {
@@ -333,14 +395,7 @@ final class RequestFacts
                 );
             }
             $event::listen('composing:*', static function (string $name, array $payload = []): void {
-                $view = $payload[0] ?? null;
-                $viewName = is_object($view) && method_exists($view, 'name') ? (string) $view->name() : '';
-                if ($viewName === '' && str_starts_with($name, 'composing: ')) {
-                    $viewName = substr($name, 11);
-                }
-                if ($viewName !== '') {
-                    self::noteView($viewName);
-                }
+                self::noteComposedView($name, $payload[0] ?? null);
             });
             if (class_exists(\Illuminate\Mail\Events\MessageSent::class)) {
                 $event::listen(\Illuminate\Mail\Events\MessageSent::class, static function (object $observed): void {
@@ -391,7 +446,13 @@ final class RequestFacts
                         return;
                     }
                     $allowed = $observed->result ?? false;
-                    self::noteGate($ability, $allowed === true);
+                    $arguments = is_array($observed->arguments ?? null) ? $observed->arguments : [];
+                    self::noteGate(
+                        $ability,
+                        $allowed === true,
+                        self::gateTarget($arguments),
+                        self::gateArgumentSummary($arguments),
+                    );
                 });
             }
             $event::listen('*', static function (mixed ...$args): void {
@@ -429,6 +490,85 @@ final class RequestFacts
             });
         } catch (Throwable) {
         }
+    }
+
+    /**
+     * Inertia's page component, when this view is the Inertia root.
+     *
+     * The Blade name is the layout (`app`); the component is the page
+     * (`Profile/Edit`). Reading it from view data is cheap — a string already
+     * on the view — and does not execute application code.
+     */
+    private static function inertiaComponent(mixed $view): string
+    {
+        if (!is_object($view) || !method_exists($view, 'getData')) {
+            return '';
+        }
+        try {
+            $data = $view->getData();
+            $page = is_array($data) ? ($data['page'] ?? null) : null;
+            $component = is_array($page) ? ($page['component'] ?? null) : null;
+
+            return is_string($component) ? trim($component) : '';
+        } catch (Throwable) {
+            return '';
+        }
+    }
+
+    /**
+     * The class the check was made against: the first argument, when it is an
+     * object or a class name. Cheap, and not the object's contents.
+     *
+     * @param array<mixed> $arguments
+     */
+    private static function gateTarget(array $arguments): string
+    {
+        $first = $arguments[0] ?? null;
+        if (is_object($first)) {
+            return $first::class;
+        }
+        if (is_string($first) && $first !== '' && (class_exists($first) || interface_exists($first))) {
+            return $first;
+        }
+
+        return '';
+    }
+
+    /**
+     * A type/class list of the check's arguments, never the argument values.
+     *
+     * Objects become their class, scalars stay clipped, arrays stay a count.
+     * That is the Debugbar row without dumping a User into the spool.
+     *
+     * @param array<mixed> $arguments
+     */
+    private static function gateArgumentSummary(array $arguments): string
+    {
+        $parts = [];
+        foreach (array_slice($arguments, 0, 8) as $argument) {
+            $parts[] = match (true) {
+                is_object($argument) => $argument::class,
+                is_bool($argument) => $argument ? 'true' : 'false',
+                is_int($argument), is_float($argument) => (string) $argument,
+                is_string($argument) => self::clip($argument, 64),
+                is_array($argument) => 'array('.count($argument).')',
+                $argument === null => 'null',
+                default => get_debug_type($argument),
+            };
+        }
+
+        return implode(', ', $parts);
+    }
+
+    private static function shortClass(string $class): string
+    {
+        $class = trim($class);
+        if ($class === '') {
+            return '';
+        }
+        $slash = strrpos($class, '\\');
+
+        return $slash === false ? $class : substr($class, $slash + 1);
     }
 
     /**

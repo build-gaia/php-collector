@@ -16,7 +16,13 @@
   },
   "suggest": {
     "laravel/framework": "Required for automatic Laravel HTTP instrumentation",
-    "symfony/framework-bundle": "Required for Symfony HTTP instrumentation"
+    "symfony/framework-bundle": "Required for Symfony HTTP instrumentation",
+    "monolog/monolog": "Lets ChronosHandler ship Monolog records to the collector's log pipeline",
+    "psr/log": "Lets ChronosLogger decorate any PSR-3 logger to capture its records",
+    "doctrine/dbal": "Lets the Doctrine ChronosMiddleware (DBAL 3/4) or ChronosSqlLogger (DBAL 2) emit SQL client spans",
+    "symfony/messenger": "Lets the Messenger ChronosMiddleware propagate traces across buses and trace message handling",
+    "symfony/http-client": "Lets ChronosHttpClient decorate Symfony's HTTP client with spans and trace propagation",
+    "psr/http-client": "Lets ChronosClientDecorator wrap any PSR-18 client with spans and trace propagation"
   },
   "extra": {
     "laravel": {
@@ -26,6 +32,15 @@
     }
   },
   "scripts": {
-    "test": "php api/tests/verify.php"
+    "test": [
+      "php api/tests/verify.php",
+      "php api/tests/monolog-psr3-case.php",
+      "php api/tests/doctrine-dbal-middleware-case.php",
+      "php api/tests/messenger-case.php",
+      "php api/tests/httpclient-case.php",
+      "php api/tests/psr18-client-decorator-case.php",
+      "php api/tests/native-extension-case.php",
+      "php api/tests/integration-wiring-case.php"
+    ]
   }
 }

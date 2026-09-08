@@ -33,7 +33,6 @@ final class RecordChronosRequest
 
         $routePattern = $request->path();
         $httpMethod = $request->method();
-        $serviceName = config('app.name', 'laravel');
 
         NativeExtension::requestStart(
             is_string($traceparent) ? $traceparent : null,
@@ -43,7 +42,14 @@ final class RecordChronosRequest
             is_string($dstDirective) ? $dstDirective : null,
             $httpMethod,
             $routePattern,
-            $serviceName,
+            // Empty service name: the native collector falls back to the
+            // CHRONOS_PHP_APPLICATION identity, keeping the service map's node
+            // names aligned with the application id — as the Symfony bridges
+            // already do. `config('app.name')` is app BRANDING, not a service
+            // identity: it is unset in most services (so it reads "Laravel")
+            // and org-wide in the rest (so several services collapse onto one
+            // label), which is exactly the mismatch the map cannot resolve.
+            '',
         );
         if (!NativeExtension::active()) {
             // The collector declined this request (no identity envelope, or a CLI

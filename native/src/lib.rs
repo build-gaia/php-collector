@@ -33,6 +33,7 @@ pub mod deterministic;
 pub mod deterministic_spool;
 pub mod dst_spool;
 pub mod http_capture;
+pub mod job_spool;
 pub mod log_spool;
 pub mod metrics_spool;
 pub mod observer;
@@ -113,6 +114,10 @@ fn native_request_start() {
     }
 
     let traceparent = http_capture::lookup(&server, "HTTP_TRACEPARENT").to_owned();
+    // The traceparent's two companion headers, read in the same breath so the
+    // frameworkless path propagates everything a bridge-started request would.
+    let tracestate = http_capture::lookup(&server, "HTTP_TRACESTATE").to_owned();
+    let baggage = http_capture::lookup(&server, "HTTP_BAGGAGE").to_owned();
     let session_id = http_capture::lookup(&server, "HTTP_X_CHRONOS_SESSION_ID").to_owned();
     let dst_directive = {
         let header = http_capture::lookup(&server, "HTTP_X_CHRONOS_DST");
@@ -139,6 +144,8 @@ fn native_request_start() {
 
     start_request(
         &traceparent,
+        &tracestate,
+        &baggage,
         &session_id,
         &dst_directive,
         &profile_directive,
@@ -286,11 +293,14 @@ fn heartbeat(config: &CollectorConfig) {
 /// instead of re-minting a trace context, which would orphan every span the
 /// observer has recorded during framework bootstrap. CLI/worker starts (which
 /// RINIT skips by default) still take the full path.
+// The arity is the PHP-side calling contract (`NativeExtension::requestStart`), not
+// a choice this crate gets to make smaller.
+#[allow(clippy::too_many_arguments)]
 #[php_function]
 pub fn chronos_request_start(
     traceparent: String,
-    _tracestate: String,
-    _baggage: String,
+    tracestate: String,
+    baggage: String,
     session_id: String,
     dst_directive: String,
     http_method: String,
@@ -299,6 +309,8 @@ pub fn chronos_request_start(
 ) {
     if REQUEST_CONFIG.with(|c| c.borrow().is_some()) {
         enrich_request(
+            &tracestate,
+            &baggage,
             &session_id,
             &dst_directive,
             &http_method,
@@ -309,6 +321,8 @@ pub fn chronos_request_start(
     }
     start_request(
         &traceparent,
+        &tracestate,
+        &baggage,
         &session_id,
         &dst_directive,
         // No profile directive on this path, and the PHP signature stays as it
@@ -323,8 +337,11 @@ pub fn chronos_request_start(
 }
 
 /// The one true request-start path, shared by the RINIT hook and the SDK bridge.
+#[allow(clippy::too_many_arguments)]
 fn start_request(
     traceparent: &str,
+    tracestate: &str,
+    baggage: &str,
     session_id: &str,
     dst_directive: &str,
     profile_directive: &str,
@@ -343,6 +360,14 @@ fn start_request(
         Some(session_id)
     };
     let mut context = TraceContext::from_header(tp, sid);
+    // The inbound `tracestate` and `baggage`, VERBATIM — never parsed. W3C Trace
+    // Context requires a participant to forward tracestate it does not understand,
+    // so pass-through IS the implementation; the only processing either header gets
+    // is a byte cap, because both are caller-controlled input that would otherwise
+    // ride on every outbound call of the request. 4 KiB comfortably clears the
+    // spec's own 512-char tracestate guidance while bounding a hostile header.
+    context.tracestate = Some(cap(tracestate.trim(), 4096)).filter(|s| !s.is_empty());
+    context.baggage = Some(cap(baggage.trim(), 4096)).filter(|s| !s.is_empty());
 
     let config = CollectorConfig::resolve();
     if !config.enabled {
@@ -408,6 +433,20 @@ fn start_request(
     }
 
     let envelope = config.envelope.clone();
+    // The reported service name is a DISPLAY LABEL; the application id is the
+    // identity every query, the catalog and the team scoping already agree on.
+    // A bridge with nothing better to offer passes an empty string, so resolve
+    // the fallback ONCE here rather than at each use: leaving it empty set the
+    // request's name from the envelope at flush but left the profile's `service`
+    // label unset, so a service's profiles and its spans disagreed on its name.
+    let service_name = if service_name.is_empty() {
+        envelope
+            .as_ref()
+            .map(|e| e.application_id.clone())
+            .unwrap_or_default()
+    } else {
+        service_name
+    };
     REQUEST_CONFIG.with(|c| *c.borrow_mut() = Some(config.clone()));
     REQUEST_ENVELOPE.with(|e| *e.borrow_mut() = envelope.clone());
     REQUEST_CONTEXT.with(|c| *c.borrow_mut() = Some(context.clone()));
@@ -494,6 +533,8 @@ fn start_request(
 /// Never touches the trace context's identity (trace/span ids, sampled flag) — the
 /// observer has been recording against it since RINIT.
 fn enrich_request(
+    tracestate: &str,
+    baggage: &str,
     session_id: &str,
     dst_directive: &str,
     http_method: &str,
@@ -508,6 +549,31 @@ fn enrich_request(
                 }
             }
         });
+    }
+    // Propagation headers fill in only when the native start saw none (a bridge
+    // can decode them from places RINIT cannot see, e.g. a queue-message header).
+    // Fill-if-unset like the session id above: the request's identity — and what
+    // rides with it — is fixed at start, and the observer may already have
+    // forwarded the started values on an outbound call.
+    if !tracestate.is_empty() || !baggage.is_empty() {
+        let mut filled: Option<(Option<String>, Option<String>)> = None;
+        REQUEST_CONTEXT.with(|c| {
+            if let Some(ctx) = c.borrow_mut().as_mut() {
+                if ctx.tracestate.is_none() {
+                    ctx.tracestate =
+                        Some(cap(tracestate.trim(), 4096)).filter(|s| !s.is_empty());
+                }
+                if ctx.baggage.is_none() {
+                    ctx.baggage = Some(cap(baggage.trim(), 4096)).filter(|s| !s.is_empty());
+                }
+                filled = Some((ctx.tracestate.clone(), ctx.baggage.clone()));
+            }
+        });
+        // The observer works off its own CLONE of the context, taken at start —
+        // curl injection reads that copy, so the fill has to reach it too.
+        if let Some((tracestate, baggage)) = filled {
+            observer::set_propagation(tracestate, baggage);
+        }
     }
     if !http_method.is_empty() {
         REQUEST_HTTP_METHOD.with(|m| *m.borrow_mut() = http_method.to_owned());
@@ -581,6 +647,9 @@ pub fn chronos_set_app_metadata(
 /// Idempotent: the first call clears the request state, so a second call (e.g. the
 /// userland fatal-error shutdown safety net after a normal end) is a no-op. The three
 /// optional error arguments attach exception identity to the request root span.
+// The arity is the PHP-side calling contract (`NativeExtension::requestEnd` and the
+// SDK's fatal-error shutdown net), not a choice this crate gets to make smaller.
+#[allow(clippy::too_many_arguments)]
 #[php_function]
 pub fn chronos_request_end(
     http_status_code: i64,
@@ -592,9 +661,10 @@ pub fn chronos_request_end(
     error_exit_code: Option<i64>,
     error_handled: Option<bool>,
 ) {
-    let error_type = error_type.unwrap_or_default();
-    let error_message = error_message.unwrap_or_default();
-    let error_stack = error_stack.unwrap_or_default();
+    let mut error_type = error_type.unwrap_or_default();
+    let mut error_message = error_message.unwrap_or_default();
+    let mut error_stack = error_stack.unwrap_or_default();
+    let mut error_handled = error_handled;
     // `error.code` is the throwable's own code — a string because PHP allows a
     // non-integer code (PDOException carries SQLSTATE like `42S02`). Distinct from
     // `error.exit_code`, the process exit status, which only a fatal shutdown has.
@@ -614,10 +684,34 @@ pub fn chronos_request_end(
     let started_at = REQUEST_STARTED_AT.with(|s| s.borrow().clone());
     let http_method = REQUEST_HTTP_METHOD.with(|m| m.borrow().clone());
     let service_name = REQUEST_SERVICE_NAME.with(|n| n.borrow().clone());
-    let errored = !error_type.is_empty();
 
     let sampled = context.as_ref().map(|c| c.sampled).unwrap_or(false);
     let extra_attributes = request_attributes::take();
+
+    // A request dying on an exception NOTHING caught, with no framework bridge to
+    // say so (plain-PHP scripts, or a framework whose bridge is not installed):
+    // the observer's throw hook is the only witness left. A bridge that already
+    // reported must win — either through this call's own error arguments or
+    // through an `error.*` attribute it merged earlier — so this only ever fills
+    // silence, never overwrites a report.
+    if error_type.is_empty()
+        && !extra_attributes
+            .iter()
+            .any(|(key, _)| key == "error.type")
+    {
+        if let Some(throw) = uncaught_exception_at_shutdown() {
+            error_type = throw.class;
+            error_message = throw.message;
+            // The throw site, in the `file:line` shape the bridges' stack argument
+            // starts with. The full trace is gone by RSHUTDOWN; the site is not.
+            if !throw.file.is_empty() {
+                error_stack = format!("{}:{}", throw.file, throw.line);
+            }
+            // Unhandled by definition: the request died on it.
+            error_handled = Some(false);
+        }
+    }
+    let errored = !error_type.is_empty();
     if config.apm_enabled && sampled {
         let mut spans = observer::drain();
         if let Some(ctx) = &context {
@@ -625,13 +719,20 @@ pub fn chronos_request_end(
             // an in-batch ancestor and the request carries its HTTP identity.
             let mut attributes: Vec<(String, String)> = vec![("span.kind".into(), "server".into())];
             if !http_method.is_empty() {
+                // Legacy + current semconv spelling, same value — see the constants'
+                // comment in `http_capture.rs` for why both are kept.
                 attributes.push(("http.method".into(), http_method.clone()));
+                attributes.push((http_capture::REQUEST_METHOD.into(), http_method.clone()));
             }
             if !route_pattern.is_empty() {
                 attributes.push(("http.route".into(), route_pattern.clone()));
             }
             if http_status_code > 0 {
                 attributes.push(("http.status_code".into(), http_status_code.to_string()));
+                attributes.push((
+                    http_capture::RESPONSE_STATUS_CODE.into(),
+                    http_status_code.to_string(),
+                ));
             }
             if errored {
                 attributes.push(("error.type".into(), cap(&error_type, 256)));
@@ -889,8 +990,57 @@ pub fn chronos_request_end(
     http_capture::reset();
 }
 
+/// The error identity of a request ending on an UNCAUGHT exception that no
+/// framework bridge reported — or `None` when the request did not end that way.
+///
+/// THE HEURISTIC, clause by clause, because each one guards a real false positive:
+///
+/// * `observer::last_throw()` recorded a throw this request. The throw hook fires
+///   on EVERY throw, caught or not, so on its own this only says "an exception
+///   existed at some point" — necessary, nowhere near sufficient.
+/// * `error_get_last()` reports an `E_ERROR` fatal whose message starts with
+///   `Uncaught `. An uncaught exception is the one thing PHP reports in exactly
+///   that shape, and such a fatal HALTS execution on the spot — so a request that
+///   ran on past its last throw (the exception was caught) cannot have one, and a
+///   request killed by a different fatal (OOM, timeout, E_PARSE) has a message of
+///   a different shape. This clause is what lets the check run on every
+///   request-end, not just the RSHUTDOWN path: on a normally-completed request it
+///   is simply never true.
+/// * The fatal's message names the recorded throw's class, tying the fatal to the
+///   SPECIFIC throw the hook last saw rather than to "some exception happened and
+///   was caught, and then something else fatal occurred" — unreachable in one
+///   request (a fatal ends it), but cheap insurance for SDK-managed worker
+///   "requests" that share one PHP process lifetime and one `error_get_last` slot.
+///
+/// `error_get_last` is called as a PHP function (same pattern as the observer's
+/// `curl_getinfo`) because the engine keeps the last error in globals ext-php-rs
+/// does not expose; userland shutdown functions already run after the fatal, so
+/// the executor is still able to answer at RSHUTDOWN.
+fn uncaught_exception_at_shutdown() -> Option<observer::LastThrow> {
+    let throw = observer::last_throw()?;
+    let func = ext_php_rs::zend::Function::try_from_function("error_get_last")?;
+    let result = func.try_call(vec![]).ok()?;
+    let last = result.array()?;
+    // PHP's E_ERROR — the severity an uncaught exception is reported at.
+    const E_ERROR: i64 = 1;
+    if last.get("type").and_then(ext_php_rs::types::Zval::long) != Some(E_ERROR) {
+        return None;
+    }
+    let message = last
+        .get("message")
+        .and_then(ext_php_rs::types::Zval::str)
+        .unwrap_or("");
+    if !message.starts_with("Uncaught ") || !message.contains(throw.class.as_str()) {
+        return None;
+    }
+    Some(throw)
+}
+
 /// PHP-callable: append a finished userland span (SpanManager / Doctrine listeners)
 /// into the native span batch. Timestamps are the collector's UTC `Y-m-d\TH:i:s.u\Z`.
+// The arity is the PHP-side calling contract (`NativeExtension::recordSpan`), not a
+// choice this crate gets to make smaller.
+#[allow(clippy::too_many_arguments)]
 #[php_function]
 pub fn chronos_record_span(
     trace_id: String,
@@ -965,6 +1115,50 @@ pub fn chronos_capture_log(
             .format("%Y-%m-%dT%H:%M:%S%.6fZ")
             .to_string(),
         attributes: attributes.into_iter().collect(),
+    });
+}
+
+/// PHP-callable: announce that a queued job has STARTED, so it is visible while
+/// it runs rather than only once it has finished.
+///
+/// Every other signal leaves at RSHUTDOWN, which is why a running job is
+/// invisible: the span index only receives finished spans. This writes a small
+/// marker immediately, carrying the trace and span ids of the job-scoped request
+/// — so the job's own root span closes the in-flight row by identity when it
+/// eventually lands. See `job_spool` for the deadline-not-heartbeat reasoning.
+///
+/// `timeout_seconds` is the framework's own job timeout, or 0 when it reports
+/// none; a job cannot legitimately outlive it, so it becomes the deadline after
+/// which a worker that died mid-job may be presumed dead. No-op when the
+/// collector is inert for this request, and a failed write is swallowed: a job
+/// must not fail because telemetry about it could not be spooled.
+#[php_function]
+pub fn chronos_job_started(
+    name: String,
+    timeout_seconds: i64,
+    facts: std::collections::HashMap<String, String>,
+) {
+    if REQUEST_CONFIG.with(|c| c.borrow().is_none()) {
+        return;
+    }
+    let Some((trace_id, span_id)) =
+        REQUEST_CONTEXT.with(|c| c.borrow().as_ref().map(|c| (c.trace_id.clone(), c.span_id.clone())))
+    else {
+        return;
+    };
+    REQUEST_ENVELOPE.with(|cell| {
+        if let Some(envelope) = cell.borrow().as_ref() {
+            let _ = job_spool::flush(
+                envelope,
+                &job_spool::JobRun {
+                    trace_id,
+                    span_id,
+                    name,
+                    timeout_seconds: u64::try_from(timeout_seconds).ok().filter(|s| *s > 0),
+                    facts,
+                },
+            );
+        }
     });
 }
 
@@ -1049,6 +1243,44 @@ pub fn chronos_traceparent() -> String {
     REQUEST_CONTEXT
         .with(|c| c.borrow().as_ref().map(|ctx| ctx.header()))
         .unwrap_or_default()
+}
+
+/// PHP-callable: every outbound propagation header in one call, as
+/// `{traceparent, tracestate, baggage}` with empty strings for whatever the
+/// request does not have (including all three when no request is open).
+///
+/// The userland seam for the PHP bridges (Guzzle middleware, HttpClient
+/// decorator, PSR-18): the native observer forwards these on `curl_exec`
+/// itself, but an outbound call made through a userland client is invisible to
+/// the curl hook until much deeper in the stack, so the bridge asks here and
+/// sets the headers on its own request object. `tracestate` is in the answer
+/// because W3C Trace Context REQUIRES a participant that forwards traceparent
+/// to also forward tracestate it does not understand; `baggage` follows the
+/// same forward-as-is contract. Both are handed over VERBATIM as captured.
+#[php_function]
+pub fn chronos_propagation_headers() -> std::collections::HashMap<String, String> {
+    REQUEST_CONTEXT.with(|c| {
+        let borrowed = c.borrow();
+        let context = borrowed.as_ref();
+        std::collections::HashMap::from([
+            (
+                "traceparent".to_owned(),
+                context.map(TraceContext::header).unwrap_or_default(),
+            ),
+            (
+                "tracestate".to_owned(),
+                context
+                    .and_then(|ctx| ctx.tracestate.clone())
+                    .unwrap_or_default(),
+            ),
+            (
+                "baggage".to_owned(),
+                context
+                    .and_then(|ctx| ctx.baggage.clone())
+                    .unwrap_or_default(),
+            ),
+        ])
+    })
 }
 
 /// PHP-callable: retrieve the pending traceparent that the observer prepared
@@ -1142,6 +1374,7 @@ pub fn module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(chronos_request_end))
         .function(wrap_function!(chronos_record_span))
         .function(wrap_function!(chronos_capture_log))
+        .function(wrap_function!(chronos_job_started))
         .function(wrap_function!(chronos_profile_tag))
         .function(wrap_function!(chronos_suppress_native))
         .function(wrap_function!(chronos_trace_function))
@@ -1151,6 +1384,7 @@ pub fn module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(chronos_http_capturing))
         .function(wrap_function!(chronos_setting))
         .function(wrap_function!(chronos_traceparent))
+        .function(wrap_function!(chronos_propagation_headers))
         .function(wrap_function!(chronos_pending_traceparent))
         .function(wrap_function!(chronos_child_traceparent))
         .function(wrap_function!(chronos_set_http_response_body))
@@ -1158,14 +1392,7 @@ pub fn module(module: ModuleBuilder) -> ModuleBuilder {
 }
 
 fn cap(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        return value.to_owned();
-    }
-    let mut end = max;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
+    spool_common::cap(value, max)
 }
 
 fn monotonic_nanos() -> u128 {

@@ -30,6 +30,17 @@ pub const RESPONSE_HEADERS: &str = "http.response.headers";
 pub const RESPONSE_BODY: &str = "http.response.body";
 pub const TIMELINE: &str = "http.timeline";
 
+// Current OTel semantic-convention keys, DUAL-EMITTED next to the legacy
+// spellings (`http.method`, `http.status_code`, `http.url`, `db.statement`)
+// rather than replacing them: the engine's span index, the service map and the
+// desktop all still read the legacy keys, so removing them is a coordinated
+// migration — adding the stable names is not. One constant per key so the
+// emit sites in `observer.rs` and `lib.rs` cannot drift in spelling.
+pub const REQUEST_METHOD: &str = "http.request.method";
+pub const RESPONSE_STATUS_CODE: &str = "http.response.status_code";
+pub const URL_FULL: &str = "url.full";
+pub const DB_QUERY_TEXT: &str = "db.query.text";
+
 /// The desktop's marker for a map that hit a cap. Surfaced as a note, never as a header.
 const DROPPED_KEY: &str = "chronos.dropped";
 

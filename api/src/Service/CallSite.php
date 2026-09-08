@@ -7,19 +7,24 @@ namespace Chronos\Collector\Service;
 use Throwable;
 
 /**
- * The first application frame above the collector: file, line, and the function
- * that frame was executing in.
+ * Call-site provenance for spans and activity catalogs.
  *
- * This is what makes an event or a queued job navigable. A job runs in another
- * process, in another trace, and the only durable link back to the request that
- * caused it is the file and line that dispatched it — so the call site is not
- * decoration on those catalogs (ADR 0024 §2, §3), it is the field that turns a
- * name into somewhere to go.
+ * Two readings from one stack walk:
  *
- * "Application" means "not under /vendor/": the frame that dispatched an event is
- * the interesting one, not the framework machinery that carried it. Fail-open
- * throughout — a call site that cannot be resolved is a null, never an exception
- * raised inside instrumentation.
+ * 1. The first application frame (`code.filepath` / `code.lineno` / `code.function`)
+ *    — not under `/vendor/`, not the collector. This is the editor jump, and the
+ *    only durable link from a queued job back to the request that dispatched it.
+ * 2. The nearest few frames (`code.stacktrace`) — vendor and framework included,
+ *    collector frames skipped. Debugbar's per-query backtrace is this: Policy →
+ *    Gate → Eloquent → the query, which a first-party-only frame would hide.
+ *
+ * `debug_backtrace` is IGNORE_ARGS and bounded. It is not gated on the counted
+ * profiler (`profile_deterministic`): that is per-function totals from the Zend
+ * observer, not a stack at an I/O sink. DST recording is the full call path and
+ * is a different mechanism again.
+ *
+ * Fail-open throughout — a call site that cannot be resolved is a null, never an
+ * exception raised inside instrumentation.
  */
 final class CallSite
 {
@@ -29,23 +34,86 @@ final class CallSite
      */
     private const MAX_FRAMES = 40;
 
+    /** Frames kept on `code.stacktrace` — Debugbar's per-query depth. */
+    public const STACK_LIMIT = 5;
+
     /**
      * @return array{0: ?string, 1: int, 2: ?string} file, line, function
      */
     public static function firstApplicationFrame(): array
     {
+        [$file, $line, $function] = self::capture();
+
+        return [$file, $line, $function];
+    }
+
+    /**
+     * One walk: first-party call site plus the bounded recent stack.
+     *
+     * @return array{0: ?string, 1: int, 2: ?string, 3: ?string} file, line, function, stacktrace JSON
+     */
+    public static function capture(int $stackLimit = self::STACK_LIMIT): array
+    {
+        $limit = max(0, $stackLimit);
         try {
             $frames = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, self::MAX_FRAMES);
-            foreach ($frames as $index => $frame) {
-                $file = $frame['file'] ?? null;
-                if (is_string($file) && $file !== '' && !str_contains($file, '/vendor/')) {
-                    return [$file, (int) ($frame['line'] ?? 0), self::frameFunction($frames[$index + 1] ?? null)];
-                }
-            }
         } catch (Throwable) {
+            return [null, 0, null, null];
         }
 
-        return [null, 0, null];
+        $recent = [];
+        $file = null;
+        $line = 0;
+        $function = null;
+        foreach ($frames as $index => $frame) {
+            if (self::isCollectorFrame($frame)) {
+                continue;
+            }
+            if (count($recent) < $limit) {
+                $normalised = self::normaliseFrame($frame);
+                if ($normalised !== []) {
+                    $recent[] = $normalised;
+                }
+            }
+            $path = $frame['file'] ?? null;
+            if ($file === null && is_string($path) && $path !== '' && !str_contains($path, '/vendor/')) {
+                $file = $path;
+                $line = (int) ($frame['line'] ?? 0);
+                $function = self::frameFunction($frames[$index + 1] ?? null);
+            }
+            if ($file !== null && count($recent) >= $limit) {
+                break;
+            }
+        }
+
+        $json = null;
+        if ($recent !== []) {
+            $encoded = json_encode($recent, JSON_UNESCAPED_SLASHES);
+            $json = is_string($encoded) ? $encoded : null;
+        }
+
+        return [$file, $line, $function, $json];
+    }
+
+    /** Stamp `code.*` plus `code.stacktrace` onto an open span. */
+    public static function applyToSpan(Span $span, int $stackLimit = self::STACK_LIMIT): void
+    {
+        if ($span->isVoid()) {
+            return;
+        }
+        [$file, $line, $function, $stacktrace] = self::capture($stackLimit);
+        if ($file !== null && $file !== '') {
+            $span->add('code.filepath', $file);
+            if ($line > 0) {
+                $span->add('code.lineno', (string) $line);
+            }
+        }
+        if ($function !== null && $function !== '') {
+            $span->add('code.function', $function);
+        }
+        if ($stacktrace !== null && $stacktrace !== '') {
+            $span->add('code.stacktrace', $stacktrace, Span::MAX_TEXT_LENGTH);
+        }
     }
 
     /**
@@ -68,6 +136,49 @@ final class CallSite
         }
 
         return $attributes;
+    }
+
+    /**
+     * @param array<string, mixed> $frame
+     */
+    private static function isCollectorFrame(array $frame): bool
+    {
+        $class = $frame['class'] ?? null;
+
+        return is_string($class) && str_starts_with($class, 'Chronos\\Collector\\');
+    }
+
+    /**
+     * @param array<string, mixed> $frame
+     * @return array<string, string|int>
+     */
+    private static function normaliseFrame(array $frame): array
+    {
+        $out = [];
+        $function = is_string($frame['function'] ?? null) ? $frame['function'] : '';
+        if ($function !== '') {
+            $out['function'] = $function;
+        }
+        $class = is_string($frame['class'] ?? null) ? $frame['class'] : '';
+        if ($class !== '') {
+            $out['class'] = $class;
+        }
+        $type = is_string($frame['type'] ?? null) ? $frame['type'] : '';
+        if ($type !== '') {
+            $out['type'] = $type;
+        }
+        $file = is_string($frame['file'] ?? null) ? $frame['file'] : '';
+        if ($file !== '') {
+            $out['file'] = $file;
+        }
+        $line = $frame['line'] ?? null;
+        if (is_int($line) && $line > 0) {
+            $out['line'] = $line;
+        } elseif (is_numeric($line) && (int) $line > 0) {
+            $out['line'] = (int) $line;
+        }
+
+        return $out;
     }
 
     /**

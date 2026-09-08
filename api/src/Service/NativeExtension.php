@@ -472,6 +472,33 @@ final class NativeExtension
     }
 
     /**
+     * Announce that a queued job has STARTED, so it can be seen while it runs.
+     *
+     * Every other signal is spooled once the work is over, which is why a job in
+     * flight is invisible — there is no span for it until it ends. This writes a
+     * marker immediately; the job's own root span closes it out later, matched on
+     * the trace and span ids the marker carries.
+     *
+     * `$timeoutSeconds` is the framework's own timeout, or 0 where it reports
+     * none: a job cannot legitimately outlive it, so it is the only honest
+     * deadline for presuming a worker that never came back is dead.
+     *
+     * @param array<string, string> $facts the root span's `messaging.*` attributes
+     */
+    public static function jobStarted(string $name, int $timeoutSeconds, array $facts): void
+    {
+        if (!self::loaded() || !function_exists('chronos_job_started')) {
+            return;
+        }
+        try {
+            \chronos_job_started($name, $timeoutSeconds, $facts);
+        } catch (\Throwable) {
+            // Fail open, like every other bridge here: a job must not fail
+            // because the note saying it started could not be written.
+        }
+    }
+
+    /**
      * Announce that userland instrumentation owns a data-access kind ("sql" |
      * "cache") for this request — the native observer stops emitting its
      * fallback I/O spans so the same query is never captured twice.

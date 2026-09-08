@@ -352,6 +352,8 @@ mod tests {
             parent_span_id: None,
             sampled: true,
             session_id: Some("018f5b2c-7a41-7c3d-9e2a-0f1b2c3d4e5f".into()),
+            tracestate: None,
+            baggage: None,
         }
     }
 

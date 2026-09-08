@@ -98,6 +98,11 @@ final class RichTelemetryHooks
                     self::traceRedisCommand($event);
                 });
             }
+            if (class_exists(Event::class) && class_exists(\Illuminate\Routing\Events\RouteMatched::class)) {
+                Event::listen(\Illuminate\Routing\Events\RouteMatched::class, static function (): void {
+                    NativeExtension::markPhase('controller');
+                });
+            }
             // Prefer Laravel HTTP client events: Facade::method_exists is false for
             // Http::globalMiddleware (magic __callStatic), so that gate never armed DST
             // or spans for outbound calls. Keep the middleware path as a fallback.
@@ -128,14 +133,7 @@ final class RichTelemetryHooks
             $span->add('span.kind', 'client');
             $span->add('db.system', 'sql');
             self::addConnectionMetadata($span, $query);
-            [$file, $line, $function] = self::callSite();
-            if ($file !== null) {
-                $span->add('code.filepath', $file);
-                $span->add('code.lineno', (string) $line);
-            }
-            if ($function !== null) {
-                $span->add('code.function', $function);
-            }
+            CallSite::applyToSpan($span);
             $span->add('db.statement', $sql, Span::MAX_TEXT_LENGTH);
             $span->add('db.query.text', $sql, Span::MAX_TEXT_LENGTH);
             $bindingsCount = count((array) ($query->bindings ?? []));
@@ -223,14 +221,7 @@ final class RichTelemetryHooks
                 }
                 $span->add('db.parameters.count', (string) count($parameters));
                 self::addRedisConnectionMetadata($span, $connection);
-                [$file, $line, $function] = self::callSite();
-                if ($file !== null) {
-                    $span->add('code.filepath', $file);
-                    $span->add('code.lineno', (string) $line);
-                }
-                if ($function !== null) {
-                    $span->add('code.function', $function);
-                }
+                CallSite::applyToSpan($span);
             }
             $span->finish();
         } catch (Throwable) {
@@ -363,14 +354,7 @@ final class RichTelemetryHooks
                 $span->add('db.operation', $level > 1 ? 'SAVEPOINT' : 'TRANSACTION');
                 $span->add('db.transaction.level', (string) $level);
                 self::addConnectionMetadata($span, $event);
-                [$file, $line, $function] = self::callSite();
-                if ($file !== null) {
-                    $span->add('code.filepath', $file);
-                    $span->add('code.lineno', (string) $line);
-                }
-                if ($function !== null) {
-                    $span->add('code.function', $function);
-                }
+                CallSite::applyToSpan($span);
             }
             self::$transactionSpans[] = $span;
         } catch (Throwable) {
@@ -460,11 +444,7 @@ final class RichTelemetryHooks
             $span->add('cache.store', $store);
             $span->add('db.operation', 'GET');
             self::addRedisMetadata($span, $store);
-            [$file, $line] = self::callSite();
-            if ($file !== null) {
-                $span->add('code.filepath', $file);
-                $span->add('code.lineno', (string) $line);
-            }
+            CallSite::applyToSpan($span);
             $span->add('cache.key', $key);
             $hit = $event instanceof CacheHit;
             CacheCapture::stamp($span, $hit, $hit ? ($event->value ?? null) : null);
@@ -495,11 +475,7 @@ final class RichTelemetryHooks
             $span->add('cache.store', $store);
             $span->add('db.operation', 'SET');
             self::addRedisMetadata($span, $store);
-            [$file, $line] = self::callSite();
-            if ($file !== null) {
-                $span->add('code.filepath', $file);
-                $span->add('code.lineno', (string) $line);
-            }
+            CallSite::applyToSpan($span);
             $span->add('cache.key', $key);
             if (isset($event->seconds) && is_numeric($event->seconds)) {
                 $span->add('cache.ttl', (string) $event->seconds);
@@ -529,11 +505,7 @@ final class RichTelemetryHooks
             $span->add('cache.store', $store);
             $span->add('db.operation', 'DEL');
             self::addRedisMetadata($span, $store);
-            [$file, $line] = self::callSite();
-            if ($file !== null) {
-                $span->add('code.filepath', $file);
-                $span->add('code.lineno', (string) $line);
-            }
+            CallSite::applyToSpan($span);
             $span->add('cache.key', $key);
         }
         $span->finish();
@@ -551,6 +523,14 @@ final class RichTelemetryHooks
                     $traceparent = NativeExtension::childTraceparent()
                         ?? ('00-' . $span->traceId . '-' . $span->id . '-01');
                     $request = $request->withHeader('traceparent', $traceparent);
+                    // W3C Trace Context: forwarding traceparent obliges forwarding
+                    // tracestate too; baggage follows the same forward-as-is rule.
+                    // An application-set header is never overwritten.
+                    foreach (\Chronos\Collector\Service\Propagation::contextHeaders() as $name => $value) {
+                        if (!method_exists($request, 'hasHeader') || !$request->hasHeader($name)) {
+                            $request = $request->withHeader($name, $value);
+                        }
+                    }
                 }
                 if (!$span->isVoid()) {
                     self::attachOutboundRequest($span, $request, $method);

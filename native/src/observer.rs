@@ -223,6 +223,25 @@ pub fn set_request_context(context: TraceContext) {
     SUPPRESS_CACHE.with(|flag| flag.set(false));
     #[cfg(feature = "zend-observer")]
     CURL_HEADERS.with(|h| h.borrow_mut().clear());
+    #[cfg(feature = "zend-observer")]
+    PREPARED_STATEMENTS.with(|m| m.borrow_mut().clear());
+    #[cfg(feature = "zend-observer")]
+    LAST_THROW.with(|t| *t.borrow_mut() = None);
+}
+
+/// Update the propagation headers on the observer's own copy of the request
+/// context. Exists because `enrich_request` (lib.rs) can learn a tracestate /
+/// baggage the native start could not see, AFTER `set_request_context` already
+/// cloned the context in here — and re-calling `set_request_context` would clear
+/// every span recorded during framework bootstrap. Touches ONLY the propagation
+/// fields; the trace identity stays whatever the request started with.
+pub fn set_propagation(tracestate: Option<String>, baggage: Option<String>) {
+    REQUEST_CONTEXT.with(|ctx| {
+        if let Some(context) = ctx.borrow_mut().as_mut() {
+            context.tracestate = tracestate;
+            context.baggage = baggage;
+        }
+    });
 }
 
 pub fn clear_request_context() {
@@ -230,6 +249,8 @@ pub fn clear_request_context() {
     SPAN_STACK.with(|stack| stack.borrow_mut().clear());
     #[cfg(feature = "zend-observer")]
     CURL_HEADERS.with(|h| h.borrow_mut().clear());
+    #[cfg(feature = "zend-observer")]
+    PREPARED_STATEMENTS.with(|m| m.borrow_mut().clear());
 }
 
 fn on_begin(
@@ -477,10 +498,27 @@ const SQL_IO_FUNCTIONS: &[&str] = &[
     "mysqli::real_query",
     "mysqli::execute_query",
     "mysqli_query",
+    // Prepared-statement execution IS the round trip — `mysqli::prepare` /
+    // `SQLite3::prepare` only compile the statement. The SQL text is not an
+    // argument at execute time, so it is captured at prepare time into
+    // PREPARED_STATEMENTS (keyed by the statement object's handle, same
+    // per-handle-map pattern as CURL_HEADERS) and stamped onto this span.
+    "mysqli_stmt::execute",
     "SQLite3::query",
     "SQLite3::exec",
     "SQLite3::querySingle",
+    "SQLite3Stmt::execute",
 ];
+
+/// The prepare methods whose RESULT is a statement object worth remembering.
+/// `PDO::prepare` is deliberately absent: it already emits its own `IoSpan`
+/// carrying `db.statement`, and userland PDO instrumentation (Doctrine,
+/// DB::listen) owns the richer capture there.
+const SQL_PREPARE_METHODS: &[&str] = &["mysqli::prepare", "SQLite3::prepare"];
+
+fn sql_prepare_method(name: &str) -> bool {
+    SQL_PREPARE_METHODS.contains(&name)
+}
 
 /// Cache client classes whose DATA methods are I/O spans. Lifecycle methods
 /// (construct/connect/auth/…) are excluded from observation entirely.
@@ -608,6 +646,13 @@ fn observe_policy(name: &str, is_internal: bool) -> Option<SpanPolicy> {
     if name == "curl_setopt" || name == "curl_setopt_array" {
         return Some(SpanPolicy::ObserveOnly);
     }
+    // Observed for the side channel only, like curl_setopt above: the prepare
+    // call is where the SQL text is last visible, so its end handler banks the
+    // text against the returned statement object for the later `::execute` span.
+    // No span of its own — the wire round trip that matters is the execute.
+    if sql_prepare_method(name) {
+        return Some(SpanPolicy::ObserveOnly);
+    }
     if dst_event_kind_for(name).is_some() {
         return Some(SpanPolicy::ObserveOnly);
     }
@@ -662,6 +707,54 @@ static PREVIOUS_THROW_HOOK: std::sync::OnceLock<
     Option<unsafe extern "C" fn(ex: *mut ext_php_rs::ffi::zend_object)>,
 > = std::sync::OnceLock::new();
 
+/// The most recent throw of the request, bounded like the root span's own error caps
+/// (`lib.rs` caps error.type at 256 and error.message at 2048 — same numbers here, so
+/// what shutdown stamps can never exceed what a bridge could have stamped).
+#[derive(Clone, Debug)]
+pub struct LastThrow {
+    pub class: String,
+    pub message: String,
+    pub file: String,
+    pub line: String,
+}
+
+#[cfg(feature = "zend-observer")]
+thread_local! {
+    /// Set by the throw hook on EVERY throw while a request is open, overwritten by
+    /// later throws, cleared at request start. At RSHUTDOWN this is the only witness
+    /// left of an exception that escaped a frameworkless script — the object itself
+    /// is gone by then. See `lib.rs::uncaught_exception_at_shutdown` for how it is
+    /// matched against `error_get_last()` before anything is stamped.
+    static LAST_THROW: RefCell<Option<LastThrow>> = const { RefCell::new(None) };
+}
+
+/// The request's most recent recorded throw, if any. `None` without the observer
+/// feature — there is no throw hook to have seen one.
+pub fn last_throw() -> Option<LastThrow> {
+    #[cfg(feature = "zend-observer")]
+    {
+        LAST_THROW.with(|t| t.borrow().clone())
+    }
+    #[cfg(not(feature = "zend-observer"))]
+    {
+        None
+    }
+}
+
+/// Truncate on a char boundary — same shape as `lib.rs::cap`, local so the throw
+/// hook does not reach across modules for a three-line helper.
+#[cfg(feature = "zend-observer")]
+fn bounded(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_owned();
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
 /// Native throw-time exception capture (debug-extension direction P5, gated on this native
 /// `.so` existing — see the phasing doc). `zend_throw_exception_hook` fires once per throw,
 /// before any catch block runs, with the raw `Throwable` object — the only point at which
@@ -673,22 +766,38 @@ static PREVIOUS_THROW_HOOK: std::sync::OnceLock<
 /// exception still shaped the execution path a replay must reproduce.
 #[cfg(feature = "zend-observer")]
 unsafe extern "C" fn chronos_throw_trampoline(exception: *mut ext_php_rs::ffi::zend_object) {
-    if crate::dst_spool::is_active() {
+    // The identity is read at most once per throw, and only when someone will use
+    // it: the DST recording, or the request-open LAST_THROW slot that lets a
+    // frameworkless fatal still stamp error.* onto its root span at RSHUTDOWN.
+    let request_open = REQUEST_CONTEXT.with(|ctx| ctx.borrow().is_some());
+    if request_open || crate::dst_spool::is_active() {
         if let Some(identity) = zend_helpers::exception_identity(exception) {
-            let mut payload = vec![("class".to_owned(), identity.class)];
-            if let Some(message) = identity.message {
-                payload.push(("message".to_owned(), message));
+            if request_open {
+                LAST_THROW.with(|slot| {
+                    *slot.borrow_mut() = Some(LastThrow {
+                        class: bounded(&identity.class, 256),
+                        message: bounded(identity.message.as_deref().unwrap_or(""), 2048),
+                        file: bounded(identity.file.as_deref().unwrap_or(""), 1024),
+                        line: bounded(identity.line.as_deref().unwrap_or(""), 16),
+                    });
+                });
             }
-            if let Some(code) = identity.code {
-                payload.push(("code".to_owned(), code));
+            if crate::dst_spool::is_active() {
+                let mut payload = vec![("class".to_owned(), identity.class)];
+                if let Some(message) = identity.message {
+                    payload.push(("message".to_owned(), message));
+                }
+                if let Some(code) = identity.code {
+                    payload.push(("code".to_owned(), code));
+                }
+                if let Some(file) = identity.file {
+                    payload.push(("file".to_owned(), file));
+                }
+                if let Some(line) = identity.line {
+                    payload.push(("line".to_owned(), line));
+                }
+                crate::dst_spool::record(crate::dst_spool::DstEventKind::Exception, payload);
             }
-            if let Some(file) = identity.file {
-                payload.push(("file".to_owned(), file));
-            }
-            if let Some(line) = identity.line {
-                payload.push(("line".to_owned(), line));
-            }
-            crate::dst_spool::record(crate::dst_spool::DstEventKind::Exception, payload);
         }
     }
     if let Some(Some(previous)) = PREVIOUS_THROW_HOOK.get() {
@@ -1050,6 +1159,9 @@ unsafe extern "C" fn chronos_begin_trampoline(
             if policy == SpanPolicy::IoSpan {
                 capture_io_detail(execute_data, &mut frame);
                 if let Some(ref url) = stream_url {
+                    frame
+                        .attributes
+                        .push((crate::http_capture::URL_FULL.into(), url.clone()));
                     frame.attributes.push(("http.url".into(), url.clone()));
                 }
             }
@@ -1142,10 +1254,33 @@ unsafe fn capture_io_detail(
         || name == "SQLite3::exec"
     {
         if let Some(statement) = zend_helpers::arg_scalar_string(execute_data, 0, 4096) {
+            // Legacy + current semconv spelling, same value — see the constants'
+            // comment in `http_capture.rs` for why both are kept.
+            frame
+                .attributes
+                .push((crate::http_capture::DB_QUERY_TEXT.into(), statement.clone()));
             frame.attributes.push(("db.statement".into(), statement));
+        }
+    } else if name == "mysqli_stmt::execute" || name == "SQLite3Stmt::execute" {
+        // The SQL text is NOT an argument here — it was banked at prepare time
+        // against this statement object's handle. A map miss (procedural prepare,
+        // cap overflow, statement from before this request) still emits the span,
+        // just without the text: an execute round trip with an unknown statement
+        // is better evidence than no row at all.
+        if let Some(handle) = zend_helpers::this_object_handle(execute_data) {
+            let statement = PREPARED_STATEMENTS.with(|map| map.borrow().get(&handle).cloned());
+            if let Some(statement) = statement {
+                frame
+                    .attributes
+                    .push((crate::http_capture::DB_QUERY_TEXT.into(), statement.clone()));
+                frame.attributes.push(("db.statement".into(), statement));
+            }
         }
     } else if name == "curl_exec" {
         if let Some(url) = zend_helpers::curl_effective_url(execute_data) {
+            frame
+                .attributes
+                .push((crate::http_capture::URL_FULL.into(), url.clone()));
             frame.attributes.push(("http.url".into(), url));
         }
     }
@@ -1196,6 +1331,14 @@ unsafe extern "C" fn chronos_end_trampoline(
             if &*frame.name == "curl_exec" {
                 capture_curl_result(execute_data, retval, &mut frame);
             }
+            // Bank a successful `mysqli::prepare` / `SQLite3::prepare`'s SQL against
+            // the statement object it RETURNED, for the later `::execute` span (the
+            // text is not an argument there). At END rather than begin because only
+            // the end handler holds the return value — and a failed prepare returns
+            // `false`, which must bank nothing.
+            if sql_prepare_method(&frame.name) {
+                bank_prepared_statement(execute_data, retval);
+            }
             // DST: record the observed result of known non-deterministic builtins.
             if crate::dst_spool::is_active() {
                 if let Some(kind) = dst_event_kind_for(&frame.name) {
@@ -1240,6 +1383,55 @@ thread_local! {
     /// CurlHandle object handle id. Injection merges with these instead of clobbering.
     static CURL_HEADERS: RefCell<std::collections::HashMap<u32, Vec<String>>> =
         RefCell::new(std::collections::HashMap::new());
+    /// SQL text banked at `mysqli::prepare` / `SQLite3::prepare` time, keyed by the
+    /// RETURNED statement object's handle (the query is not an argument of the later
+    /// `::execute` call, so this map is the only bridge between the two). Same
+    /// per-handle-map pattern as CURL_HEADERS, cleared with it per request. A miss
+    /// (evicted entry, statement prepared before this request, procedural
+    /// `mysqli_prepare`) degrades to an execute span WITHOUT the text — never to a
+    /// dropped span.
+    static PREPARED_STATEMENTS: RefCell<std::collections::HashMap<u32, String>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Ceiling on remembered prepared statements per request. CURL_HEADERS gets away
+/// without one because an application holds a handful of curl handles; an ORM in a
+/// loop can prepare per row, and each entry here retains up to 4 KiB of SQL text.
+/// Past the cap new prepares fall back to the graceful text-less path above.
+#[cfg(feature = "zend-observer")]
+const MAX_PREPARED_STATEMENTS: usize = 512;
+
+/// Remember a prepare call's SQL, keyed by the statement object it returned —
+/// see PREPARED_STATEMENTS for the map's contract and the miss behaviour.
+///
+/// The cap refuses NEW handles only: re-preparing into an already-known handle id
+/// always lands, because the engine recycles object handles and a recycled id must
+/// never keep the PREVIOUS statement's text — a wrong query on a span is worse
+/// than no query.
+///
+/// # Safety
+/// Called from the Zend observer end handler, where execute_data and retval are
+/// both still valid for the frame being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn bank_prepared_statement(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    retval: *mut ext_php_rs::ffi::zval,
+) {
+    let Some(handle) = zend_helpers::retval_object_handle(retval) else {
+        return;
+    };
+    // Same 4096-byte cap as the direct-query capture in `capture_io_detail`, so a
+    // prepared query is bounded exactly like an immediate one.
+    let Some(statement) = zend_helpers::arg_scalar_string(execute_data, 0, 4096) else {
+        return;
+    };
+    PREPARED_STATEMENTS.with(|map| {
+        let mut map = map.borrow_mut();
+        if map.len() >= MAX_PREPARED_STATEMENTS && !map.contains_key(&handle) {
+            return;
+        }
+        map.insert(handle, statement);
+    });
 }
 
 /// Response detail for a finished `curl_exec`: the connection phase timeline, the
@@ -1290,9 +1482,14 @@ unsafe fn capture_curl_result(
     let content_type = info.get("content_type").cloned().unwrap_or_default();
     if let Some(code) = info.get("http_code").and_then(|c| c.parse::<i64>().ok()) {
         if code > 0 {
+            // Legacy + current semconv spelling, same value (see `http_capture.rs`).
             frame
                 .attributes
                 .push(("http.status_code".into(), code.to_string()));
+            frame.attributes.push((
+                crate::http_capture::RESPONSE_STATUS_CODE.into(),
+                code.to_string(),
+            ));
         }
     }
     if !content_type.is_empty() {
@@ -1310,6 +1507,9 @@ unsafe fn capture_curl_result(
         frame
             .attributes
             .push(("http.method".into(), method.clone()));
+        frame
+            .attributes
+            .push((crate::http_capture::REQUEST_METHOD.into(), method.clone()));
     }
 
     // The body, but only when CURLOPT_RETURNTRANSFER made curl_exec return one; a
@@ -1459,9 +1659,21 @@ unsafe fn inject_curl_traceparent(
     let mut headers = CURL_HEADERS
         .with(|map| map.borrow().get(&handle).cloned())
         .unwrap_or_default();
-    // Idempotence: never stack multiple traceparent headers on retried handles.
-    headers.retain(|h| !h.to_ascii_lowercase().starts_with("traceparent:"));
-    headers.push(format!("traceparent: {traceparent}"));
+    // The request's inbound `tracestate`/`baggage` ride along VERBATIM. They were
+    // captured next to the traceparent (see `lib.rs::start_request`) and never
+    // parsed — pass-through is the whole contract.
+    let (tracestate, baggage) = REQUEST_CONTEXT.with(|ctx| {
+        ctx.borrow()
+            .as_ref()
+            .map(|c| (c.tracestate.clone(), c.baggage.clone()))
+            .unwrap_or((None, None))
+    });
+    merge_propagation_headers(
+        &mut headers,
+        traceparent,
+        tracestate.as_deref(),
+        baggage.as_deref(),
+    );
 
     zend_helpers::call_curl_setopt_httpheader(execute_data, &headers);
 
@@ -1469,6 +1681,39 @@ unsafe fn inject_curl_traceparent(
     CURL_HEADERS.with(|map| {
         map.borrow_mut().insert(handle, headers);
     });
+}
+
+/// Merge the trace-propagation headers into an application's own curl header list.
+///
+/// `traceparent` always lands. `tracestate` is forwarded whenever the inbound
+/// request carried one, because W3C Trace Context REQUIRES a participant that
+/// forwards `traceparent` to also forward `tracestate` it does not understand —
+/// the vendor entries in it belong to OTHER tracers sharing this trace, and
+/// dropping them severs their correlation. `baggage` follows the same
+/// forward-as-is contract (its own W3C spec).
+///
+/// Dedupe mirrors the traceparent idempotence rule that was always here: each
+/// header we are about to add first evicts any earlier spelling of itself (a
+/// retried handle, or an application that forwarded the inbound headers by
+/// hand). A header we have NO value for is left untouched — an application's
+/// own `tracestate` is not ours to remove.
+fn merge_propagation_headers(
+    headers: &mut Vec<String>,
+    traceparent: &str,
+    tracestate: Option<&str>,
+    baggage: Option<&str>,
+) {
+    // Idempotence: never stack multiple traceparent headers on retried handles.
+    headers.retain(|h| !h.to_ascii_lowercase().starts_with("traceparent:"));
+    headers.push(format!("traceparent: {traceparent}"));
+    if let Some(tracestate) = tracestate {
+        headers.retain(|h| !h.to_ascii_lowercase().starts_with("tracestate:"));
+        headers.push(format!("tracestate: {tracestate}"));
+    }
+    if let Some(baggage) = baggage {
+        headers.retain(|h| !h.to_ascii_lowercase().starts_with("baggage:"));
+        headers.push(format!("baggage: {baggage}"));
+    }
 }
 
 #[cfg(feature = "zend-observer")]
@@ -1732,6 +1977,42 @@ pub(crate) mod zend_helpers {
             return None;
         }
         let obj = (*zv).value.obj;
+        if obj.is_null() {
+            return None;
+        }
+        Some((*obj).handle)
+    }
+
+    /// Handle id of the object a METHOD call is invoked on (`$this`) — how the
+    /// prepared-statement map is keyed at `mysqli_stmt::execute` /
+    /// `SQLite3Stmt::execute` time, matching the key banked off the prepare call's
+    /// return value. `None` for a plain function call or a static call, which
+    /// have no bound object.
+    pub unsafe fn this_object_handle(
+        execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    ) -> Option<u32> {
+        if execute_data.is_null() {
+            return None;
+        }
+        let this = std::ptr::addr_of!((*execute_data).This) as *const ext_php_rs::ffi::zval;
+        if zval_type(this) != IS_OBJECT {
+            return None;
+        }
+        let obj = (*this).value.obj;
+        if obj.is_null() {
+            return None;
+        }
+        Some((*obj).handle)
+    }
+
+    /// Handle id of an object RETURN VALUE (`mysqli::prepare` returning a
+    /// `mysqli_stmt`). `None` when the call returned anything else — a failed
+    /// prepare returns `false`, and there is nothing to key against then.
+    pub unsafe fn retval_object_handle(retval: *mut ext_php_rs::ffi::zval) -> Option<u32> {
+        if retval.is_null() || zval_type(retval) != IS_OBJECT {
+            return None;
+        }
+        let obj = (*retval).value.obj;
         if obj.is_null() {
             return None;
         }
@@ -2189,6 +2470,61 @@ mod tests {
             "/srv/app/vendor/symfony/Kernel.php",
             &parsed
         ));
+    }
+
+    // --- Propagation header merging -----------------------------------------
+
+    #[test]
+    fn all_three_propagation_headers_are_appended_to_the_applications_own() {
+        let mut headers = vec!["Accept: application/json".to_owned()];
+        merge_propagation_headers(
+            &mut headers,
+            "00-abc-def-01",
+            Some("vendor=state"),
+            Some("userId=1"),
+        );
+        assert_eq!(
+            headers,
+            vec![
+                "Accept: application/json".to_owned(),
+                "traceparent: 00-abc-def-01".to_owned(),
+                "tracestate: vendor=state".to_owned(),
+                "baggage: userId=1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_retried_handle_never_stacks_duplicate_propagation_headers() {
+        let mut headers = vec![
+            "TraceParent: 00-old-old-01".to_owned(),
+            "tracestate: stale=1".to_owned(),
+            "Baggage: stale=1".to_owned(),
+        ];
+        merge_propagation_headers(&mut headers, "00-new-new-01", Some("fresh=1"), Some("k=v"));
+        assert_eq!(
+            headers,
+            vec![
+                "traceparent: 00-new-new-01".to_owned(),
+                "tracestate: fresh=1".to_owned(),
+                "baggage: k=v".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_applications_own_tracestate_survives_when_the_request_carried_none() {
+        // We only dedupe a header we are about to re-add. An application that set
+        // its own tracestate on a request with no inbound one keeps it.
+        let mut headers = vec!["tracestate: mine=1".to_owned()];
+        merge_propagation_headers(&mut headers, "00-abc-def-01", None, None);
+        assert_eq!(
+            headers,
+            vec![
+                "tracestate: mine=1".to_owned(),
+                "traceparent: 00-abc-def-01".to_owned(),
+            ]
+        );
     }
 
     // --- Policy ------------------------------------------------------------

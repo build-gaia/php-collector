@@ -37,8 +37,10 @@ use Chronos\Collector\Replay\Vocabulary;
 use Chronos\Collector\Framework\Guzzle\ImmediatePromise;
 use Chronos\Collector\Framework\Guzzle\ReplayMiddleware;
 use Chronos\Collector\Framework\Laravel\ExceptionCapture;
+use Chronos\Collector\Framework\Laravel\QueueTelemetry;
 use Chronos\Collector\Framework\Laravel\RequestFacts;
 use Chronos\Collector\Service\CacheCapture;
+use Chronos\Collector\Service\CallSite;
 use Chronos\Collector\Service\Span;
 use Chronos\Collector\Framework\Pdo\EffectConnection;
 
@@ -894,6 +896,70 @@ $runner->test('Laravel request facts hydrate the root with names and counts only
     $runner->assertTrue(!isset($attributes['laravel.jobs']), 'the old count dictionary is gone');
 });
 
+$runner->test('an authorization check records the target class, not just the ability', static function (Runner $runner): void {
+    RequestFacts::reset();
+    RequestFacts::noteGate('accessBackoffice', true, 'App\\Models\\User', 'App\\Models\\User');
+    RequestFacts::noteGate('update', true);
+
+    $attributes = RequestFacts::snapshot();
+    $gates = json_decode($attributes['framework.authorization'] ?? '{}', true);
+    $runner->assertSame(1, is_array($gates) ? ($gates['accessBackoffice@User:allow'] ?? 0) : 0, 'target is on the count key');
+    $runner->assertSame(1, is_array($gates) ? ($gates['update:allow'] ?? 0) : 0, 'no-target keeps the old shape');
+    $checks = json_decode($attributes['framework.authorization.checks'] ?? '[]', true);
+    $runner->assertSame(2, is_array($checks) ? count($checks) : 0, 'each check is a catalog record');
+    $named = [];
+    foreach (is_array($checks) ? $checks : [] as $check) {
+        $named[$check['name'] ?? ''] = $check;
+    }
+    $runner->assertSame('accessBackoffice', $named['accessBackoffice']['name'] ?? null, 'ability kept');
+    $runner->assertSame('App\\Models\\User', $named['accessBackoffice']['target'] ?? null, 'full target class');
+    $runner->assertSame('allow', $named['accessBackoffice']['result'] ?? null, 'result');
+    $runner->assertSame('App\\Models\\User', $named['accessBackoffice']['arguments'] ?? null, 'cheap argument summary');
+    $runner->assertTrue(!isset($named['update']['target']), 'no target is omitted, not blank');
+});
+
+$runner->test('Inertia records the page component, not the Blade root named app', static function (Runner $runner): void {
+    RequestFacts::reset();
+    $view = new class {
+        public function name(): string
+        {
+            return 'app';
+        }
+
+        /** @return array<string, mixed> */
+        public function getData(): array
+        {
+            return ['page' => ['component' => 'Profile/Edit']];
+        }
+    };
+    RequestFacts::noteComposedView('composing: app', $view);
+    RequestFacts::noteComposedView('composing: layouts.nav', null);
+
+    $attributes = RequestFacts::snapshot();
+    $runner->assertSame(
+        '{"Profile/Edit":1,"layouts.nav":1}',
+        $attributes['framework.views'] ?? null,
+        'Inertia page plus real Blade includes, not the root layout',
+    );
+});
+
+$runner->test('a query span carries the last few stack frames, including vendor', static function (Runner $runner): void {
+    $span = Span::open('t', 's1', '', 'SQL SELECT');
+    CallSite::applyToSpan($span);
+    $attributes = $span->toRecord()->attributes;
+    $runner->assertTrue(isset($attributes['code.filepath']), 'first-party file for the editor jump');
+    $frames = json_decode($attributes['code.stacktrace'] ?? '[]', true);
+    $runner->assertTrue(is_array($frames) && $frames !== [], 'a stack was captured');
+    $runner->assertTrue(count($frames) <= CallSite::STACK_LIMIT, 'bounded to Debugbar depth');
+    foreach ($frames as $frame) {
+        $class = is_array($frame) ? ($frame['class'] ?? '') : '';
+        $runner->assertTrue(
+            !is_string($class) || !str_starts_with($class, 'Chronos\\Collector\\'),
+            'collector frames stay out',
+        );
+    }
+});
+
 $runner->test('reads and writes are counted apart, because they answer different questions', static function (Runner $runner): void {
     RequestFacts::reset();
     RequestFacts::noteModel('App\\Models\\User');
@@ -1038,6 +1104,72 @@ $runner->test('CacheCapture stamps a hit with the value and a miss without', sta
     $missAttributes = $miss->toRecord()->attributes;
     $runner->assertSame('false', $missAttributes['cache.hit'] ?? null);
     $runner->assertTrue(!array_key_exists('cache.value', $missAttributes), 'miss carries no value');
+});
+
+// The wait is the number a queue is judged on, and every case below is one where
+// it cannot be measured — the point of each is that the answer is "unknown"
+// rather than the healthiest possible value, which is what a zero would claim.
+$runner->test('a queued job reports the wait it can prove and nothing more', static function (Runner $runner): void {
+    $startedAt = 1_757_000_000.500;
+
+    $runner->assertSame(
+        1500,
+        QueueTelemetry::waitMilliseconds('1756999999.000000', $startedAt),
+        'a stamped dispatch instant becomes the wait in milliseconds',
+    );
+    $runner->assertSame(
+        0,
+        QueueTelemetry::waitMilliseconds((string) $startedAt, $startedAt),
+        'a job picked up the instant it was pushed really did wait zero',
+    );
+    $runner->assertSame(
+        1500,
+        QueueTelemetry::waitMilliseconds(1756999999.0, $startedAt),
+        'a float stamp is read as readily as the string form',
+    );
+
+    // Each of these is a payload this SDK did not write, or a clock that
+    // disagrees with the worker's. None of them may report as instant.
+    foreach ([
+        'absent' => null,
+        'empty' => '',
+        'not a number' => 'now',
+        'an array' => ['1756999999'],
+        'zero' => '0',
+        'negative' => '-1756999999',
+        // Skew, not a measurement: the dispatcher's clock is ahead of the
+        // worker's, so the message appears to have been pushed after it started.
+        'dispatched in the future' => (string) ($startedAt + 5.0),
+    ] as $case => $stamp) {
+        $runner->assertTrue(
+            QueueTelemetry::waitMilliseconds($stamp, $startedAt) === null,
+            "an unmeasurable wait ({$case}) is unknown, not zero",
+        );
+    }
+});
+
+$runner->test('every dispatched payload carries the dispatch instant', static function (Runner $runner): void {
+    $before = microtime(true);
+    $context = QueueTelemetry::payloadContext();
+    $after = microtime(true);
+
+    $stamped = $context[QueueTelemetry::PAYLOAD_KEY][QueueTelemetry::ENQUEUED_AT_KEY] ?? null;
+    $runner->assertTrue(is_string($stamped) && is_numeric($stamped), 'the instant is stamped');
+    $runner->assertTrue(
+        (float) $stamped >= $before && (float) $stamped <= $after,
+        'the instant is when the payload was built',
+    );
+    // Without an open request there is no trace to continue — and the wait is
+    // still measurable, which is the whole reason the key is no longer dropped.
+    $runner->assertTrue(
+        !array_key_exists('traceparent', $context[QueueTelemetry::PAYLOAD_KEY]),
+        'no open request contributes no traceparent',
+    );
+    $runner->assertSame(
+        0,
+        QueueTelemetry::waitMilliseconds($stamped, (float) $stamped),
+        'the stamp this SDK writes is the one it can read back',
+    );
 });
 
 exit($runner->finish());

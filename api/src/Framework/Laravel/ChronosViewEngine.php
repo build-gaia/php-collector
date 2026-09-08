@@ -47,17 +47,18 @@ final class ChronosViewEngine implements Engine
      */
     public function get($path, array $data = []): string
     {
+        $template = self::templateName((string) $path, $data);
         // The first template to render is the boundary between the controller's
         // work and the response's: everything after this mark is rendering.
         if (!self::$renderPhaseMarked) {
             self::$renderPhaseMarked = true;
-            NativeExtension::markPhase('render');
+            NativeExtension::markPhase('view: '.$template);
         }
 
-        $span = SpanManager::open('VIEW '.self::templateName((string) $path));
+        $span = SpanManager::open('VIEW '.$template);
         if (!$span->isVoid()) {
             $span->add('span.kind', 'internal');
-            $span->add('framework.view.template', self::templateName((string) $path));
+            $span->add('framework.view.template', $template);
             $span->add('code.filepath', (string) $path);
             // The COUNT of bound variables, never their values: view data is the
             // application's own domain objects, and the panel that showed them
@@ -84,9 +85,14 @@ final class ChronosViewEngine implements Engine
      * file name rather than presenting the hash as if it meant something.
      *
      * @param  string  $path
+     * @param  array<mixed>  $data
      */
-    private static function templateName(string $path): string
+    private static function templateName(string $path, array $data = []): string
     {
+        $component = $data['page']['component'] ?? null;
+        if (is_string($component) && trim($component) !== '') {
+            return trim($component);
+        }
         if ($path === '') {
             return 'view';
         }

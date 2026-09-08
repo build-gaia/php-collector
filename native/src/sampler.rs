@@ -833,6 +833,8 @@ mod tests {
             parent_span_id: None,
             sampled: true,
             session_id: Some("session".into()),
+            tracestate: None,
+            baggage: None,
         }
     }
 

@@ -77,6 +77,22 @@ pub fn write_atomic(spool_directory: &str, body: &str, extension: &str) -> std::
 /// and the POST, and it dead-letters as a whole batch rather than degrading.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 900 * 1024;
 
+/// Truncate `value` to at most `max_bytes`, never splitting a UTF-8 character.
+///
+/// Byte-bounded rather than character-bounded because every consumer of this —
+/// a jsonb column, a document budget — is counting bytes, and a cap that counted
+/// characters would let one multi-byte string overrun a limit expressed in bytes.
+pub fn cap(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
 /// The configured budget (`CHRONOS_PHP_SPOOL_MAX_BYTES`), or the default.
 pub fn max_body_bytes() -> usize {
     crate::settings::get("CHRONOS_PHP_SPOOL_MAX_BYTES")
