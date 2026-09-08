@@ -51,8 +51,10 @@ use Throwable;
  * identity), but it does not itself watch the chunk stream to know when a
  * given response finished. A request whose response is driven exclusively
  * through stream() and never asked for its status/content directly therefore
- * gets a span that opens but is never closed — SpanManager simply drops an
- * unfinished span, so this shows up as a MISSING span rather than a wrong one.
+ * gets a span that opens but is never closed — it was opened DETACHED (see
+ * beginSpan), so it parents nothing and counts against no capacity; an
+ * unfinished span is simply never recorded, so this shows up as a MISSING
+ * span rather than a wrong one.
  * Closing spans from inside stream() would mean wrapping ResponseStreamInterface
  * too and mapping each yielded chunk's response back to its span by identity;
  * left for a follow-up since the common case does not need it.
@@ -204,7 +206,14 @@ final class ChronosHttpClient implements HttpClientInterface
     private function beginSpan(string $method, string $url, array $options): ?Span
     {
         try {
-            $span = SpanManager::open('HTTP '.$method);
+            // DETACHED, not open(): this span outlives request() — it closes whenever
+            // the caller resolves the response, arbitrarily later. On the stack it
+            // would become the parent of every span opened in between (the Doctrine
+            // query between request() and getContent(), a second concurrent
+            // request()), and a never-resolved response would leave it mis-parenting
+            // the rest of the request. Detached, it parents correctly onto whatever
+            // was current at request() time and intercepts nothing.
+            $span = SpanManager::openDetached('HTTP '.$method);
             if ($span->isVoid()) {
                 return $span;
             }

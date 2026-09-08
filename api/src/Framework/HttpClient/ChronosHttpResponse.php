@@ -4,119 +4,43 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\HttpClient;
 
-use Chronos\Collector\Service\Span;
 use Symfony\Contracts\HttpClient\ResponseInterface;
-use Throwable;
 
 /**
  * A thin ResponseInterface pass-through that stays exactly as lazy as the
  * response it wraps (see ChronosHttpClient's class doc for why laziness
  * matters). Every method delegates to the inner response unchanged; the only
  * addition is closing the client span the first time a caller actually
- * resolves the response, stamping http.response.status_code at that point.
+ * resolves the response — on success AND on the exception paths, see the
+ * ChronosHttpResponseMethods trait, which holds the entire implementation.
  *
- * Closing is idempotent and guarded per-instance ($closed) rather than
- * relying on Span's own finished-guard alone, so a caller who calls
- * getStatusCode() and then getContent() only pays the status-code lookup
- * once and the span is stamped from whichever call happened first.
+ * TWO declarations of the same class, chosen by `interface_exists()`, because
+ * the interface this wrapper must not silently drop lives in a different
+ * package than the one it must not depend on being present:
+ *
+ * Symfony's concrete transport responses all implement StreamableInterface
+ * (from symfony/http-client, NOT the contracts package), and application code
+ * legitimately calls `$response->toStream()` on whatever `http_client` hands
+ * back — a documented feature. ChronosIntegrationsPass decorates `http_client`
+ * unconditionally, so a wrapper that did not declare the interface would turn
+ * that working call into an instanceof-check miss (StreamWrapper::createResource
+ * without the $client argument, typed consumers) with zero application change.
+ * But this file must also load for a caller who holds only the CONTRACTS
+ * package (any custom HttpClientInterface, no symfony/http-client installed),
+ * where the interface does not exist and implementing it would be a fatal.
+ * Hence the branch — same conditional-declaration technique as
+ * Framework/Messenger/ChronosMiddleware. Both branches carry toStream() via
+ * the trait, so duck-typed callers work either way; the interface_exists()
+ * branch additionally satisfies instanceof checks.
  */
-final class ChronosHttpResponse implements ResponseInterface
-{
-    private bool $closed = false;
-
-    public function __construct(
-        private readonly ResponseInterface $response,
-        private readonly ?Span $span,
-    ) {
-    }
-
-    public function getStatusCode(): int
+if (interface_exists(\Symfony\Component\HttpClient\Response\StreamableInterface::class)) {
+    final class ChronosHttpResponse implements ResponseInterface, \Symfony\Component\HttpClient\Response\StreamableInterface
     {
-        $code = $this->response->getStatusCode();
-        $this->close($code);
-
-        return $code;
+        use ChronosHttpResponseMethods;
     }
-
-    public function getHeaders(bool $throw = true): array
+} else {
+    final class ChronosHttpResponse implements ResponseInterface
     {
-        $headers = $this->response->getHeaders($throw);
-        $this->closeFromResponse();
-
-        return $headers;
-    }
-
-    public function getContent(bool $throw = true): string
-    {
-        $content = $this->response->getContent($throw);
-        $this->closeFromResponse();
-
-        return $content;
-    }
-
-    public function toArray(bool $throw = true): array
-    {
-        $data = $this->response->toArray($throw);
-        $this->closeFromResponse();
-
-        return $data;
-    }
-
-    public function cancel(): void
-    {
-        $this->response->cancel();
-        try {
-            $this->span?->markError();
-        } catch (Throwable) {
-        }
-        $this->close(0);
-    }
-
-    public function getInfo(?string $type = null): mixed
-    {
-        // Deliberately does not close the span: Symfony populates `getInfo()`
-        // fields progressively as a transfer proceeds (e.g. on_progress
-        // callbacks read it before the body is complete), so treating any
-        // getInfo() call as "the response resolved" would close the span far
-        // too early and record a status code the transfer had not reached yet.
-        return $this->response->getInfo($type);
-    }
-
-    /** Unwrap back to the real response, for ChronosHttpClient::stream(). */
-    public function unwrap(): ResponseInterface
-    {
-        return $this->response;
-    }
-
-    private function closeFromResponse(): void
-    {
-        try {
-            $this->close($this->response->getStatusCode());
-        } catch (Throwable) {
-            // A transport error surfaces to the caller from the method they
-            // called; the span still deserves to close, just with no code.
-            $this->close(0);
-        }
-    }
-
-    private function close(int $statusCode): void
-    {
-        if ($this->closed) {
-            return;
-        }
-        $this->closed = true;
-        if ($this->span !== null && !$this->span->isVoid() && $statusCode > 0) {
-            try {
-                $this->span->add('http.response.status_code', (string) $statusCode);
-                if ($statusCode >= 500) {
-                    $this->span->markError();
-                }
-            } catch (Throwable) {
-            }
-        }
-        try {
-            $this->span?->finish();
-        } catch (Throwable) {
-        }
+        use ChronosHttpResponseMethods;
     }
 }

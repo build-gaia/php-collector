@@ -61,6 +61,30 @@ final class SpanManager
         return self::spawn($name, self::top());
     }
 
+    /**
+     * Open a span parented on the current top WITHOUT leaving it on the stack.
+     *
+     * For spans whose lifetime is decoupled from lexical scope — Symfony's lazy HTTP
+     * client opens a span at request() time and only closes it when (if!) the caller
+     * resolves the response, arbitrarily later. Left on the stack, such a span would
+     * become the parent of every span opened in between (SQL, cache, a second
+     * concurrent request), and one that is never resolved would mis-parent the rest
+     * of the request. Detached, it keeps its own correct parent, everything opened
+     * after it parents onto that same parent, and an unresolved one simply never
+     * records — a missing span, never a wrong tree. complete() is filter-based, so
+     * finishing a detached span works unchanged.
+     */
+    public static function openDetached(string $name): Span
+    {
+        $span = self::spawn($name, self::top());
+        self::$stack = array_values(array_filter(
+            self::$stack,
+            static fn (Span $open): bool => $open !== $span,
+        ));
+
+        return $span;
+    }
+
     public static function spawn(string $name, ?Span $parent): Span
     {
         if ($parent === null || $parent->isVoid() || count(self::$stack) + count(self::$finished) >= self::MAX_SPANS) {

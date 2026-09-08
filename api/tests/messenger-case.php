@@ -350,9 +350,41 @@ $runner->test('destinationName falls back to the sender class when the SentStamp
     $runner->assertSame(FakeMessage::class, invokePrivateStatic('destinationName', $envelope));
 });
 
-$runner->test('destinationName falls back to the message class when nothing was ever sent to a transport', function () use ($runner): void {
+$runner->test('destinationName answers null when nothing was ever sent to a transport (no producer span)', function () use ($runner): void {
+    // No SentStamp means no transport accepted the message: the whole chain ran
+    // synchronously in-process, and handleDispatch must record NO producer span —
+    // a class-named destination here would fabricate a producer-graph edge to a
+    // stream that does not exist, once per synchronous dispatch.
     $envelope = new Envelope(new FakeMessage());
+    $runner->assertSame(null, invokePrivateStatic('destinationName', $envelope));
+});
+
+$runner->test('destinationName still names the message class for a SentStamp whose alias and class are blank', function () use ($runner): void {
+    $envelope = (new Envelope(new FakeMessage()))->with(new SentStamp('', null));
     $runner->assertSame(FakeMessage::class, invokePrivateStatic('destinationName', $envelope));
+});
+
+$runner->test('consumesInline recognises the sync transport\'s hardcoded ReceivedStamp name', function () use ($runner): void {
+    // SyncTransport re-dispatches inside the live request with ReceivedStamp('sync');
+    // treating that as a worker consume would hijack and prematurely end the
+    // enclosing request's telemetry (requestStart resets the span stack, requestEnd
+    // is first-call-wins). The guard must trip on 'sync' and on nothing else.
+    $runner->assertSame(true, invokePrivateStatic('consumesInline', new ReceivedStamp('sync')));
+    $runner->assertSame(false, invokePrivateStatic('consumesInline', new ReceivedStamp('async')));
+    $runner->assertSame(false, invokePrivateStatic('consumesInline', new ReceivedStamp('')));
+});
+
+$runner->test('a sync-transport consume passes through to the handler untouched', function () use ($runner): void {
+    $middleware = new ChronosMiddleware();
+    $envelope = (new Envelope(new FakeMessage()))->with(new ReceivedStamp('sync'));
+    $result = new Envelope(new FakeMessage());
+    $inner = new RecordingMiddleware($result);
+    $stack = new FakeStack($inner);
+
+    $actual = $middleware->handle($envelope, $stack);
+
+    $runner->assertTrue($inner->seen === $envelope, 'inline consume must hand the handler the same envelope');
+    $runner->assertTrue($actual === $result, 'inline consume must return exactly what the handler chain returned');
 });
 
 $runner->test('consumeAttributes carries transport, message name and retry count', function () use ($runner): void {

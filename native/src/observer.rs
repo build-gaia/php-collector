@@ -510,14 +510,42 @@ const SQL_IO_FUNCTIONS: &[&str] = &[
     "SQLite3Stmt::execute",
 ];
 
-/// The prepare methods whose RESULT is a statement object worth remembering.
+/// The prepare calls whose RESULT is a statement object worth remembering.
 /// `PDO::prepare` is deliberately absent: it already emits its own `IoSpan`
 /// carrying `db.statement`, and userland PDO instrumentation (Doctrine,
-/// DB::listen) owns the richer capture there.
-const SQL_PREPARE_METHODS: &[&str] = &["mysqli::prepare", "SQLite3::prepare"];
+/// DB::listen) owns the richer capture there. Procedural `mysqli_prepare`
+/// belongs here too (same returned-statement shape, SQL at arg 1 after the
+/// link) — see `prepare_sql_arg_index`.
+const SQL_PREPARE_METHODS: &[&str] = &["mysqli::prepare", "SQLite3::prepare", "mysqli_prepare"];
+
+/// The prepare calls that mutate the statement object they are CALLED ON
+/// (`$db->stmt_init()` + `$stmt->prepare($sql)`, `new mysqli_stmt($link, $sql)`)
+/// rather than returning a fresh one. Observed for the same side channel as
+/// SQL_PREPARE_METHODS, with one extra duty the retval-keyed path never has:
+/// EVICTION. The Zend engine recycles object handles within a request, so a
+/// statement created through one of these calls can inherit the handle id of a
+/// freed statement whose SQL is still banked — and a later `::execute` would
+/// then be stamped with the OLD query's text. Every observed call here therefore
+/// either re-banks the handle with its real SQL or evicts it (failed prepare,
+/// unreadable argument): a wrong query on a span is worse than no query.
+const SQL_THIS_PREPARE_METHODS: &[&str] = &["mysqli_stmt::prepare", "mysqli_stmt::__construct"];
 
 fn sql_prepare_method(name: &str) -> bool {
     SQL_PREPARE_METHODS.contains(&name)
+}
+
+fn sql_this_prepare_method(name: &str) -> bool {
+    SQL_THIS_PREPARE_METHODS.contains(&name)
+}
+
+/// Which argument carries the SQL text for a given prepare call. The method
+/// forms take it first; the procedural forms and the constructor take the
+/// connection/link first and the SQL second.
+fn prepare_sql_arg_index(name: &str) -> usize {
+    match name {
+        "mysqli_prepare" | "mysqli_stmt::__construct" => 1,
+        _ => 0,
+    }
 }
 
 /// Cache client classes whose DATA methods are I/O spans. Lifecycle methods
@@ -648,9 +676,10 @@ fn observe_policy(name: &str, is_internal: bool) -> Option<SpanPolicy> {
     }
     // Observed for the side channel only, like curl_setopt above: the prepare
     // call is where the SQL text is last visible, so its end handler banks the
-    // text against the returned statement object for the later `::execute` span.
-    // No span of its own — the wire round trip that matters is the execute.
-    if sql_prepare_method(name) {
+    // text against the statement object (returned, or `$this` for the mutating
+    // forms) for the later `::execute` span. No span of its own — the wire
+    // round trip that matters is the execute.
+    if sql_prepare_method(name) || sql_this_prepare_method(name) {
         return Some(SpanPolicy::ObserveOnly);
     }
     if dst_event_kind_for(name).is_some() {
@@ -1331,13 +1360,16 @@ unsafe extern "C" fn chronos_end_trampoline(
             if &*frame.name == "curl_exec" {
                 capture_curl_result(execute_data, retval, &mut frame);
             }
-            // Bank a successful `mysqli::prepare` / `SQLite3::prepare`'s SQL against
-            // the statement object it RETURNED, for the later `::execute` span (the
-            // text is not an argument there). At END rather than begin because only
-            // the end handler holds the return value — and a failed prepare returns
-            // `false`, which must bank nothing.
+            // Bank a successful prepare's SQL against the statement object — the one
+            // it RETURNED (mysqli::prepare and friends) or the one it was CALLED ON
+            // (mysqli_stmt::prepare / new mysqli_stmt) — for the later `::execute`
+            // span (the text is not an argument there). At END rather than begin
+            // because only the end handler holds the return value — and a failed
+            // prepare (`false`) must bank nothing / must EVICT a recycled handle.
             if sql_prepare_method(&frame.name) {
-                bank_prepared_statement(execute_data, retval);
+                bank_prepared_statement(execute_data, retval, prepare_sql_arg_index(&frame.name));
+            } else if sql_this_prepare_method(&frame.name) {
+                rebank_prepared_statement_for_this(execute_data, retval, &frame.name);
             }
             // DST: record the observed result of known non-deterministic builtins.
             if crate::dst_spool::is_active() {
@@ -1383,13 +1415,17 @@ thread_local! {
     /// CurlHandle object handle id. Injection merges with these instead of clobbering.
     static CURL_HEADERS: RefCell<std::collections::HashMap<u32, Vec<String>>> =
         RefCell::new(std::collections::HashMap::new());
-    /// SQL text banked at `mysqli::prepare` / `SQLite3::prepare` time, keyed by the
-    /// RETURNED statement object's handle (the query is not an argument of the later
-    /// `::execute` call, so this map is the only bridge between the two). Same
-    /// per-handle-map pattern as CURL_HEADERS, cleared with it per request. A miss
-    /// (evicted entry, statement prepared before this request, procedural
-    /// `mysqli_prepare`) degrades to an execute span WITHOUT the text — never to a
-    /// dropped span.
+    /// SQL text banked at prepare time (`mysqli::prepare` / `SQLite3::prepare` /
+    /// `mysqli_prepare` keyed by the RETURNED statement's handle;
+    /// `mysqli_stmt::prepare` / `new mysqli_stmt` keyed by `$this` — the query is
+    /// not an argument of the later `::execute` call, so this map is the only
+    /// bridge between the two). Same per-handle-map pattern as CURL_HEADERS,
+    /// cleared with it per request, and EVICTED per handle whenever an observed
+    /// prepare path re-creates a statement without readable SQL — the engine
+    /// recycles object handles, and a recycled id keeping a freed statement's text
+    /// would stamp the wrong query onto a span. A miss (evicted entry, statement
+    /// prepared before this request) degrades to an execute span WITHOUT the text
+    /// — never to a dropped span.
     static PREPARED_STATEMENTS: RefCell<std::collections::HashMap<u32, String>> =
         RefCell::new(std::collections::HashMap::new());
 }
@@ -1416,13 +1452,20 @@ const MAX_PREPARED_STATEMENTS: usize = 512;
 unsafe fn bank_prepared_statement(
     execute_data: *mut ext_php_rs::ffi::zend_execute_data,
     retval: *mut ext_php_rs::ffi::zval,
+    sql_arg_index: usize,
 ) {
     let Some(handle) = zend_helpers::retval_object_handle(retval) else {
         return;
     };
     // Same 4096-byte cap as the direct-query capture in `capture_io_detail`, so a
     // prepared query is bounded exactly like an immediate one.
-    let Some(statement) = zend_helpers::arg_scalar_string(execute_data, 0, 4096) else {
+    let Some(statement) = zend_helpers::arg_scalar_string(execute_data, sql_arg_index, 4096)
+    else {
+        // A brand-new statement object whose SQL could not be read must not
+        // inherit whatever a freed statement left banked under this handle id.
+        PREPARED_STATEMENTS.with(|map| {
+            map.borrow_mut().remove(&handle);
+        });
         return;
     };
     PREPARED_STATEMENTS.with(|map| {
@@ -1431,6 +1474,57 @@ unsafe fn bank_prepared_statement(
             return;
         }
         map.insert(handle, statement);
+    });
+}
+
+/// The `$this`-keyed counterpart of `bank_prepared_statement`, for the prepare
+/// calls that mutate an existing statement object (`mysqli_stmt::prepare`,
+/// `mysqli_stmt::__construct`) instead of returning a new one.
+///
+/// Eviction is the point, not an edge case: these are exactly the creation paths
+/// the retval-keyed banking never sees, so a recycled object handle could
+/// otherwise keep a freed statement's SQL and stamp the wrong query onto this
+/// statement's `::execute` span. A failed `prepare()` (returns `false`), a
+/// constructor called without a query, or an unreadable argument all EVICT the
+/// handle; only a successful prepare with readable SQL re-banks it. The cap
+/// refuses NEW handles only, same rule as above — an evicted-or-replaced known
+/// handle always lands.
+///
+/// # Safety
+/// Called from the Zend observer end handler, where execute_data and retval are
+/// both still valid for the frame being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn rebank_prepared_statement_for_this(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    retval: *mut ext_php_rs::ffi::zval,
+    name: &str,
+) {
+    let Some(handle) = zend_helpers::this_object_handle(execute_data) else {
+        return;
+    };
+    // `mysqli_stmt::prepare` answers a bool; banking on `false` would record SQL
+    // the server never compiled. A constructor has no meaningful return value —
+    // reaching the end handler at all means it did not throw.
+    let succeeded =
+        name != "mysqli_stmt::prepare" || zend_helpers::retval_is_true(retval);
+    let statement = if succeeded {
+        zend_helpers::arg_scalar_string(execute_data, prepare_sql_arg_index(name), 4096)
+    } else {
+        None
+    };
+    PREPARED_STATEMENTS.with(|map| {
+        let mut map = map.borrow_mut();
+        match statement {
+            Some(sql) => {
+                if map.len() >= MAX_PREPARED_STATEMENTS && !map.contains_key(&handle) {
+                    return;
+                }
+                map.insert(handle, sql);
+            }
+            None => {
+                map.remove(&handle);
+            }
+        }
     });
 }
 
@@ -2003,6 +2097,13 @@ pub(crate) mod zend_helpers {
             return None;
         }
         Some((*obj).handle)
+    }
+
+    /// Whether a return value is the boolean `true` — how `mysqli_stmt::prepare`
+    /// reports success. A null retval pointer (a call unwinding on an exception)
+    /// reads as failure, which is the conservative answer for a banking decision.
+    pub unsafe fn retval_is_true(retval: *mut ext_php_rs::ffi::zval) -> bool {
+        !retval.is_null() && zval_type(retval) == IS_TRUE
     }
 
     /// Handle id of an object RETURN VALUE (`mysqli::prepare` returning a

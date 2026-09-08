@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Doctrine;
 
+use Chronos\Collector\Service\NativeExtension;
 use Doctrine\DBAL\Driver\Connection;
 use Doctrine\DBAL\Driver\Middleware\AbstractConnectionMiddleware;
 use Doctrine\DBAL\Driver\Result;
@@ -26,6 +27,12 @@ final class ChronosConnection extends AbstractConnectionMiddleware
 
     public function prepare(string $sql): Statement
     {
+        // No span of its own, but the native observer must still stand down BEFORE the
+        // wrapped driver's PDO::prepare runs underneath — that call is on the native
+        // SQL I/O list, and DoctrineQuerySpan only declares suppression at execute
+        // time, which for the first query of a request would be one prepare too late.
+        NativeExtension::suppressNative('sql');
+
         return new ChronosStatement(parent::prepare($sql), $sql, $this->metadata);
     }
 

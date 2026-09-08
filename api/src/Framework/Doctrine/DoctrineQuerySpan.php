@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Chronos\Collector\Framework\Doctrine;
 
 use Chronos\Collector\Service\CallSite;
+use Chronos\Collector\Service\NativeExtension;
 use Chronos\Collector\Service\Span;
 use Chronos\Collector\Service\SpanManager;
 use Throwable;
@@ -58,6 +59,17 @@ final class DoctrineQuerySpan
      */
     public static function open(string $sql, array $metadata, ?int $parameterCount): Span
     {
+        // Stand the native PDO/mysqli observer down BEFORE the real driver call runs
+        // inside this span: without it every query is captured twice — this userland
+        // `SQL <VERB>` span plus a native `PDOStatement::execute` IoSpan — inflating
+        // query counts and breaking N+1 grouping. Declared HERE, at the moment
+        // userland SQL instrumentation demonstrably owns the query, rather than from
+        // a framework request hook: this one seam covers Symfony web requests,
+        // Messenger workers and bare DBAL alike (Laravel and Symfony 1 declare it in
+        // their own request hooks instead, where their listeners always own SQL).
+        // Suppression is per-request native state, so re-declaring per query is a
+        // cheap idempotent flag set, not accumulating work.
+        NativeExtension::suppressNative('sql');
         $verb = self::verb($sql);
         $span = SpanManager::open('SQL '.$verb);
         if (!$span->isVoid()) {
