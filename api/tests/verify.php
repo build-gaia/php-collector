@@ -916,6 +916,9 @@ $runner->test('an authorization check records the target class, not just the abi
     $runner->assertSame('allow', $named['accessBackoffice']['result'] ?? null, 'result');
     $runner->assertSame('App\\Models\\User', $named['accessBackoffice']['arguments'] ?? null, 'cheap argument summary');
     $runner->assertTrue(!isset($named['update']['target']), 'no target is omitted, not blank');
+    // Laravel is absent in this process, so the Gate seam resolves to nothing.
+    // laravel-policy-case.php is where the resolved location is proven.
+    $runner->assertTrue(!isset($named['accessBackoffice']['policy']), 'no Gate, no invented policy location');
 });
 
 $runner->test('Inertia records the page component, not the Blade root named app', static function (Runner $runner): void {

@@ -60,6 +60,8 @@ final class RequestFacts
 
     private static ?ActivityCatalog $authorizations = null;
 
+    private static ?ActivityCatalog $viewTemplates = null;
+
     private static int $droppedViews = 0;
 
     private static int $droppedModels = 0;
@@ -89,11 +91,28 @@ final class RequestFacts
         self::events()->reset();
         self::jobs()->reset();
         self::authorizations()->reset();
+        self::viewTemplates()->reset();
     }
 
-    public static function noteView(string $name): void
+    /**
+     * One rendered template, with the file it was compiled from when known.
+     *
+     * The path is what turns a row naming `errors::403` into somewhere to go. It
+     * comes from the View object the framework hands the `composing:` listener and
+     * is never resolved through the view finder here: finding a template is a
+     * filesystem search the framework has already done, and doing it again would
+     * put that cost on every render.
+     */
+    public static function noteView(string $name, string $path = ''): void
     {
         self::note(self::$views, self::$droppedViews, $name);
+        if ($path === '') {
+            return;
+        }
+        self::viewTemplates()->record(
+            $name,
+            static fn (): array => ['name' => $name, 'code.filepath' => $path],
+        );
     }
 
     /**
@@ -115,7 +134,22 @@ final class RequestFacts
             return;
         }
         if ($viewName !== '') {
-            self::noteView($viewName);
+            self::noteView($viewName, self::viewPath($view));
+        }
+    }
+
+    /** The compiled template's own file, as the View object reports it. */
+    private static function viewPath(mixed $view): string
+    {
+        try {
+            if (!is_object($view) || !method_exists($view, 'getPath')) {
+                return '';
+            }
+            $path = $view->getPath();
+
+            return is_string($path) ? $path : '';
+        } catch (Throwable) {
+            return '';
         }
     }
 
@@ -204,6 +238,11 @@ final class RequestFacts
      * which is what turns "a gate named accessBackoffice" into Debugbar's
      * `accessBackoffice App\Models\User`. Argument *values* stay out of the count
      * key; a cheap type/class summary lives on the catalog record instead.
+     *
+     * The catalog record also names the policy method that returned the verdict
+     * and the file it lives in, so a `deny` is one click from the code that said
+     * so. That resolution sits inside the catalog's field callable, which means it
+     * is paid once per distinct check and never for a repeat.
      */
     public static function noteGate(
         string $ability,
@@ -225,8 +264,71 @@ final class RequestFacts
                 'result' => $result,
                 'target' => $target,
                 'arguments' => $argumentSummary,
-            ],
+            ] + self::policySite($ability, $target),
         );
+    }
+
+    /**
+     * Where the verdict was decided: `App\Policies\MessagePolicy::manageMessages`
+     * and its file and line.
+     *
+     * Resolution is by REFLECTION only — `getPolicyFor()` returns the registered
+     * policy instance without evaluating anything, and a `ReflectionMethod` reads
+     * the declaration. Nothing here calls the ability. A closure-defined ability is
+     * reflected the same way, and a gate defined by neither resolves to no fields
+     * rather than to a guess.
+     *
+     * @return array<string, string>
+     */
+    private static function policySite(string $ability, string $target): array
+    {
+        try {
+            if (!class_exists(\Illuminate\Support\Facades\Gate::class)) {
+                return [];
+            }
+            $gate = \Illuminate\Support\Facades\Gate::class;
+            if ($target !== '') {
+                $policy = $gate::getPolicyFor($target);
+                if (is_object($policy) && method_exists($policy, $ability)) {
+                    return self::declaration(
+                        $policy::class.'::'.$ability,
+                        new \ReflectionMethod($policy, $ability),
+                    );
+                }
+            }
+            $abilities = $gate::abilities();
+            $callback = is_array($abilities) ? ($abilities[$ability] ?? null) : null;
+            if ($callback instanceof \Closure) {
+                return self::declaration($ability, new \ReflectionFunction($callback));
+            }
+            if (is_string($callback) && str_contains($callback, '@')) {
+                [$class, $method] = explode('@', $callback, 2);
+                if (class_exists($class) && method_exists($class, $method)) {
+                    return self::declaration(
+                        $class.'::'.$method,
+                        new \ReflectionMethod($class, $method),
+                    );
+                }
+            }
+        } catch (Throwable) {
+        }
+
+        return [];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private static function declaration(string $policy, \ReflectionFunctionAbstract $function): array
+    {
+        $fields = ['policy' => $policy];
+        $file = $function->getFileName();
+        if (is_string($file) && $file !== '') {
+            $fields['code.filepath'] = $file;
+            $fields['code.lineno'] = (string) $function->getStartLine();
+        }
+
+        return $fields;
     }
 
     /**
@@ -273,6 +375,11 @@ final class RequestFacts
     private static function authorizations(): ActivityCatalog
     {
         return self::$authorizations ??= new ActivityCatalog();
+    }
+
+    private static function viewTemplates(): ActivityCatalog
+    {
+        return self::$viewTemplates ??= new ActivityCatalog();
     }
 
     /**
@@ -341,6 +448,7 @@ final class RequestFacts
         self::events()->putInto($attributes, 'messaging.events');
         self::jobs()->putInto($attributes, 'messaging.jobs');
         self::authorizations()->putInto($attributes, 'framework.authorization.checks');
+        self::viewTemplates()->putInto($attributes, 'framework.views.templates');
 
         return $attributes;
     }
