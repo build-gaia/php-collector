@@ -18,6 +18,10 @@ final class NativeExtension
 
     private static ?bool $enabled = null;
 
+    /** Resolved once per process: the setting read is an FFI call, and the answer
+     * cannot change inside a process. */
+    private static ?int $bodyCeiling = null;
+
     /** Once-per-process guard for the instrumentation-manifest load (the native
      * trace allowlist is per-process and only ever grows, so once is enough). */
     private static bool $manifestLoaded = false;
@@ -332,12 +336,13 @@ final class NativeExtension
      * holding a Response object can supply it exactly and for free — no output
      * buffer, so streamed and X-Sendfile responses are untouched.
      *
-     * Guarded by size before the call: shipping a 40 MB CSV export across the FFI
-     * boundary only for the .so to truncate it to 64 KiB is pure waste. The cap
-     * here is deliberately generous relative to the collector's own so the .so
-     * stays the single place the real limit is configured. `text/html` is allowed
-     * up to 100 MiB to match the native HTML ceiling (error pages and rendered
-     * views), everything else stays at 1 MiB.
+     * Guarded by size before the call, from the collector's OWN configured total
+     * (`CHRONOS_PHP_HTTP_CAPTURE_MAX_BODY_TOTAL`), so the .so stays the single
+     * place the real limit is set — which is what this guard is for, and what a
+     * media-type-specific number here had quietly stopped being. A fixed 1 MiB for
+     * everything but HTML meant a 5 MB JSON export arrived already cut, and
+     * arrived looking COMPLETE: the .so measures the size of what it is handed, so
+     * the real length was gone before anything could report it.
      */
     /** @param array<string, string> $headers */
     public static function setResponseBody(
@@ -352,12 +357,39 @@ final class NativeExtension
         if ($body === '' && $headers === []) {
             return;
         }
-        $media = strtolower(trim(explode(';', $contentType, 2)[0]));
-        $maxBytes = $media === 'text/html' ? 100 * 1024 * 1024 : 1_048_576;
         try {
-            \chronos_set_http_response_body(substr($body, 0, $maxBytes), $contentType, $headers);
+            \chronos_set_http_response_body(
+                substr($body, 0, self::bodyCaptureCeiling()),
+                $contentType,
+                $headers,
+            );
         } catch (\Throwable) {
         }
+    }
+
+    /**
+     * The most the collector could keep of one body, plus a little slack.
+     *
+     * Slack because the .so applies the real cap itself: handing it one byte over
+     * is what makes `.truncated` true, and shaving the string to exactly the cap
+     * would present an oversized body as a complete one. An extension that predates
+     * the setting reports nothing, and falls back to the total this SDK release
+     * was written against.
+     */
+    private static function bodyCaptureCeiling(): int
+    {
+        if (self::$bodyCeiling !== null) {
+            return self::$bodyCeiling;
+        }
+        $configured = 0;
+        if (function_exists('chronos_setting')) {
+            $configured = (int) \chronos_setting('CHRONOS_PHP_HTTP_CAPTURE_MAX_BODY_TOTAL');
+        }
+        if ($configured <= 0) {
+            $configured = 8 * 1024 * 1024;
+        }
+
+        return self::$bodyCeiling = min($configured + 1, 512 * 1024 * 1024);
     }
 
     /**

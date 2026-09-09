@@ -26,6 +26,7 @@
 
 use ext_php_rs::prelude::*;
 
+pub mod body_spool;
 pub mod call_path;
 pub mod config;
 pub mod context;
@@ -765,10 +766,16 @@ pub fn chronos_request_end(
             // redacted by the collector. Its keys (`http.request.*`, `http.response.*`,
             // `url.*`, `http.timeline`) are disjoint from the identity attributes set
             // above, so append order carries no precedence question.
-            attributes.extend(http_capture::drain(
-                request_end_ns.saturating_sub(request_start_ns),
-            ));
+            let drained = http_capture::drain(request_end_ns.saturating_sub(request_start_ns));
+            attributes.extend(drained.attributes);
             attributes.extend(extra_attributes);
+            // Spooled before the span, keyed by the same (trace, span). A reader
+            // only asks for a body after seeing the span say `.stored`, so writing
+            // the body first is the ordering that cannot show a promise the store
+            // has not yet been able to honour.
+            if !drained.bodies.is_empty() {
+                let _ = body_spool::flush(&envelope, &ctx.trace_id, &ctx.span_id, &drained.bodies);
+            }
             let root = observer::root_http_span(
                 ctx,
                 &route_pattern,

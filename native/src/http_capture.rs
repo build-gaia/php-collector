@@ -51,7 +51,27 @@ const DROPPED_KEY: &str = "chronos.dropped";
 /// `Authorization` HEADER — one mask, one vocabulary, one thing for a reader to learn.
 pub(crate) const MASK: &str = "********";
 
-const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
+/// Bytes of body kept INLINE on the span attribute.
+///
+/// The preview, in other words. It is sized so the overwhelming majority of
+/// bodies are whole on the span and need no second fetch at all; anything past it
+/// goes to `body_spool` and is loaded on request.
+const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// Bytes of body captured in TOTAL — the preview plus what is spooled behind it.
+///
+/// Not the same kind of number as the one above. That one trades a round trip;
+/// this one trades spool disk on a volume every application in the organisation
+/// shares, and index bytes behind it, so the default is a working figure rather
+/// than the largest thing that could be made to work.
+///
+/// Setting it to the inline cap (or below) turns whole-body storage off: the span
+/// keeps its preview and nothing is spooled. That is one knob rather than a
+/// second flag that could disagree with it.
+const DEFAULT_MAX_BODY_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Ceiling on the configurable total, whatever the setting asks for.
+const MAX_BODY_TOTAL_CEILING: usize = 512 * 1024 * 1024;
 const MAX_MAP_ENTRIES: usize = 128;
 const MAX_MAP_BYTES: usize = 16 * 1024;
 const MAX_VALUE_BYTES: usize = 2 * 1024;
@@ -83,7 +103,11 @@ pub struct HttpCaptureConfig {
     /// supplied. Off by default: it only sees a body when the application already had
     /// output buffering on, and reading it is a full copy of the response.
     pub response_buffer: bool,
+    /// Bytes kept inline on the span attribute.
     pub max_body_bytes: usize,
+    /// Bytes captured in total, inline plus spooled. At or below `max_body_bytes`,
+    /// nothing is spooled and a long body is simply previewed.
+    pub max_body_total_bytes: usize,
     /// Whether to mask credential-looking values. On by default; a service opts out
     /// only for a local debugging session.
     pub redact: bool,
@@ -97,6 +121,7 @@ impl Default for HttpCaptureConfig {
             capture_bodies: false,
             response_buffer: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_body_total_bytes: DEFAULT_MAX_BODY_TOTAL_BYTES,
             redact: true,
             redact_patterns: DEFAULT_REDACT_PATTERNS
                 .iter()
@@ -117,6 +142,7 @@ impl HttpCaptureConfig {
             };
         }
         let patterns = redaction_patterns().clone();
+        let max_body_bytes = env_usize("CHRONOS_PHP_HTTP_CAPTURE_MAX_BODY", DEFAULT_MAX_BODY_BYTES);
 
         Self {
             enabled: true,
@@ -125,11 +151,36 @@ impl HttpCaptureConfig {
                 "CHRONOS_PHP_HTTP_CAPTURE_RESPONSE_BUFFER",
                 false,
             ),
-            max_body_bytes: env_usize("CHRONOS_PHP_HTTP_CAPTURE_MAX_BODY", DEFAULT_MAX_BODY_BYTES),
+            max_body_bytes,
+            // Never below the inline cap: a total under the preview would make the
+            // preview itself a lie about what was captured.
+            max_body_total_bytes: env_usize(
+                "CHRONOS_PHP_HTTP_CAPTURE_MAX_BODY_TOTAL",
+                DEFAULT_MAX_BODY_TOTAL_BYTES,
+            )
+            .clamp(max_body_bytes, MAX_BODY_TOTAL_CEILING.max(max_body_bytes)),
             redact: crate::settings::flag("CHRONOS_PHP_HTTP_CAPTURE_REDACT", true),
             redact_patterns: patterns,
         }
     }
+}
+
+/// A body worth keeping whole, on its way to `body_spool`.
+///
+/// Produced here rather than there because this module is what decides what
+/// capture is allowed to keep; the spool only decides how it is written down.
+pub struct StoredBody {
+    /// `request` or `response` — which half of the exchange this is.
+    pub side: &'static str,
+    pub content_type: String,
+    pub bytes: String,
+}
+
+/// What one request's capture yielded: the span's attributes, and the bodies that
+/// did not fit in them.
+pub struct Drained {
+    pub attributes: Vec<(String, String)>,
+    pub bodies: Vec<StoredBody>,
 }
 
 /// One request's captured exchange.
@@ -199,8 +250,11 @@ pub fn on_request_start(config: HttpCaptureConfig) {
         // carry a document nobody meant to ship to a telemetry store.
         if !content_type.contains("multipart/form-data") {
             if let Some(body) = read_input_stream() {
+                // `size` is what the service saw; the copy kept is bounded. The two
+                // differing is exactly what `.truncated` reports.
                 let size = body.len();
-                capture.request_body = Some((body, size, content_type));
+                capture.request_body =
+                    Some((truncate(&body, config.max_body_total_bytes), size, content_type));
             }
         }
     }
@@ -218,7 +272,8 @@ pub fn set_response(body: String, content_type: String, headers: Vec<(String, St
             }
             if capture.config.capture_bodies && !body.is_empty() {
                 let size = body.len();
-                capture.response_body = Some((body, size, content_type));
+                let kept = truncate(&body, capture.config.max_body_total_bytes);
+                capture.response_body = Some((kept, size, content_type));
             }
         }
     });
@@ -239,12 +294,20 @@ pub fn mark_phase(name: &str, at_ns: u128) {
 ///
 /// `request_duration_ns` closes the final phase: a bridge marks where a phase starts
 /// and never has to close one, so the last mark runs to the end of the request.
-pub fn drain(request_duration_ns: u128) -> Vec<(String, String)> {
+///
+/// Bodies too long for the span come back beside the attributes rather than being
+/// written here: this module never touches the filesystem, and the caller is the
+/// one that knows the span's identity.
+pub fn drain(request_duration_ns: u128) -> Drained {
     let Some(mut capture) = CAPTURE.with(|c| c.borrow_mut().take()) else {
-        return Vec::new();
+        return Drained {
+            attributes: Vec::new(),
+            bodies: Vec::new(),
+        };
     };
     let config = capture.config.clone();
     let mut attributes: Vec<(String, String)> = Vec::new();
+    let mut bodies: Vec<StoredBody> = Vec::new();
 
     if let Some(json) = encode_map_masked(&capture.request_headers, &config) {
         attributes.push((REQUEST_HEADERS.to_owned(), json));
@@ -256,13 +319,10 @@ pub fn drain(request_duration_ns: u128) -> Vec<(String, String)> {
         attributes.push((REQUEST_QUERY.to_owned(), json));
     }
     if let Some((body, size, content_type)) = capture.request_body.take() {
-        attributes.extend(body_attributes(
-            REQUEST_BODY,
-            &body,
-            size,
-            &content_type,
-            &config,
-        ));
+        let (encoded, stored) =
+            body_attributes(REQUEST_BODY, "request", &body, size, &content_type, &config);
+        attributes.extend(encoded);
+        bodies.extend(stored);
     }
 
     // The bridge supplies response headers because it calls request-end before the
@@ -290,20 +350,17 @@ pub fn drain(request_duration_ns: u128) -> Vec<(String, String)> {
         }
     }
     if let Some((body, size, content_type)) = capture.response_body.take() {
-        attributes.extend(body_attributes(
-            RESPONSE_BODY,
-            &body,
-            size,
-            &content_type,
-            &config,
-        ));
+        let (encoded, stored) =
+            body_attributes(RESPONSE_BODY, "response", &body, size, &content_type, &config);
+        attributes.extend(encoded);
+        bodies.extend(stored);
     }
 
     if let Some(timeline) = phase_json(&capture.phases, request_duration_ns) {
         attributes.push((TIMELINE.to_owned(), timeline));
     }
 
-    attributes
+    Drained { attributes, bodies }
 }
 
 /// `$_SERVER`, as a plain map.
@@ -531,17 +588,23 @@ pub fn redacts_identifier(name: &str) -> bool {
         .any(|pattern| lowered.contains(pattern.as_str()))
 }
 
-/// The body plus the three siblings that keep a truncated payload from reading as a
-/// complete one.
+/// The body preview plus the siblings that keep a bounded payload from reading as a
+/// complete one, and the whole body when it did not fit.
+///
+/// `.stored` is the load-bearing addition: it is how a reader can tell "this is
+/// all there was" from "there is more, and it is retrievable". A `.truncated`
+/// without it still means what it always did — the rest is gone.
 fn body_attributes(
     key: &str,
+    side: &'static str,
     body: &str,
     size: usize,
     content_type: &str,
     config: &HttpCaptureConfig,
-) -> Vec<(String, String)> {
+) -> (Vec<(String, String)>, Option<StoredBody>) {
     let captured = truncate(body, config.max_body_bytes);
-    let truncated = captured.len() < body.len() || size > body.len();
+    let overflowed = captured.len() < body.len();
+    let truncated = overflowed || size > body.len();
     let mut attributes = vec![
         (key.to_owned(), captured),
         (format!("{key}.size"), size.to_string()),
@@ -552,10 +615,26 @@ fn body_attributes(
     if !content_type.is_empty() {
         attributes.push((format!("{key}.content_type"), content_type.to_owned()));
     }
-    attributes
+    if !overflowed || config.max_body_total_bytes <= config.max_body_bytes {
+        return (attributes, None);
+    }
+    attributes.push((format!("{key}.stored"), "true".to_owned()));
+    (
+        attributes,
+        Some(StoredBody {
+            side,
+            content_type: content_type.to_owned(),
+            bytes: body.to_owned(),
+        }),
+    )
 }
 
 /// `body_attributes` for callers outside a request capture (outbound curl).
+///
+/// Attributes only, never a stored body: the whole-body path is keyed by the span
+/// that carries the preview, and an outbound call's body belongs to a client span
+/// this function's caller has not created yet. Previewing it is the same; storing
+/// it would need an identity that does not exist here.
 pub fn encode_body(
     key: &str,
     body: &str,
@@ -563,7 +642,7 @@ pub fn encode_body(
     content_type: &str,
     config: &HttpCaptureConfig,
 ) -> Vec<(String, String)> {
-    body_attributes(key, body, size, content_type, config)
+    body_attributes(key, "response", body, size, content_type, config).0
 }
 
 /// Truncate to at most `limit` bytes without splitting a UTF-8 character.
