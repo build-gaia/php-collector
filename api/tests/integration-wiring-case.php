@@ -107,6 +107,8 @@ namespace Symfony\Component\DependencyInjection {
     {
         public ?string $decorates = null;
 
+        public bool $public = false;
+
         public array $arguments = [];
 
         public array $tags = [];
@@ -138,6 +140,13 @@ namespace Symfony\Component\DependencyInjection {
             return $this;
         }
 
+        public function setPublic(bool $public): static
+        {
+            $this->public = $public;
+
+            return $this;
+        }
+
         public function addMethodCall(string $method, array $arguments = []): static
         {
             $this->methodCalls[] = [$method, $arguments];
@@ -160,9 +169,19 @@ namespace Symfony\Component\DependencyInjection {
         /** @var list<string> */
         public array $aliases = [];
 
+        /** @var list<object> */
+        public array $compilerPasses = [];
+
         public function register(string $id, string $class): Definition
         {
             return $this->definitions[$id] = new Definition($class);
+        }
+
+        public function addCompilerPass(object $pass, string $type = '', int $priority = 0): static
+        {
+            $this->compilerPasses[] = $pass;
+
+            return $this;
         }
 
         public function hasDefinition(string $id): bool
@@ -214,6 +233,22 @@ namespace Symfony\Component\DependencyInjection {
 // Third-party presence fixtures: each one flips an interface_exists()/
 // class_exists() guard in ChronosIntegrationsPass to "installed".
 // ---------------------------------------------------------------------------
+
+namespace Symfony\Component\HttpKernel\Bundle {
+    abstract class Bundle
+    {
+        public function build(\Symfony\Component\DependencyInjection\ContainerBuilder $container): void
+        {
+        }
+    }
+}
+
+namespace Symfony\Component\DependencyInjection\Compiler {
+    final class PassConfig
+    {
+        public const TYPE_BEFORE_OPTIMIZATION = 'beforeOptimization';
+    }
+}
 
 namespace Symfony\Component\Messenger\Middleware {
     interface MiddlewareInterface
@@ -500,6 +535,21 @@ namespace Chronos\Collector\Tests\IntegrationWiring {
             !$container->hasDefinition('Chronos\\Collector\\Framework\\Messenger\\ChronosMiddleware'),
             'no messenger service without a bus middleware parameter to join',
         );
+    });
+
+    // ---- 5. ChronosBundle: the no-extension floor ----------------------------
+
+    test('the Symfony bundle wires nothing at all without the native extension', function (): void {
+        // The same floor ChronosServiceProvider::boot() gives Laravel. This suite
+        // runs with no .so, which is exactly the case under test; the wired case is
+        // covered by section 4, which drives the pass directly.
+        assertTrue(!\Chronos\Collector\Service\NativeExtension::loaded(), 'no extension in the test process');
+
+        $container = new ContainerBuilder();
+        (new \Chronos\Collector\Framework\Symfony\ChronosBundle())->build($container);
+
+        assertTrue($container->definitions === [], 'no service is registered, http_kernel is left undecorated');
+        assertTrue($container->compilerPasses === [], 'no compiler pass is added');
     });
 
     if ($failures > 0) {
