@@ -34,9 +34,23 @@ use Throwable;
  * than inventing a parallel one, and everything already built on the request root
  * (facts, transactions, the DST recording) works inside a job unchanged.
  *
- * Requires `CHRONOS_PHP_CLI_ENABLED`: the .so's RINIT hook deliberately skips CLI
- * processes, so without it a worker's requestStart is declined and this all stays
- * inert.
+ * `CHRONOS_PHP_CLI_ENABLED` is NOT required, despite what this comment used to
+ * say. That flag gates only the extension's AUTOMATIC request-start in RINIT;
+ * `chronos_request_start` never consults it, so the explicit per-job start below
+ * works on a worker with the flag unset (verified against a built extension: a
+ * job emits its `.trace` with `QUEUE`, the consumer attributes and the wait, plus
+ * its in-flight marker).
+ *
+ * Leaving the flag OFF is the better configuration, not merely an acceptable one.
+ * With it on, RINIT opens a request when the worker PROCESS starts, and
+ * `chronos_request_start` enriches an already-open request rather than opening a
+ * new one — so the first job of every worker would inherit a trace containing
+ * everything since boot, and an idle worker would accumulate spans toward the
+ * 32,768-span ceiling with no job to attribute them to.
+ *
+ * What IS required is this class being installed — it is userland code, so an
+ * application whose vendor tree lacks the SDK emits no job telemetry however the
+ * extension is configured.
  */
 final class QueueTelemetry
 {

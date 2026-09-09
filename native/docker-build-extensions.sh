@@ -19,10 +19,17 @@
 # Dockerfile.builder-alpine for musl. Verify a container's libc with:
 #   docker exec <c> sh -c 'cat /etc/os-release | grep ^ID=; ldd --version 2>&1 | head -1'
 #
-# ARCHITECTURE. The app containers are x86-64 (verify: docker exec mercury uname -m),
-# so every build is forced to linux/amd64. On Apple Silicon that is emulated and
-# SLOW — a release build with LTO takes tens of minutes per version. That is
-# expected, not a hang.
+# ARCHITECTURE — CHECK IT, DO NOT ASSUME. This script forces linux/amd64 because
+# the ORIGINAL app containers (mercury, deepwell, service-*) are x86-64. The QLS
+# estate under ~/code/qls/qls-development is NOT: those containers run aarch64
+# natively, and an amd64 .so copied into one does not load. The failure is SILENT
+# — `extension_loaded()` returns false, PHP carries on, and telemetry simply stops
+# (verified the hard way on 2026-09-08). Always confirm with
+# `docker exec <container> uname -m` before distributing, and build the matching
+# arch: the aarch64 artefacts are the `*-arm64.so` files in dist/.
+#
+# On Apple Silicon an amd64 build is emulated and SLOW — a release build with LTO
+# takes tens of minutes per version. That is expected, not a hang.
 #
 # ext-php-rs 0.15 supports PHP 8.0..=8.4, so all three versions are in range.
 set -euo pipefail
@@ -47,9 +54,24 @@ case "$ONLY" in ""|glibc|musl) ;; *) echo "--only takes glibc or musl, got '$ONL
 TARGETS=(
   "8.1:musl:20210902:service-pick-api service-pack-api"
   "8.2:glibc:20220829:deepwell"
+  "8.3:musl:20230831:"
   "8.4:glibc:20240924:mercury"
   "8.4:musl:20240924:service-auth service-insights-api"
 )
+
+# 8.3/musl has an EMPTY repo list on purpose. The QLS services that run it
+# (qls-oms, qls-admin, qls-finance) do not live at ~/code/<repo> like the rows
+# above — they are ~/code/qls/qls-development/services/<name>, and their images
+# do not COPY an extension from a repo path at all. So the artefact is built here
+# and delivered with `docker cp` into the running container:
+#
+#   docker cp dist/chronos-php8.3-musl.so \
+#     <container>:/usr/local/lib/php/extensions/no-debug-non-zts-20230831/chronos.so
+#
+# That survives `docker restart` and is lost on `docker compose up` recreating
+# the container, which is the honest trade for an estate whose images are built
+# elsewhere. The row is here rather than absent so the version is BUILT — leaving
+# it out is what made somebody build it by hand.
 
 # --only glibc | --only musl restricts the run to one libc, so a partial rebuild
 # does not pay for the emulated builds it already has.

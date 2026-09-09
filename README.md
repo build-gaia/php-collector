@@ -95,9 +95,12 @@ The extension works without it; the package adds what only userland can know:
   job payload at dispatch (through Laravel's own `createPayloadUsing` seam, so it
   survives retries, releases and any queue driver), and the worker opens a
   job-scoped request against it — so the job's queries, HTTP calls and failures
-  hang beneath the request that queued it. Workers need
-  `CHRONOS_PHP_CLI_ENABLED=1`; the extension's RINIT hook skips CLI processes by
-  default, and without it the worker half stays inert.
+  hang beneath the request that queued it. This needs no `CHRONOS_PHP_CLI_ENABLED`:
+  that flag gates only the extension's AUTOMATIC start in RINIT, and the bridge
+  starts each job's request explicitly. Leave it off — with it on, the worker
+  PROCESS gets a request of its own and the first job of each worker inherits
+  everything since boot. What the worker does need is this package in its vendor
+  tree; the extension alone carries no queue instrumentation.
 
   The dispatch instant rides in the payload beside the context, so the job root
   also carries `messaging.message.queue_time_ms`: **how long the message waited**,
