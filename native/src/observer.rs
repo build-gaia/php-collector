@@ -716,7 +716,38 @@ fn observe_policy(name: &str, is_internal: bool) -> Option<SpanPolicy> {
     Some(SpanPolicy::UserSpan)
 }
 
+/// Whether MINIT actually registered the observer. False when the collector was
+/// explicitly switched off at module startup, and false in a build without the
+/// `zend-observer` feature.
+static OBSERVER_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has a live Zend observer. The heartbeat reports it, because
+/// a process that later resolves `enabled` to true while this is false will produce
+/// no observer spans and nothing else would say why.
+pub fn installed() -> bool {
+    OBSERVER_INSTALLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Register the fcall observer, unless the collector is explicitly off.
+///
+/// Registration is MINIT-only — `zend_observer_fcall_register` cannot be called
+/// later — and it is not free: an installed observer costs roughly 30ns on EVERY
+/// userland call, whether or not a request is being collected, because the factory
+/// and the paired begin/end handlers run regardless. That is the price of the
+/// feature when the collector is on, and pure waste when it is off, which is the
+/// case for an image that bakes the .so in and disables it.
+///
+/// Only an EXPLICIT off skips it (`CHRONOS_PHP_ENABLED` / `chronos.enabled` in the
+/// process environment or php.ini). An absent setting installs as before, because a
+/// value this early cannot see per-request configuration — see `settings::startup_flag`.
+/// The consequence is worth stating plainly: switching the collector off at module
+/// startup and back on per-request leaves the process without an observer for its
+/// whole life. `heartbeat()` says so out loud when that happens.
 pub fn install_observer() {
+    if !crate::settings::startup_flag("CHRONOS_PHP_ENABLED", true) {
+        return;
+    }
     #[cfg(feature = "zend-observer")]
     unsafe {
         zend_observer_fcall_register(Some(chronos_observer_factory));
@@ -726,6 +757,7 @@ pub fn install_observer() {
         let previous = ext_php_rs::ffi::zend_throw_exception_hook;
         let _ = PREVIOUS_THROW_HOOK.set(previous);
         ext_php_rs::ffi::zend_throw_exception_hook = Some(chronos_throw_trampoline);
+        OBSERVER_INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(not(feature = "zend-observer"))]
     {}

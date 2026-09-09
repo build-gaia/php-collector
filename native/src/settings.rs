@@ -135,10 +135,41 @@ pub fn first(env_names: &[&str]) -> Option<String> {
     env_names.iter().find_map(|name| get(name))
 }
 
-pub fn flag(env_name: &str, default: bool) -> bool {
-    get(env_name)
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+/// The value of a boolean setting AT MODULE STARTUP, resolved without touching the
+/// cached `sources()`.
+///
+/// MINIT runs before any request exists: `$_SERVER` is empty and the process cwd is
+/// the SAPI's, not the application's. Calling `get()` there would resolve `.chronos`
+/// against the wrong tree — and, because `SOURCES` is a `OnceLock`, would CACHE that
+/// wrong answer for every request the worker ever serves. So only the two sources that
+/// are already final at MINIT are consulted: process environment, then php.ini.
+///
+/// Anything absent falls back to `default`, because a setting this function cannot see
+/// yet may still arrive per-request (an FPM pool `env[]` entry is applied at request
+/// startup, long after this runs). Only an explicit value decides.
+pub fn startup_flag(env_name: &str, default: bool) -> bool {
+    if let Ok(value) = std::env::var(env_name) {
+        if !value.is_empty() {
+            return truthy(&value);
+        }
+    }
+    let wanted = ini_name(env_name);
+    ext_php_rs::zend::ExecutorGlobals::get()
+        .ini_values()
+        .into_iter()
+        .find(|(name, _)| *name == wanted)
+        .and_then(|(_, value)| value)
+        .filter(|value| !value.is_empty())
+        .map(|value| truthy(&value))
         .unwrap_or(default)
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+pub fn flag(env_name: &str, default: bool) -> bool {
+    get(env_name).map(|v| truthy(&v)).unwrap_or(default)
 }
 
 pub fn u32_value(env_name: &str, default: u32) -> u32 {
@@ -286,6 +317,38 @@ mod tests {
 
         std::env::remove_var("CHRONOS_PHP_TEAM_ID");
         std::env::remove_var("CHRONOS_PHP_PROJECT");
+    }
+
+    #[test]
+    fn startup_flag_reads_the_environment_without_priming_the_cached_sources() {
+        // Only the env branch is exercised: with nothing set, startup_flag falls
+        // through to the INI table, which needs a live PHP runtime. The point of
+        // the function is that it answers from env alone when env has an answer.
+        std::env::set_var("CHRONOS_PHP_ENABLED", "0");
+        assert!(!startup_flag("CHRONOS_PHP_ENABLED", true));
+
+        std::env::set_var("CHRONOS_PHP_ENABLED", "off");
+        assert!(!startup_flag("CHRONOS_PHP_ENABLED", true));
+
+        std::env::set_var("CHRONOS_PHP_ENABLED", "true");
+        assert!(startup_flag("CHRONOS_PHP_ENABLED", false));
+
+        // An unparseable value is not an accident to ignore — it is not one of the
+        // spellings that mean on, so it means off, exactly as `flag()` reads it.
+        std::env::set_var("CHRONOS_PHP_ENABLED", "maybe");
+        assert!(!startup_flag("CHRONOS_PHP_ENABLED", true));
+
+        std::env::remove_var("CHRONOS_PHP_ENABLED");
+    }
+
+    #[test]
+    fn truthy_spells_on_the_same_way_everywhere() {
+        for on in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(truthy(on), "{on} should read as on");
+        }
+        for off in ["0", "false", "no", "off", "", "2", "enabled"] {
+            assert!(!truthy(off), "{off} should read as off");
+        }
     }
 
     #[test]

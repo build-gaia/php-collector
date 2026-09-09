@@ -4,8 +4,10 @@ Observability for PHP applications: APM traces, continuous profiling, full HTTP
 stack capture, log correlation, and deterministic-simulation recording — collected
 by a native extension (`chronos.so`), spooled to a shared volume, and drained
 automatically by the Chronos Docker stack's collector.
-Designed to be safe to bake into every image: with `CHRONOS_PHP_ENABLED` unset,
-both the extension and this package cost your application nothing.
+Designed to be safe to bake into every image: with `CHRONOS_PHP_ENABLED=0`,
+both the extension and this package cost your application nothing. Set it to `0`
+explicitly rather than leaving it unset — see [Cost guarantees](#cost-guarantees)
+for the one thing that is not free by default.
 
 > **`build-gaia/php-collector` is a read-only publishing mirror.** The source
 > lives at `build-gaia/collector` under `sdks/php`, and is split out to this
@@ -157,9 +159,19 @@ at its spool directory; see `engine/deploy/php-spool-forwarder.md`.)
 
 ## Cost guarantees
 
-- **Extension installed, `enabled` unset/0**: requests start nothing, observers
-  emit nothing, the package's framework hooks register nothing. One cached
-  config check per process.
+- **Extension installed, `enabled` explicitly `0`**: requests start nothing, the
+  Zend observer is never registered, the package's framework hooks register
+  nothing. One cached config check per process. Measured on PHP 8.3: a
+  function-call-bound workload runs at the same speed as with no extension
+  installed at all.
+- **Extension installed, `enabled` UNSET**: everything above holds except the
+  observer, which IS registered — and costs roughly **30 ns on every userland
+  function call** whether or not anything is being collected (measured ~19 ns/call
+  without the extension, ~50 ns/call with it). `zend_observer_fcall_register` is
+  MINIT-only, so the decision cannot be deferred to the first request; an absent
+  setting has to assume a later request might turn collection on. Write the `0`
+  and the cost goes away. On a request making 100k calls the difference is ~3 ms;
+  at 1M calls, ~30 ms.
 - **Package installed, extension absent**: every call is
   `extension_loaded`/`function_exists`-guarded and fail-open — silent no-ops,
   nothing registered.

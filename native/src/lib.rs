@@ -269,6 +269,19 @@ fn heartbeat(config: &CollectorConfig) {
             )
         },
     );
+    // A process whose observer never registered still collects — the bridges, the
+    // RINIT root span and HTTP capture all work — but every span the Zend observer
+    // would have produced is missing. That is invisible otherwise, so it is said
+    // here, where the one line per process that describes the collector already is.
+    let summary = if observer::installed() {
+        summary
+    } else {
+        format!(
+            "{summary} | observer NOT installed: the collector was switched off at \
+             module startup, so this process emits no observer spans (I/O, manifest) \
+             however it is configured now — see CHRONOS_PHP_ENABLED / chronos.enabled"
+        )
+    };
     // Lands in the SAPI error log (docker logs) even when log shipping is off.
     eprintln!("[chronos-ext] {summary}");
     if config.logs_enabled {
