@@ -39,10 +39,17 @@ const SCHEMA: &str = "chronos.tracing.span-body.v1";
 const CHUNK_BYTES: usize = 512 * 1024;
 
 /// Write every body as numbered documents. Bodies with nothing in them are skipped.
+///
+/// `started_at` is the request's own start instant, carried verbatim so a chunk's
+/// row lands in the same retention window as the span it belongs to — and so the
+/// row's identity is DERIVED rather than assigned. A chunk redelivered by the
+/// broker produces byte-identical keys, which is what makes the store's write
+/// idempotent without a dedupe table.
 pub fn flush(
     envelope: &CollectorEnvelope,
     trace_id: &str,
     span_id: &str,
+    started_at: &str,
     bodies: &[StoredBody],
 ) -> std::io::Result<()> {
     let mut result = Ok(());
@@ -53,7 +60,7 @@ pub fn flush(
         // Every chunk is attempted even after a failure: abandoning the tail of a
         // body because its third document could not be written loses more than it
         // protects, and the count on each document is what makes the gap visible.
-        if let Err(error) = flush_one(envelope, trace_id, span_id, body) {
+        if let Err(error) = flush_one(envelope, trace_id, span_id, started_at, body) {
             result = Err(error);
         }
     }
@@ -64,6 +71,7 @@ fn flush_one(
     envelope: &CollectorEnvelope,
     trace_id: &str,
     span_id: &str,
+    started_at: &str,
     body: &StoredBody,
 ) -> std::io::Result<()> {
     let chunks = split(&body.bytes);
@@ -78,6 +86,7 @@ fn flush_one(
             "application": { "applicationId": envelope.application_id },
             "traceId": trace_id,
             "spanId": span_id,
+            "observedAt": started_at,
             "side": body.side,
             "contentType": body.content_type,
             "totalBytes": body.bytes.len().to_string(),

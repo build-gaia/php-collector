@@ -787,7 +787,13 @@ pub fn chronos_request_end(
             // the body first is the ordering that cannot show a promise the store
             // has not yet been able to honour.
             if !drained.bodies.is_empty() {
-                let _ = body_spool::flush(&envelope, &ctx.trace_id, &ctx.span_id, &drained.bodies);
+                let _ = body_spool::flush(
+                    &envelope,
+                    &ctx.trace_id,
+                    &ctx.span_id,
+                    &started_at,
+                    &drained.bodies,
+                );
             }
             let root = observer::root_http_span(
                 ctx,
