@@ -35,6 +35,7 @@
     "test": [
       "php api/tests/verify.php",
       "php api/tests/laravel-policy-case.php",
+      "php api/tests/laravel-view-engine-case.php",
       "php api/tests/monolog-psr3-case.php",
       "php api/tests/doctrine-dbal-middleware-case.php",
       "php api/tests/messenger-case.php",

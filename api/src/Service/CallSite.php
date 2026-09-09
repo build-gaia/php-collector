@@ -12,11 +12,18 @@ use Throwable;
  * Two readings from one stack walk:
  *
  * 1. The first application frame (`code.filepath` / `code.lineno` / `code.function`)
- *    — not under `/vendor/`, not the collector. This is the editor jump, and the
- *    only durable link from a queued job back to the request that dispatched it.
- * 2. The nearest few frames (`code.stacktrace`) — vendor and framework included,
- *    collector frames skipped. Debugbar's per-query backtrace is this: Policy →
- *    Gate → Eloquent → the query, which a first-party-only frame would hide.
+ *    — not under an excluded tree such as `/vendor/`, not the collector. This is
+ *    the editor jump, and the only durable link from a queued job back to the
+ *    request that dispatched it.
+ * 2. The stack read outwards FROM that frame (`code.stacktrace`). The innermost
+ *    frames of an instrumented sink are framework plumbing — a Laravel query
+ *    arrives under Dispatcher → invokeListeners → dispatch → event → logQuery,
+ *    five frames that say nothing the span's own name did not. So the stack
+ *    starts at the boundary: the frame where userland enters the excluded tree,
+ *    which carries the vendor entry point as its function and the first-party
+ *    file as its location, followed by the userland callers above it.
+ *    A stack with no first-party frame at all (framework bootstrap, a queue
+ *    worker) keeps the nearest frames, because there is nothing better to show.
  *
  * `debug_backtrace` is IGNORE_ARGS and bounded. It is not gated on the counted
  * profiler (`profile_deterministic`): that is per-function totals from the Zend
@@ -38,6 +45,12 @@ final class CallSite
     public const STACK_LIMIT = 5;
 
     /**
+     * Path fragments that mark a frame as somebody else's code. A file under one
+     * of these is never the editor jump, and never starts the recorded stack.
+     */
+    private const EXCLUDED_PATH_FRAGMENTS = ['/vendor/'];
+
+    /**
      * @return array{0: ?string, 1: int, 2: ?string} file, line, function
      */
     public static function firstApplicationFrame(): array
@@ -48,7 +61,7 @@ final class CallSite
     }
 
     /**
-     * One walk: first-party call site plus the bounded recent stack.
+     * One walk: first-party call site plus the bounded stack above it.
      *
      * @return array{0: ?string, 1: int, 2: ?string, 3: ?string} file, line, function, stacktrace JSON
      */
@@ -61,28 +74,34 @@ final class CallSite
             return [null, 0, null, null];
         }
 
-        $recent = [];
+        $frames = array_values(array_filter(
+            $frames,
+            static fn (array $frame): bool => !self::isCollectorFrame($frame),
+        ));
+
+        $entry = null;
+        foreach ($frames as $index => $frame) {
+            if (self::isApplicationPath($frame['file'] ?? null)) {
+                $entry = $index;
+                break;
+            }
+        }
+
         $file = null;
         $line = 0;
         $function = null;
-        foreach ($frames as $index => $frame) {
-            if (self::isCollectorFrame($frame)) {
-                continue;
-            }
-            if (count($recent) < $limit) {
-                $normalised = self::normaliseFrame($frame);
-                if ($normalised !== []) {
-                    $recent[] = $normalised;
-                }
-            }
-            $path = $frame['file'] ?? null;
-            if ($file === null && is_string($path) && $path !== '' && !str_contains($path, '/vendor/')) {
-                $file = $path;
-                $line = (int) ($frame['line'] ?? 0);
-                $function = self::frameFunction($frames[$index + 1] ?? null);
-            }
-            if ($file !== null && count($recent) >= $limit) {
-                break;
+        if ($entry !== null) {
+            $file = (string) $frames[$entry]['file'];
+            $line = (int) ($frames[$entry]['line'] ?? 0);
+            $function = self::frameFunction($frames[$entry + 1] ?? null);
+        }
+
+        $recent = [];
+        $count = count($frames);
+        for ($index = $entry ?? 0; $index < $count && count($recent) < $limit; $index++) {
+            $normalised = self::normaliseFrame($frames[$index]);
+            if ($normalised !== []) {
+                $recent[] = $normalised;
             }
         }
 
@@ -136,6 +155,21 @@ final class CallSite
         }
 
         return $attributes;
+    }
+
+    /** A frame located in first-party code — the boundary the stack starts at. */
+    private static function isApplicationPath(mixed $path): bool
+    {
+        if (!is_string($path) || $path === '') {
+            return false;
+        }
+        foreach (self::EXCLUDED_PATH_FRAGMENTS as $fragment) {
+            if (str_contains($path, $fragment)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

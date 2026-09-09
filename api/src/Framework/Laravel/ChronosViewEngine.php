@@ -26,13 +26,21 @@ use Throwable;
  * Everything other than `get()` is forwarded untouched. `CompilerEngine::
  * getCompiler()` is reached for by Blade's own component and cache tooling, and
  * a wrapper that swallowed it would break view caching to buy a span.
+ *
+ * The wrapped engine is held in a property named `engine`, and the name is part
+ * of the contract, not a preference. Laravel's exception renderer reflects on
+ * whatever `blade` resolves to (`BladeMapper::getKnownPaths`) to read its
+ * `lastCompiled` list; finding no such property it looks for exactly one
+ * decorator shape — a property called `engine` — and unwraps through it. Any
+ * other name makes the renderer throw a ReflectionException, so the first real
+ * error in a request would be replaced by one thrown inside the collector.
  */
 final class ChronosViewEngine implements Engine
 {
     /** Set once per request by the first render, for the Timeline phase mark. */
     private static bool $renderPhaseMarked = false;
 
-    public function __construct(private readonly Engine $inner)
+    public function __construct(private readonly Engine $engine)
     {
     }
 
@@ -67,7 +75,7 @@ final class ChronosViewEngine implements Engine
         }
 
         try {
-            return (string) $this->inner->get($path, $data);
+            return (string) $this->engine->get($path, $data);
         } catch (Throwable $exception) {
             if (!$span->isVoid()) {
                 $span->recordException($exception, false);
@@ -133,6 +141,6 @@ final class ChronosViewEngine implements Engine
      */
     public function __call(string $method, array $arguments): mixed
     {
-        return $this->inner->{$method}(...$arguments);
+        return $this->engine->{$method}(...$arguments);
     }
 }

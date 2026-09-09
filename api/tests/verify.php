@@ -946,7 +946,7 @@ $runner->test('Inertia records the page component, not the Blade root named app'
     );
 });
 
-$runner->test('a query span carries the last few stack frames, including vendor', static function (Runner $runner): void {
+$runner->test('a query span carries the stack from the vendor boundary outwards', static function (Runner $runner): void {
     $span = Span::open('t', 's1', '', 'SQL SELECT');
     CallSite::applyToSpan($span);
     $attributes = $span->toRecord()->attributes;
@@ -961,6 +961,48 @@ $runner->test('a query span carries the last few stack frames, including vendor'
             'collector frames stay out',
         );
     }
+});
+
+$runner->test('framework plumbing below the call site is dropped, its entry point kept', static function (Runner $runner): void {
+    // A real vendor tree on disk, because the boundary is decided on the frame's path.
+    $root = sys_get_temp_dir() . '/chronos-callsite-' . getmypid() . '/vendor/acme/db';
+    if (!is_dir($root)) {
+        mkdir($root, 0777, true);
+    }
+    $plumbing = $root . '/Plumbing.php';
+    file_put_contents($plumbing, <<<'VENDOR'
+<?php
+namespace Acme\Db;
+
+/** Stands in for the framework layers a query arrives under. */
+class Connection
+{
+    public function select(callable $sink): array { return $this->run($sink); }
+    private function run(callable $sink): array { return $this->logQuery($sink); }
+    private function logQuery(callable $sink): array { return $sink(); }
+}
+VENDOR);
+    require_once $plumbing;
+
+    $connection = new \Acme\Db\Connection();
+    [$file, , , $stack] = $connection->select(static fn (): array => CallSite::capture());
+    $frames = json_decode((string) $stack, true);
+
+    $runner->assertTrue(is_array($frames) && $frames !== [], 'a stack was captured');
+    $runner->assertTrue(
+        !str_contains((string) $file, '/vendor/'),
+        'the call site is first-party, not the plumbing that raised it',
+    );
+    foreach ($frames as $frame) {
+        $runner->assertTrue(
+            !str_contains((string) ($frame['file'] ?? ''), '/vendor/'),
+            'no frame is located inside the vendor tree: ' . json_encode($frame),
+        );
+    }
+    $runner->assertSame('select', $frames[0]['function'] ?? null, 'the vendor entry point is the first frame');
+    $runner->assertSame('Acme\\Db\\Connection', $frames[0]['class'] ?? null, 'named by the class userland called');
+
+    unlink($plumbing);
 });
 
 $runner->test('reads and writes are counted apart, because they answer different questions', static function (Runner $runner): void {
