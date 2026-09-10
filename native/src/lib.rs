@@ -36,7 +36,6 @@ pub mod dst_spool;
 pub mod http_capture;
 pub mod job_spool;
 pub mod log_spool;
-pub mod metrics_spool;
 pub mod observer;
 pub mod profile_spool;
 pub mod rate;
@@ -46,6 +45,7 @@ pub mod sampler;
 pub mod settings;
 pub mod spool;
 pub mod spool_common;
+pub mod spool_log;
 pub mod vcs;
 
 use config::CollectorConfig;
@@ -250,7 +250,7 @@ fn heartbeat(config: &CollectorConfig) {
     .collect::<Vec<_>>();
     let summary = format!(
         "chronos-collector active: apm={} apm_rate={} logs={} profiler={} \
-         profile_request_rate={} profile_job_rate={} rate_denominator={} dst={} metrics={}{}",
+         profile_request_rate={} profile_job_rate={} rate_denominator={} dst={}{}",
         config.apm_enabled,
         config.apm_sample_rate.effective_fraction(),
         config.logs_enabled,
@@ -259,7 +259,6 @@ fn heartbeat(config: &CollectorConfig) {
         config.profile_job_rate.effective_fraction(),
         config.apm_sample_rate.denominator,
         config.dst_enabled,
-        config.runtime_metrics_enabled,
         if legacy.is_empty() {
             String::new()
         } else {
@@ -994,21 +993,6 @@ pub fn chronos_request_end(
         dst_spool::deactivate();
         if let Some(ctx) = &context {
             let _ = dst_spool::flush(&envelope, &events, &ctx.trace_id, ctx.session_id.as_deref());
-        }
-    }
-
-    if config.runtime_metrics_enabled {
-        if let Some(ctx) = &context {
-            let metrics = metrics_spool::RequestMetrics {
-                trace_id: ctx.trace_id.clone(),
-                span_id: ctx.span_id.clone(),
-                http_route: route_pattern,
-                http_method,
-                http_status_code: http_status_code as u16,
-                request_start_ns,
-                request_end_ns,
-            };
-            let _ = metrics_spool::flush(&envelope, &metrics, envelope.app_version.as_deref());
         }
     }
 

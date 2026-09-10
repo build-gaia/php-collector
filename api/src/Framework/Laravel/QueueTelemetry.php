@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Laravel;
 
+use Chronos\Collector\Service\MessagingDestination;
 use Chronos\Collector\Service\NativeExtension;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
@@ -343,12 +344,12 @@ final class QueueTelemetry
             if ($transport !== '') {
                 $attributes['messaging.system'] = $transport;
             }
-            if (method_exists($job, 'getQueue')) {
-                $queue = (string) $job->getQueue();
-                if ($queue !== '') {
-                    $attributes['messaging.destination.name'] = $queue;
-                }
-            }
+            $queue = method_exists($job, 'getQueue') ? (string) $job->getQueue() : '';
+            // The same normalised destination the publish side writes, so the two
+            // halves of one queue describe the same place in the same words —
+            // and so a consume span can be joined to ONE stream on an estate
+            // where the queue's name repeats across vhosts.
+            $attributes += MessagingDestination::forLaravelQueue($transport, $connection, $queue);
             if (method_exists($job, 'getJobId')) {
                 $id = $job->getJobId();
                 if (is_scalar($id) && (string) $id !== '') {

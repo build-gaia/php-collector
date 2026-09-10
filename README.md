@@ -242,10 +242,17 @@ both names is not a conflict — `team_id` is taken and `project` ignored.
 | `apm_enabled` | `CHRONOS_PHP_APM_ENABLED` | `0` |
 | `logs_enabled` | `CHRONOS_PHP_LOGS_ENABLED` | `0` |
 | `profiler_enabled` | `CHRONOS_PHP_PROFILER_ENABLED` | `0` |
-| `runtime_metrics_enabled` | `CHRONOS_PHP_RUNTIME_METRICS_ENABLED` | `0` |
 | `cli_enabled` | `CHRONOS_PHP_CLI_ENABLED` | `0` — CLI/workers are not auto-collected |
 | `dst_enabled` | `CHRONOS_PHP_DST_ENABLED` | `0` — lab/CLI only; ignored when `env` is `production`/`prod`, where the only path is the `x-chronos-dst` header / `chronos_dst` cookie |
 | `env` | `CHRONOS_PHP_ENV` | — (`production`/`prod` refuses process-wide DST) |
+
+There is no runtime-metrics tier. The extension used to write one `.metrics`
+spool file per request behind `CHRONOS_PHP_RUNTIME_METRICS_ENABLED`, carrying a
+request count, its duration and (on Linux) `VmRSS`. Every one of those numbers
+is already on the request's root span, which the engine now reads for traffic,
+latency and served routes — so the tier bought a second `fsync()` on the
+request's own critical path and nothing else. The three tiers above are the
+whole surface.
 
 ### Sample rates
 

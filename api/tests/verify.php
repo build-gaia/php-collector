@@ -41,6 +41,7 @@ use Chronos\Collector\Framework\Laravel\QueueTelemetry;
 use Chronos\Collector\Framework\Laravel\RequestFacts;
 use Chronos\Collector\Service\CacheCapture;
 use Chronos\Collector\Service\CallSite;
+use Chronos\Collector\Service\MessagingDestination;
 use Chronos\Collector\Service\Span;
 use Chronos\Collector\Framework\Pdo\EffectConnection;
 
@@ -377,6 +378,49 @@ foreach ($index['cases'] ?? [] as $entry) {
 }
 
 // ── 3. PHP-specific edges ───────────────────────────────────────────────────────────────────
+
+$runner->test('a destination is described in one vocabulary whatever the broker is', static function (Runner $runner): void {
+    // The vhost scopes the queue, the exchange routed it, the routing key chose
+    // it — under keys that do not change when the broker does.
+    $amqp = MessagingDestination::fromConfig('rabbitmq', [
+        'hosts' => [['host' => 'rabbitmq', 'vhost' => 'oms-queues']],
+        'options' => ['exchange' => ['name' => 'orders'], 'queue' => ['routing_key' => 'order.created']],
+    ]);
+    $runner->assertSame('oms-queues', $amqp['messaging.destination.namespace'] ?? null);
+    $runner->assertSame('orders', $amqp['messaging.destination.via'] ?? null);
+    $runner->assertSame('order.created', $amqp['messaging.destination.route'] ?? null);
+
+    // The flat form describes the same fact and must read the same.
+    $flat = MessagingDestination::fromConfig('rabbitmq', ['vhost' => 'shared']);
+    $runner->assertSame('shared', $flat['messaging.destination.namespace'] ?? null);
+
+    // Other brokers fill in what they have under the SAME keys, and nothing
+    // invents an exchange it does not have.
+    $runner->assertSame(
+        'eu-west-1',
+        MessagingDestination::fromConfig('sqs', ['region' => 'eu-west-1'])['messaging.destination.namespace'] ?? null,
+    );
+    $runner->assertSame(
+        'jobs',
+        MessagingDestination::fromConfig('redis', ['connection' => 'jobs'])['messaging.destination.namespace'] ?? null,
+    );
+    $runner->assertTrue(
+        !array_key_exists('messaging.destination.via', MessagingDestination::fromConfig('redis', ['connection' => 'jobs'])),
+        'a broker with no intermediary omits via',
+    );
+});
+
+$runner->test('an unreadable destination fact is absent, never guessed', static function (Runner $runner): void {
+    // A namespace inferred from a default would make the join confident and
+    // wrong; an absent one degrades to the name-only match the desktop already
+    // labels as ambiguous.
+    $runner->assertSame([], MessagingDestination::fromConfig('rabbitmq', []));
+    $runner->assertSame([], MessagingDestination::fromConfig('beanstalkd', ['host' => 'localhost']));
+    $runner->assertSame(
+        ['messaging.destination.name' => 'orders'],
+        MessagingDestination::forLaravelQueue('rabbitmq', '', 'orders'),
+    );
+});
 
 $runner->test('an unknown kind becomes its own custom channel', static function (Runner $runner): void {
     $runner->assertSame('custom:widget_read', Vocabulary::channelForKind('widget_read'));

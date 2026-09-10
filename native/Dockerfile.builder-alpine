@@ -1,16 +1,43 @@
 ARG PHP_VERSION=8.4
+ARG RUST_VERSION=1.88.0
+
+# See the note in Dockerfile.builder: the toolchain is COPYed from a pinned
+# official image so every musl builder shares one content-addressed layer
+# instead of each baking its own rustup download.
+FROM rust:${RUST_VERSION}-alpine AS toolchain
+
 FROM php:${PHP_VERSION}-cli-alpine
 
 # bash so this builder is drop-in interchangeable with Dockerfile.builder:
 # the build scripts invoke `bash -lc`, and alpine ships only busybox ash.
+#
+# clang-static was dropped: it carries the static LLVM archives (~1 GB) and
+# bindgen resolves libclang.so from clang-libs, which clang-dev already pulls in.
+# llvm-dev stays for `llvm-config`, which the build script shells out to.
 RUN apk add --no-cache \
-    bash curl build-base pkgconf clang-dev clang-static clang llvm-dev musl-dev linux-headers
+    bash build-base pkgconf clang-dev clang llvm-dev musl-dev linux-headers
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-ENV PATH="/root/.cargo/bin:${PATH}"
+COPY --from=toolchain /usr/local/rustup /usr/local/rustup
+COPY --from=toolchain /usr/local/cargo  /usr/local/cargo
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
 
 ENV LIBCLANG_PATH=/usr/lib
 ENV C_INCLUDE_PATH=/usr/include
 ENV BINDGEN_EXTRA_CLANG_ARGS="--sysroot=/ -isystem /usr/include"
+
+# `bash -lc` (which the build scripts use) re-sources /etc/profile, whose FIRST
+# line hard-overwrites PATH and drops /usr/local/cargo/bin. The old rustup install
+# survived that only because rustup appends `. "$HOME/.cargo/env"` to ~/.profile;
+# copying the toolchain removes that mechanism, so cargo must be put back on PATH
+# explicitly. Symlinks into /usr/local/bin hold even for a non-login shell.
+RUN printf '%s\n' \
+      'export RUSTUP_HOME=/usr/local/rustup' \
+      'export CARGO_HOME=/usr/local/cargo' \
+      'export PATH=/usr/local/cargo/bin:$PATH' > /etc/profile.d/rust.sh \
+    && chmod +x /etc/profile.d/rust.sh \
+    && ln -sf /usr/local/cargo/bin/* /usr/local/bin/
 
 WORKDIR /build

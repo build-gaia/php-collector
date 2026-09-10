@@ -57,7 +57,6 @@ pub struct CollectorConfig {
     /// on the expensive path.
     pub profile_token: String,
     pub dst_enabled: bool,
-    pub runtime_metrics_enabled: bool,
     pub rich_telemetry: bool,
     pub log_sink: String,
     pub metrics_sink: String,
@@ -108,7 +107,6 @@ impl CollectorConfig {
             // DST only via X-Chronos-DST / chronos_dst (see lib.rs directive_records).
             dst_enabled: flag("CHRONOS_PHP_DST_ENABLED", false)
                 && allow_process_wide_dst(settings::get("CHRONOS_PHP_ENV").as_deref()),
-            runtime_metrics_enabled: flag("CHRONOS_PHP_RUNTIME_METRICS_ENABLED", false),
             rich_telemetry: flag("CHRONOS_PHP_LOCAL_RICH_TELEMETRY", false),
             log_sink: env_string("CHRONOS_PHP_LOG_SINK", ""),
             metrics_sink: env_string("CHRONOS_PHP_METRICS_SINK", ""),
@@ -135,7 +133,6 @@ impl CollectorConfig {
             profile_job_rate: SampleRate::off(rate::DEFAULT_DENOMINATOR),
             profile_token: String::new(),
             dst_enabled: false,
-            runtime_metrics_enabled: false,
             rich_telemetry: false,
             log_sink: String::new(),
             metrics_sink: String::new(),

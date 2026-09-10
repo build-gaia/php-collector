@@ -1,0 +1,8 @@
+# The build context is source only. Without this, `docker build` ships target/
+# (1.9 GB) and dist/ to the daemon on EVERY build of EVERY (version, libc)
+# target — the source itself is 548 K.
+target/
+dist/
+dist-arm64/
+.git/
+*.so

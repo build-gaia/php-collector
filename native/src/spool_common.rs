@@ -48,10 +48,39 @@ pub fn set_mode_0600(file: &fs::File) {
 #[cfg(not(unix))]
 pub fn set_mode_0600(_file: &fs::File) {}
 
-/// Content-addressed atomic write: `<spool>/<sha256(body)>.<ext>.tmp` at mode 0600, then renamed
-/// to `<id>.<ext>`. Non-panicking; on any I/O error the temp file is best-effort removed and the
-/// request is undisturbed.
+/// Append one document to the tenant's spool log as a framed entry (ADR 0035).
+///
+/// The name is kept from the era when this wrote `<sha256(body)>.<ext>` through a
+/// temp file, an `fsync` and a rename. Every caller's contract is unchanged — hand
+/// over a body and the signal it is, and it reaches the agent — but the write is
+/// now a single append to a shared segment, with no sync on the request path.
+///
+/// `extension` is carried into the frame header as the signal name, so what used
+/// to select an ingest endpoint by filename now selects it by frame.
+///
+/// The content address survives as the frame's `id`: it is what deduplicates a
+/// document that gets re-shipped after a failed POST, a job the filename used to
+/// do.
 pub fn write_atomic(spool_directory: &str, body: &str, extension: &str) -> std::io::Result<()> {
+    crate::spool_log::append(
+        spool_directory,
+        extension,
+        "json",
+        &hex_digest(body),
+        body.as_bytes(),
+    )
+}
+
+/// The pre-ADR-0035 write: content-addressed, synced, renamed into place.
+///
+/// Retained for the alias window (an agent that predates the framed log still
+/// ships whole files) and as the fallback for a spool directory the log layout
+/// refuses. Not on the request path.
+pub fn write_document_file(
+    spool_directory: &str,
+    body: &str,
+    extension: &str,
+) -> std::io::Result<()> {
     fs::create_dir_all(spool_directory)?;
     let id = hex_digest(body);
     let tmp = format!("{spool_directory}/{id}.{extension}.tmp");
@@ -60,7 +89,6 @@ pub fn write_atomic(spool_directory: &str, body: &str, extension: &str) -> std::
     let mut file = fs::File::create(&tmp)?;
     set_mode_0600(&file);
     file.write_all(body.as_bytes())?;
-    file.sync_all()?;
     drop(file);
 
     if let Err(err) = fs::rename(&tmp, &final_path) {

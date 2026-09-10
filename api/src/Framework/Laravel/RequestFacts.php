@@ -6,6 +6,7 @@ namespace Chronos\Collector\Framework\Laravel;
 
 use Chronos\Collector\Service\ActivityCatalog;
 use Chronos\Collector\Service\CallSite;
+use Chronos\Collector\Service\MessagingDestination;
 use Chronos\Collector\Service\MessagingSpan;
 use Chronos\Collector\Service\NativeExtension;
 use Throwable;
@@ -541,9 +542,17 @@ final class RequestFacts
                     // gets a tier-2 span. The `sync` driver runs it inline: no
                     // boundary crossed, nothing to draw.
                     if ($transport !== '' && $transport !== 'sync') {
-                        MessagingSpan::published($transport, $queue, $name, array_filter([
-                            'messaging.message.body.size' => $payloadSize === null ? '' : (string) $payloadSize,
-                        ]));
+                        $connection = is_string($observed->connectionName ?? null)
+                            ? $observed->connectionName
+                            : '';
+                        // WHERE it went, in the normalised vocabulary: the queue
+                        // name alone does not identify a stream on an estate
+                        // where six vhosts each have a `products`.
+                        MessagingSpan::published($transport, $queue, $name, array_filter(
+                            MessagingDestination::forLaravelQueue($transport, $connection) + [
+                                'messaging.message.body.size' => $payloadSize === null ? '' : (string) $payloadSize,
+                            ],
+                        ));
                     }
                 });
             }
