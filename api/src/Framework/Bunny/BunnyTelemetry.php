@@ -136,7 +136,13 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
          */
         public static function publish(
             \Bunny\Channel $channel,
-            string $body,
+            // Deliberately untyped, matching Bunny's own untyped
+            // `Channel::publish($body, ...)`. Under `declare(strict_types=1)` a
+            // `string` hint here would reject an int or a Stringable that Bunny
+            // itself accepts, so a wrapper meant to be a drop-in substitution
+            // would throw where the original call worked. The span side narrows
+            // it instead — see $payload below.
+            mixed $body,
             array $headers = [],
             string $exchange = '',
             string $routingKey = '',
@@ -153,9 +159,28 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
             // worst kind of bug — it would look like a working trace.
             $headers = $headers + self::contextHeaders();
 
+            // Declaring a content type to the span but not to the BROKER would
+            // leave the two halves of every stream disagreeing: the publish span
+            // would say protobuf and the consume span, which can only read what
+            // arrived, would say nothing. `content-type` is one of the reserved
+            // AMQP property names ContentHeaderFrame::fromArray() lifts out of the
+            // header table into a real property, so this sets the message's actual
+            // content type rather than adding an application header. Union again,
+            // so a caller that set it itself still wins.
+            if ($contentType !== '' && !isset($headers['content-type'])) {
+                $headers['content-type'] = $contentType;
+            }
+
             $result = $channel->publish($body, $headers, $exchange, $routingKey, $mandatory, $immediate);
 
             try {
+                // Narrowed here rather than at the signature. A non-stringable
+                // body describes nothing, so it contributes no size and no
+                // payload instead of guessing at one.
+                $payload = \is_string($body)
+                    ? $body
+                    : ((\is_scalar($body) || $body instanceof \Stringable) ? (string) $body : '');
+
                 $destination = MessagingDestination::forAmqp($vhost, $exchange, $routingKey);
                 $extra = $destination;
                 unset($extra[MessagingDestination::NAME]);
@@ -163,13 +188,13 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
                 // Size is emitted whatever the capture gate says, and measured on
                 // the RAW wire bytes before any cap or base64: it is free, and it
                 // is the one payload fact that survives capture being off.
-                $extra['messaging.message.body.size'] = (string) \strlen($body);
+                $extra['messaging.message.body.size'] = (string) \strlen($payload);
                 $extra['messaging.message.body.content_type'] = $contentType;
                 $extra['server.address'] = trim($server);
                 // Span::MAX_TEXT_LENGTH is the real ceiling on this side, so the
                 // truncation happens in PHP where `.truncated` can be set
                 // honestly rather than in Span::cap() where it cannot.
-                $extra += MessagingBody::encode($body, Span::MAX_TEXT_LENGTH);
+                $extra += MessagingBody::encode($payload, Span::MAX_TEXT_LENGTH);
 
                 MessagingSpan::published(
                     self::SYSTEM,
@@ -238,62 +263,55 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
                 // wait is not inflated by the cost of measuring it.
                 $startedAt = \microtime(true);
 
-                // The process-level master switch, and the cheapest possible
-                // exit: a fleet image with the .so baked in but CHRONOS_PHP_ENABLED
-                // unset pays one memoised bool per message and nothing else.
-                if (!NativeExtension::enabled()) {
+                // Deciding whether to trace a message must never stop the message
+                // being handled, so the WHOLE decision — the switches, the header
+                // reads and requestStart itself — is fail-open.
+                //
+                // requestStart is the reason this needs a catch rather than trust:
+                // it calls chronos_request_start() FIRST and only afterwards resets
+                // the span stack and loads the instrumentation manifest, and a
+                // manifest is an operator-supplied PHP file that `require` can throw
+                // on. A throw there would escape into Bunny's event loop (killing a
+                // consumer that should have degraded to untraced) AND leave a native
+                // request open, which is the worse half: the next messages would be
+                // swallowed into that one request's trace until the process died.
+                //
+                // `$name` is seeded with the queue so the recovery path below can
+                // close a request that was opened before routeName() ever ran.
+                $name = $queue;
+                $opened = false;
+                try {
+                    // The process-level master switch, and the cheapest possible
+                    // exit: a fleet image with the .so baked in but
+                    // CHRONOS_PHP_ENABLED unset pays one memoised bool per message.
+                    //
+                    // NativeExtension::active() covers the case where a request is
+                    // ALREADY open, so this delivery is being pumped from inside
+                    // something already traced — a `$channel->get()` during a web
+                    // request, or a nested run of the event loop. requestStart here
+                    // would hijack that live request exactly as
+                    // ChronosMiddleware::handleConsume describes for the sync
+                    // transport. The work is already inside a trace.
+                    if (NativeExtension::enabled() && !NativeExtension::active()) {
+                        $opened = self::openMessage($message, $queue, $name);
+                    }
+                } catch (Throwable) {
+                    try {
+                        if (NativeExtension::active()) {
+                            NativeExtension::requestEnd(0, $name);
+                        }
+                    } catch (Throwable) {
+                        // Nothing left to try. The process is in a state this
+                        // bridge cannot repair, and the message still has to run.
+                    }
+                    $opened = false;
+                }
+
+                if (!$opened) {
                     return $handler($message, ...$rest);
                 }
 
-                // A request is ALREADY open, so this delivery is being pumped
-                // from inside something already traced — a `$channel->get()`
-                // during a web request, or a nested run of the event loop.
-                // requestStart/requestEnd here would hijack that live request
-                // exactly as ChronosMiddleware::handleConsume describes for the
-                // sync transport: reset its span stack, rewrite method/route to
-                // QUEUE/<queue>, and close the request root early, after which
-                // the real end no-ops because chronos_request_end is
-                // first-call-wins. The work is already inside a trace.
-                if (NativeExtension::active()) {
-                    return $handler($message, ...$rest);
-                }
-
-                $name = self::routeName($message, $queue);
-                $traceparent = self::header($message, self::TRACEPARENT_HEADER);
-                $tracestate = self::header($message, 'tracestate');
-                $baggage = self::header($message, 'baggage');
                 $enqueuedAt = self::header($message, self::ENQUEUED_AT_HEADER);
-
-                NativeExtension::requestStart(
-                    $traceparent !== '' ? $traceparent : null,
-                    $tracestate !== '' ? $tracestate : null,
-                    $baggage !== '' ? $baggage : null,
-                    // Neither a session id nor a DST directive crosses AMQP:
-                    // chronos_propagation_headers() returns only traceparent,
-                    // tracestate and baggage, and there is no accessor for the
-                    // current session id. Passing null is the honest shape —
-                    // both are additive later, one header and one probe each.
-                    null,
-                    null,
-                    // The queue is this message's "method and route": what it
-                    // was, and where it came from. Naming them in the HTTP
-                    // fields keeps one root-span vocabulary rather than a second
-                    // one only AMQP consumers use.
-                    'QUEUE',
-                    $name,
-                    // Empty service name → native falls back to
-                    // CHRONOS_PHP_APPLICATION, so a consumer and the web requests
-                    // of the same service land on ONE service map node.
-                    '',
-                );
-
-                // The collector DECLINED this request (unsampled, no envelope,
-                // inert). Nothing below is worth paying for — and critically
-                // there is now no open request, so this branch must NOT call
-                // requestEnd.
-                if (!NativeExtension::active()) {
-                    return $handler($message, ...$rest);
-                }
 
                 try {
                     $attributes = self::consumeAttributes($message, $name, $queue, $vhost, $server, $startedAt);
@@ -348,6 +366,56 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
 
                 return $result;
             };
+        }
+
+        /**
+         * Open a Chronos request for one delivery, and report whether the
+         * collector accepted it.
+         *
+         * Split out of the wrapper so the throw-recovery around it has one thing
+         * to guard rather than a dozen statements, and so `$name` is assigned by
+         * reference BEFORE requestStart runs: if requestStart throws after the
+         * native request is already open, the caller needs the real route name to
+         * close it with, not the bare queue.
+         *
+         * False means the collector declined this request — unsampled, no
+         * envelope, inert. There is then NO open request, so the caller must not
+         * call requestEnd; it just runs the handler untraced.
+         */
+        private static function openMessage(
+            \Bunny\Message $message,
+            string $queue,
+            string &$name,
+        ): bool {
+            $name = self::routeName($message, $queue);
+            $traceparent = self::header($message, self::TRACEPARENT_HEADER);
+            $tracestate = self::header($message, 'tracestate');
+            $baggage = self::header($message, 'baggage');
+
+            NativeExtension::requestStart(
+                $traceparent !== '' ? $traceparent : null,
+                $tracestate !== '' ? $tracestate : null,
+                $baggage !== '' ? $baggage : null,
+                // Neither a session id nor a DST directive crosses AMQP:
+                // chronos_propagation_headers() returns only traceparent,
+                // tracestate and baggage, and there is no accessor for the
+                // current session id. Passing null is the honest shape — both are
+                // additive later, one header and one probe each.
+                null,
+                null,
+                // The queue is this message's "method and route": what it was, and
+                // where it came from. Naming them in the HTTP fields keeps one
+                // root-span vocabulary rather than a second one only AMQP
+                // consumers use.
+                'QUEUE',
+                $name,
+                // Empty service name → native falls back to
+                // CHRONOS_PHP_APPLICATION, so a consumer and the web requests of
+                // the same service land on ONE service map node.
+                '',
+            );
+
+            return NativeExtension::active();
         }
 
         /**
@@ -504,11 +572,18 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
          */
         private static function protocol(string $contentType): string
         {
-            if (str_contains($contentType, 'protobuf')) {
+            // Lowercased and trimmed before matching, because a media type is
+            // case-insensitive per RFC 9110 §8.3.1 and both halves of one stream
+            // have to agree. Without this, a publisher declaring
+            // `application/X-Protobuf` — legal, and what several generators emit —
+            // yields `protobuf` from one side and no attribute at all from the
+            // other, which is two spellings of one fact on one stream.
+            $type = strtolower(trim($contentType));
+            if (str_contains($type, 'protobuf')) {
                 return 'protobuf';
             }
 
-            return str_contains($contentType, 'json') ? 'json' : '';
+            return str_contains($type, 'json') ? 'json' : '';
         }
 
         /**

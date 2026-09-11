@@ -33,6 +33,10 @@ final class NativeExtension
      * trace allowlist is per-process and only ever grows, so once is enough). */
     private static bool $manifestLoaded = false;
 
+    /** Whether the fatal-error net is already registered for this PROCESS. Only
+     * consulted under a one-request-per-process SAPI — see armShutdownNet. */
+    private static bool $shutdownNetArmed = false;
+
     public static function loaded(): bool
     {
         // The module registers as `chronos` (matching the chronos.so filename);
@@ -289,12 +293,40 @@ final class NativeExtension
      * chronos_request_end is idempotent, so on a healthy request this is a no-op —
      * the framework hook already flushed and cleared the request state.
      *
-     * Registered on every requestStart: PHP clears shutdown functions between FPM
-     * requests, while class statics persist per worker — a once-per-worker guard
-     * would leave every request after the first unprotected.
+     * Registered on every requestStart under a per-request SAPI: PHP clears shutdown
+     * functions between FPM requests, while class statics persist per worker — a
+     * once-per-worker guard would leave every request after the first unprotected.
+     *
+     * Under CLI it is registered ONCE per process instead, and that distinction is
+     * not a micro-optimisation. The real invariant is "at most one net per PHP
+     * REQUEST", which the unguarded version expressed correctly only because a
+     * request is the unit that clears the list. CLI breaks the equivalence: there is
+     * exactly one PHP request for the whole process, so a worker that opens a
+     * Chronos request per unit of work — a queue job, a consumed AMQP message — was
+     * registering one closure per message that nothing could ever release. Measured
+     * at roughly 470 bytes each: about 390 MiB/day for a consumer taking ten
+     * messages a second, until memory_limit kills the worker mid-message.
+     *
+     * Arming once is not weaker cover, because the closure is STATELESS: it reads
+     * error_get_last() and closes whichever request is open at the moment it fires,
+     * so one registration protects every message the process ever handles.
+     *
+     * The test is on the SAPI rather than on "have we armed already", because those
+     * are different questions and only the SAPI one is answerable here. `cli` and
+     * `phpdbg` are the SAPIs with one request per process. `cli-server`
+     * deliberately is not — it runs a real request cycle per connection and clears
+     * the list like FPM. Octane/RoadRunner/Swoole workers report `cli` and do NOT
+     * clear shutdown functions between their own pseudo-requests, so once-per-process
+     * is the correct answer there too.
      */
     private static function armShutdownNet(): void
     {
+        if (in_array(\PHP_SAPI, ['cli', 'phpdbg'], true)) {
+            if (self::$shutdownNetArmed) {
+                return;
+            }
+            self::$shutdownNetArmed = true;
+        }
         register_shutdown_function(static function (): void {
             $error = error_get_last();
             $fatal = $error !== null && in_array(
