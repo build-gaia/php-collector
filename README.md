@@ -120,6 +120,33 @@ The extension works without it; the package adds what only userland can know:
   carrying `messaging.system` / `messaging.destination.name` /
   `messaging.operation`, which is what draws the edge to the broker on the service
   map. See ADR 0024 for the vocabulary and its bounds.
+- **bunny/bunny (raw AMQP)** — `BunnyTelemetry` joins a publish and a consume into
+  one trace where there is no framework seam to hook: no envelope, no stamp, no
+  event, just a channel method and a delivery callback. Two call sites change.
+  `$channel->publish($body, $headers, $exchange, $routingKey)` becomes
+  `BunnyTelemetry::publish($channel, $body, $headers, $exchange, $routingKey,
+  vhost: $vhost, messageName: $class, contentType: 'application/x-protobuf')` —
+  the first six arguments are Bunny's own signature verbatim, and the trailing
+  ones are the facts Bunny cannot supply (its `$options` is protected with no
+  getter, so the vhost is unreachable from a `Channel`). And
+  `$channel->consume($callback, $queue)` becomes
+  `$channel->consume(BunnyTelemetry::consumer($callback, $queue, $vhost), $queue)`
+  — wrapped at the callback, the OUTERMOST point, so the ack and the payload
+  decode happen inside the traced request.
+
+  The publish injects `traceparent` (a child, so the consumer hangs beneath the
+  publish rather than claiming to be it), `tracestate`, `baggage` and an
+  `x-chronos-enqueued-at` stamp into the AMQP application headers, and records a
+  producer span; each delivery becomes its own `QUEUE`-rooted request carrying
+  `messaging.message.queue_time_ms`, `messaging.message.redelivered` and the
+  normalised destination. A publish to a named topic exchange carries NO
+  `messaging.destination.name`: a topic has no queue, and which queues are bound
+  to that routing key is not knowable from the publisher — such a span is named
+  after the exchange instead, which is the same string the consumer's binding
+  names. Like the Laravel queue bridge this needs no `CHRONOS_PHP_CLI_ENABLED`,
+  and leaving it off is better for the same reason. `bunny/bunny` stays a
+  composer `suggest`: the bridge only declares for an application that already
+  has it.
 - **Symfony** — register `Chronos\Collector\Framework\Symfony\ChronosBundle`
   (or decorate the kernel with `ChronosHttpKernel`). Cache pools are wrapped so
   reads show hit/miss and the unserialized hit value.
@@ -391,6 +418,34 @@ narrows it to a path.
 | `http_capture_response_buffer` | `CHRONOS_PHP_HTTP_CAPTURE_RESPONSE_BUFFER` | `0` |
 | `http_capture_redact` | `CHRONOS_PHP_HTTP_CAPTURE_REDACT` | `1` |
 | `redact_patterns` | `CHRONOS_PHP_REDACT_PATTERNS` | `authorization`, `password`, `credential`, `private_key`, `client_secret`, `access_token`, `refresh_token`, `secret`, `api_key` — matched case-insensitively against the KEY |
+
+### Messaging capture
+
+| `.chronos` key | env | default |
+|---|---|---|
+| `messaging_capture_bodies` | `CHRONOS_PHP_MESSAGING_CAPTURE_BODIES` | `0` |
+| `messaging_capture_max_body` | `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY` | `65536` (64 KiB) |
+
+Note the default: this is OFF where `http_capture_bodies` is ON. Installing an APM
+agent is already a decision to look at your own request and response bodies; an
+inter-service message payload is a different one — it was written by one team for
+another team's consumer, and capturing it copies that contract into telemetry a
+third audience reads.
+
+**No field-level masking applies to a body on either path.** `redact_patterns`
+masks map ENTRIES — header and query-parameter keys — and a body is only ever
+truncated. A protobuf payload has no field names on the wire to match against at
+all. So this flag is the whole control: with it on, complete payloads ship, PII
+included.
+
+The configured size is a ceiling, not the effective limit. A publish body rides a
+span attribute capped at 16 KiB (12 KiB of raw bytes once base64 inflates a binary
+payload); a consume body rides the request-attribute bag, capped at 8 KiB (6 KiB
+raw). The SDK truncates to whichever is smaller and sets
+`messaging.message.body.truncated`, so a cut body always says it was cut.
+Non-UTF-8 payloads — which is every protobuf — are base64-encoded and marked with
+`messaging.message.body.encoding`, because the value has to cross into a Rust
+`String` and then through `serde_json`, and both require valid UTF-8.
 
 ### DST and spool
 

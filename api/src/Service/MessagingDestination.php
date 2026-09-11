@@ -23,6 +23,12 @@ use Throwable;
  * | Key | Means | RabbitMQ | Kafka | NATS | SQS | Redis / database |
  * | --- | --- | --- | --- | --- | --- | --- |
  * | `…destination.name` | The leaf a consumer reads | queue | topic | subject | queue | list key / table |
+ *
+ * The RabbitMQ column's leaf is the one that can legitimately be EMPTY. A
+ * publish to a named topic exchange has no queue at all — zero, one or six
+ * queues may be bound to that routing key, and the publisher cannot know which
+ * — so `…destination.name` is absent by construction on that path, and `via`
+ * plus `route` are the whole identity. See [`forAmqp`].
  * | `…destination.namespace` | What scopes that name | vhost | cluster | account | region | connection |
  * | `…destination.via` | What ROUTED it there | exchange | – | JetStream stream | SNS topic | – |
  * | `…destination.route` | The selector used against `via` | routing key | – | subject filter | – | – |
@@ -55,6 +61,59 @@ final class MessagingDestination
     public const NAMESPACE_KEY = 'messaging.destination.namespace';
     public const VIA = 'messaging.destination.via';
     public const ROUTE = 'messaging.destination.route';
+
+    /**
+     * AMQP, described from what the caller actually knows at the call.
+     *
+     * The AMQP-specific reasoning belongs here, in the vocabulary class, rather
+     * than in the bridge: a bridge should hand over the four raw facts and get
+     * back the normalised shape, so a second AMQP bridge (a different client
+     * library, a different framework) cannot quietly decide the mapping
+     * differently and split the desktop's join in two.
+     *
+     * The NAME rule is "absent, never guessed" spelled out for AMQP:
+     *
+     *   - an explicitly known `$queue` always wins. That is the CONSUME side,
+     *     where the integration named the queue it subscribed to, so the leaf
+     *     is not an inference at all;
+     *   - with no known queue, the routing key becomes the name ONLY for the
+     *     default exchange, because making the routing key a queue name is
+     *     precisely what the nameless exchange does;
+     *   - a named exchange with no known queue leaves NAME ABSENT. Filling it
+     *     with the routing key there would claim a queue that may not exist,
+     *     and the desktop's producer graph would attach the trace to a stream
+     *     confidently and wrongly.
+     *
+     * VIA is likewise omitted for the default exchange rather than filled with
+     * `amq.default`: the nameless exchange cannot be named, and inventing a
+     * name for it is exactly the confident-and-wrong join this class's header
+     * warns about.
+     *
+     * @param string $vhost      the connection's virtual host — the namespace
+     * @param string $exchange   the exchange published to; empty is the default exchange
+     * @param string $routingKey the selector used against that exchange
+     * @param string $queue      the queue, when the caller genuinely knows it
+     *
+     * @return array<string, string> only the facts that could be read
+     */
+    public static function forAmqp(
+        string $vhost,
+        string $exchange,
+        string $routingKey,
+        string $queue = '',
+    ): array {
+        $vhost = trim($vhost);
+        $exchange = trim($exchange);
+        $routingKey = trim($routingKey);
+        $queue = trim($queue);
+
+        return self::filled([
+            self::NAME => $queue !== '' ? $queue : ($exchange === '' ? $routingKey : ''),
+            self::NAMESPACE_KEY => $vhost,
+            self::VIA => $exchange,
+            self::ROUTE => $routingKey,
+        ]);
+    }
 
     /**
      * The normalised destination attributes for one Laravel queue connection.

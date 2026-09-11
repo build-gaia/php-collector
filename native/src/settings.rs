@@ -75,6 +75,15 @@ pub const SETTING_NAMES: &[&str] = &[
     "CHRONOS_PHP_HTTP_CAPTURE_MAX_BODY",
     "CHRONOS_PHP_HTTP_CAPTURE_RESPONSE_BUFFER",
     "CHRONOS_PHP_HTTP_CAPTURE_REDACT",
+    // Messaging payload capture — the AMQP/queue counterpart of the HTTP pair above,
+    // and registered here for the reason stated at the top of this list: `get()` reads
+    // process env unconditionally, so an unregistered name APPEARS to work from env
+    // while `chronos.messaging_capture_bodies` in php.ini and
+    // `messaging_capture_bodies=1` in a `.chronos` file silently do not exist. Defaults
+    // OFF in the SDK (unlike HTTP body capture), because an inter-service payload is a
+    // data-sharing decision the operator has not already made.
+    "CHRONOS_PHP_MESSAGING_CAPTURE_BODIES",
+    "CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY",
     "CHRONOS_PHP_REDACT_PATTERNS",
     "CHRONOS_PHP_SPOOL_MAX_BYTES",
     "CHRONOS_PHP_INSTRUMENTATION_MANIFEST",

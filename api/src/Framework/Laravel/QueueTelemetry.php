@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Chronos\Collector\Framework\Laravel;
 
 use Chronos\Collector\Service\MessagingDestination;
+use Chronos\Collector\Service\MessagingWait;
 use Chronos\Collector\Service\NativeExtension;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
@@ -155,40 +156,20 @@ final class QueueTelemetry
      * How long the message waited, in milliseconds, or null when that cannot be
      * said honestly.
      *
-     * Null rather than zero in every unknowable case — a payload pushed before
-     * this SDK was installed, a stamp another producer wrote in some other
-     * format, or a clock difference that puts the dispatch AFTER the start. Zero
-     * is a measurement meaning "picked up instantly", and a queue that is
-     * actually unmeasured must not be able to report the healthiest possible
-     * value. That is also why a negative reading is discarded whole instead of
-     * clamped: skew of a second in one direction is skew of a second in the
-     * other, so the positive readings from a skewed pair are wrong by as much as
-     * the negative ones — the difference is only that clamping HIDES it.
+     * The rule — and the clock-skew reasoning behind returning null rather than
+     * zero, and discarding a negative reading rather than clamping it — now
+     * lives in [`MessagingWait`], because it is reasoning about wall clocks
+     * across processes rather than anything Laravel-specific: the AMQP bridge
+     * stamps the same instant into a wire header and needs the identical rule,
+     * and it cannot reach a `Framework\Laravel` class to get it.
      *
-     * This is dispatch-to-start, so a deliberately delayed job counts its delay
-     * as wait. The intent lives on the dispatching request instead, as the
-     * `delay_ms` of its `messaging.jobs` catalog record: the two are in one trace
-     * and can be read together, whereas a worker holding only the payload cannot
-     * tell an intentional delay from a backlog.
+     * Kept here, with its signature unchanged, because it is public and already
+     * covered by the suite: the delegation is what moves the logic without
+     * churning callers or tests.
      */
     public static function waitMilliseconds(mixed $enqueuedAt, float $startedAt): ?int
     {
-        if (!is_string($enqueuedAt) && !is_int($enqueuedAt) && !is_float($enqueuedAt)) {
-            return null;
-        }
-        if (is_string($enqueuedAt) && !is_numeric($enqueuedAt)) {
-            return null;
-        }
-        $enqueued = (float) $enqueuedAt;
-        if (!\is_finite($enqueued) || $enqueued <= 0.0) {
-            return null;
-        }
-        $waited = ($startedAt - $enqueued) * 1000.0;
-        if (!\is_finite($waited) || $waited < 0.0) {
-            return null;
-        }
-
-        return (int) \round($waited);
+        return MessagingWait::milliseconds($enqueuedAt, $startedAt);
     }
 
     /** Begin a job-scoped request, continuing the dispatcher's trace when it left one. */

@@ -422,6 +422,42 @@ $runner->test('an unreadable destination fact is absent, never guessed', static 
     );
 });
 
+$runner->test('a topic publish has no queue, and forAmqp refuses to invent one', static function (Runner $runner): void {
+    // Read from the call rather than from config, because a raw AMQP publisher has no
+    // queue.connections entry to read. The leaf is the part that can legitimately be
+    // absent: a named topic exchange may have zero, one or six queues bound to that
+    // routing key, and the publisher cannot know which — so naming one would attach the
+    // trace to a stream confidently and wrongly.
+    $topic = MessagingDestination::forAmqp('oms', 'organizations', 'order.created');
+    $runner->assertTrue(
+        !array_key_exists('messaging.destination.name', $topic),
+        'a topic publish must carry no destination name',
+    );
+    $runner->assertSame('oms', $topic['messaging.destination.namespace'] ?? null);
+    $runner->assertSame('organizations', $topic['messaging.destination.via'] ?? null);
+    $runner->assertSame('order.created', $topic['messaging.destination.route'] ?? null);
+
+    // The default exchange is the one case where a routing key IS a queue name — that is
+    // what the nameless exchange does — and it stays nameless rather than becoming
+    // 'amq.default'.
+    $direct = MessagingDestination::forAmqp('oms', '', 'asn-items');
+    $runner->assertSame('asn-items', $direct['messaging.destination.name'] ?? null);
+    $runner->assertSame('asn-items', $direct['messaging.destination.route'] ?? null);
+    $runner->assertTrue(
+        !array_key_exists('messaging.destination.via', $direct),
+        'the nameless exchange has no name to record',
+    );
+
+    // A queue the consumer actually subscribed to is not an inference, so it wins
+    // whatever the delivery's exchange was — which is what makes the consume side of a
+    // stream describe the same place as its publish side, in the same four keys.
+    $consume = MessagingDestination::forAmqp('oms', 'organizations', 'order.created', 'oms-orders');
+    $runner->assertSame('oms-orders', $consume['messaging.destination.name'] ?? null);
+    $runner->assertSame('organizations', $consume['messaging.destination.via'] ?? null);
+
+    $runner->assertSame([], MessagingDestination::forAmqp('', '', '', ''));
+});
+
 $runner->test('an unknown kind becomes its own custom channel', static function (Runner $runner): void {
     $runner->assertSame('custom:widget_read', Vocabulary::channelForKind('widget_read'));
     $runner->assertSame('custom:feature_flag', Vocabulary::channelForKind('custom:feature_flag'));

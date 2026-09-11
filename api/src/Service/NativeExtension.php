@@ -22,6 +22,13 @@ final class NativeExtension
      * cannot change inside a process. */
     private static ?int $bodyCeiling = null;
 
+    /** Resolved once per process, same reason as $bodyCeiling: the setting read is
+     * an FFI call, and a payload-capture decision cannot change mid-process. */
+    private static ?bool $messagingCapture = null;
+
+    /** Resolved once per process, for the same reason. */
+    private static ?int $messagingCeiling = null;
+
     /** Once-per-process guard for the instrumentation-manifest load (the native
      * trace allowlist is per-process and only ever grows, so once is enough). */
     private static bool $manifestLoaded = false;
@@ -85,6 +92,71 @@ final class NativeExtension
         }
 
         return \chronos_http_capturing();
+    }
+
+    /**
+     * Whether captured message PAYLOADS are wanted at all.
+     *
+     * Deliberately not modelled on `httpCapturing()`, which is a per-request
+     * sampling probe and answers TRUE against an older extension that lacks it
+     * (capture was unconditional there, so true preserved the old behaviour).
+     * This is a process-level operator decision, and its safe direction is the
+     * other one: DEFAULT FALSE, so an older .so with no `chronos_setting()` —
+     * and any deployment that simply has not set the flag — ships no payloads.
+     * For a body, an unset setting must mean "do not send it", never "send it
+     * because nobody said otherwise".
+     *
+     * `messaging_capture_bodies` defaults off where `http_capture_bodies`
+     * defaults on because an inter-service payload is a data-sharing decision
+     * the operator has not already made by installing an APM agent, and no
+     * field-level masking applies to a body on either path — see
+     * [`MessagingBody`].
+     */
+    public static function messagingCapturing(): bool
+    {
+        if (!self::loaded()) {
+            return false;
+        }
+        if (self::$messagingCapture === null) {
+            $value = function_exists('chronos_setting')
+                ? \chronos_setting('CHRONOS_PHP_MESSAGING_CAPTURE_BODIES')
+                : '';
+            // The same truthiness list enabled() uses, so one spelling rule
+            // covers every boolean setting an operator can write.
+            self::$messagingCapture = in_array(strtolower($value), ['1', 'true', 'yes', 'on'], true);
+        }
+
+        return self::$messagingCapture;
+    }
+
+    /**
+     * The most of one message body the operator has allowed, in bytes.
+     *
+     * The fallback is the Go SDK's own `CHRONOS_GO_MESSAGING_CAPTURE_MAX_BODY`
+     * default rather than a number chosen here, so a Go producer and a PHP
+     * producer on the same stream cap it identically — a stream where one side
+     * truncates at 64 KiB and the other at some other figure is a stream whose
+     * payloads cannot be compared.
+     *
+     * This is a CEILING on the operator's number, not the effective limit: each
+     * call site min()s it against its own hard bound (a span attribute is capped
+     * at 16 KiB, the request-attribute bag at 8 KiB), which is why
+     * `MessagingBody::encode()` takes that bound as an argument.
+     */
+    public static function messagingBodyCeiling(): int
+    {
+        if (self::$messagingCeiling !== null) {
+            return self::$messagingCeiling;
+        }
+        $configured = 0;
+        if (function_exists('chronos_setting')) {
+            $configured = (int) \chronos_setting('CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY');
+        }
+        if ($configured <= 0) {
+            $configured = 65536;
+        }
+
+        return self::$messagingCeiling = min($configured, 512 * 1024);
     }
 
     /**
