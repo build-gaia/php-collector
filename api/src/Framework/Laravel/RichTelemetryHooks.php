@@ -520,9 +520,25 @@ final class RichTelemetryHooks
                 $url = method_exists($request, 'getUri') ? (string) $request->getUri() : '';
                 $span = SpanManager::open('HTTP ' . ($host !== '' ? $host : 'unknown'));
                 if (!$span->isVoid() && method_exists($request, 'withHeader')) {
-                    $traceparent = NativeExtension::childTraceparent()
-                        ?? ('00-' . $span->traceId . '-' . $span->id . '-01');
-                    $request = $request->withHeader('traceparent', $traceparent);
+                    // The span just opened above, and no longer
+                    // NativeExtension::childTraceparent() — the operands were the
+                    // wrong way round, so the `??` PREFERRED a phantom id (one no
+                    // span is ever recorded under) over the correct value sitting
+                    // right beside it. This is the one HTTP site that records its
+                    // own client span, so it is the one site that must not defer
+                    // to the extension's placeholder: the curl hook, which
+                    // overwrites that placeholder with a real id, never sees a
+                    // Guzzle handler stack.
+                    //
+                    // Built through SpanManager::reservationOf() rather than by
+                    // string concatenation so the sampled flag stops being
+                    // hardcoded to `01`: an unsampled request was telling every
+                    // downstream service it was sampled, which is what makes a
+                    // half-recorded trace instead of none.
+                    $request = $request->withHeader(
+                        'traceparent',
+                        SpanManager::reservationOf($span)->header(),
+                    );
                     // W3C Trace Context: forwarding traceparent obliges forwarding
                     // tracestate too; baggage follows the same forward-as-is rule.
                     // An application-set header is never overwritten.

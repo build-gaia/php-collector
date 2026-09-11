@@ -64,6 +64,15 @@ final class MessagingBody
     public const TRUNCATED = 'messaging.message.body.truncated';
 
     /**
+     * Set only when the collector has actually TAKEN a whole copy of the payload
+     * for the span-body store — i.e. when `chronos_store_span_body` returned
+     * true. It is a promise a reader acts on (it is what turns on "load the rest"
+     * in the desktop), so it is never set optimistically: a `.stored` marker that
+     * resolves to nothing is the single failure that store was built to prevent.
+     */
+    public const STORED = 'messaging.message.body.stored';
+
+    /**
      * The body attributes for one message, or an empty array when there are
      * none to emit.
      *
@@ -104,6 +113,70 @@ final class MessagingBody
             // A body that cannot be encoded is a body that is not reported. It
             // must never be a publish or a consume that failed.
             return [];
+        }
+    }
+
+    /**
+     * The WHOLE payload for the span-body store, as `[payload, encoding]`, or
+     * `['', '']` when there is nothing to store.
+     *
+     * The sibling of [`encode`] and deliberately not a widening of it: they
+     * answer different questions against the same bytes. `encode` produces the
+     * span's PREVIEW, cut to whatever the attribute it rides can hold (16 KiB on
+     * a publish span, 8 KiB in the consume side's request-attribute bag). This
+     * produces the copy that goes to the blob store, cut only to what the
+     * operator allowed — `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY`, 64 KiB by
+     * default and hard-clamped to 512 KiB. Same gate, same `isText()` test, same
+     * cut-before-encode rule, so the preview and the stored copy can never
+     * disagree about the same payload; one implementation of each is exactly why
+     * they cannot.
+     *
+     * `$previewCeiling` is the bound the caller's preview was already cut to, and
+     * nothing is stored unless the allowance genuinely exceeds it — mirroring
+     * `http_capture`'s own rule (`if !overflowed || max_body_total_bytes <=
+     * max_body_bytes`). A blob identical to the attribute beside it costs a NATS
+     * message, a hypertable row and a round trip to say what the span already
+     * said.
+     *
+     * The returned encoding is a TRANSFER encoding (`base64` or `''`), and it is
+     * only ever handed to the native store. The authority a reader consults is
+     * the span's [`ENCODING`] attribute, which [`encode`] set from the identical
+     * test — one fact, not two that can drift.
+     *
+     * NOTE: the contract this was written against spells the signature
+     * `whole(string $body)`. It cannot be implemented that way: the
+     * "only when it exceeds the preview" rule needs the preview's bound, and the
+     * preview bound is per call site (publish 16 KiB, consume 8 KiB), so it has
+     * to be passed in exactly as `encode()` already takes it.
+     *
+     * @return array{0: string, 1: string}
+     */
+    public static function whole(string $body, int $previewCeiling): array
+    {
+        try {
+            // The gate first, before the payload is read, copied or measured —
+            // the same ordering [`encode`] documents.
+            if (!NativeExtension::messagingCapturing()) {
+                return ['', ''];
+            }
+            if ($body === '') {
+                return ['', ''];
+            }
+            $budget = NativeExtension::messagingBodyCeiling();
+            if ($budget <= 0 || $budget <= $previewCeiling) {
+                return ['', ''];
+            }
+            $encoded = self::isText($body) ? self::text($body, $budget) : self::binary($body, $budget);
+            $payload = $encoded[self::BODY] ?? '';
+            if ($payload === '') {
+                return ['', ''];
+            }
+
+            return [$payload, $encoded[self::ENCODING] ?? ''];
+        } catch (Throwable) {
+            // A payload that cannot be encoded is a payload that is not stored.
+            // It must never be a publish or a consume that failed.
+            return ['', ''];
         }
     }
 

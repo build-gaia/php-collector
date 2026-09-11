@@ -26,17 +26,125 @@
 //! Chunks are numbered and carry their own count, so the indexer never has to
 //! have seen chunk 0 to store chunk 3, and a body whose tail was lost is
 //! detectable rather than silently short.
+//!
+//! # Two producers, one store
+//!
+//! The HTTP path drains at request end and hands over every body it kept for
+//! ONE span — the request root — through [`flush`]. Userland (a message payload,
+//! `chronos_store_span_body`) cannot work that way: its bodies belong to spans
+//! the PHP SDK minted, and it hands them over one at a time while the request is
+//! still running. Those are buffered request-locally as [`PendingBody`] and
+//! written by [`flush_pending`] at the same moment, immediately before the span
+//! batch — so the `.stored` marker on a span can never be shipped ahead of the
+//! bytes it promises. The buffer exists rather than an inline write because a
+//! `CollectorEnvelope` is only assembled at request end, and because a file
+//! write per publish inside a loop would be its own outage.
 
 use crate::context::{hex_bytes, CollectorEnvelope};
 use crate::http_capture::StoredBody;
 use crate::spool_common;
 use serde_json::json;
+use std::cell::RefCell;
 
 const SCHEMA: &str = "chronos.tracing.span-body.v1";
 
 /// Bytes of body per document, under the engine streams' 1 MiB message limit
 /// with room for the envelope around it.
 const CHUNK_BYTES: usize = 512 * 1024;
+
+/// The most bodies one request may buffer for the userland store.
+///
+/// Deliberately NOT sized by analogy to `log_spool`'s 512 records: a log body is
+/// capped at a kilobyte, while one of these is capped by
+/// `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY`, whose hard clamp is 512 KiB — so 512
+/// of them would be a quarter of a gigabyte held in a request that is still
+/// running. Sixteen is one publish loop's worth of evidence: 1 MiB at the 64 KiB
+/// default, 8 MiB at the clamp, both of which a request can carry. A publisher
+/// that sends more than sixteen messages in one request keeps the first sixteen
+/// payloads and the spans for all of them — the seventeenth span simply does not
+/// claim `.stored`, which is the honest degradation, because
+/// [`crate::body_spool::capture`] reports the refusal rather than swallowing it.
+const MAX_PENDING_BODIES: usize = 16;
+
+/// A whole payload handed over by userland, waiting for request end.
+///
+/// Its own `(trace, span)` rather than the request's, because the span this
+/// belongs to is often NOT the request root: a publish span is a child minted by
+/// the PHP SDK, and it is the span whose attributes carry the preview and the
+/// `.stored` marker this row exists to honour. `observed_at` is the REQUEST's
+/// start instant, carried for the same reason [`flush`] carries it — see its
+/// docblock on derived identity.
+pub struct PendingBody {
+    pub trace_id: String,
+    pub span_id: String,
+    pub observed_at: String,
+    pub body: StoredBody,
+}
+
+thread_local! {
+    static PENDING: RefCell<Vec<PendingBody>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Clear the request-local buffer. Called from request start, because these are
+/// thread-locals that outlive one request inside an FPM worker.
+pub fn reset() {
+    PENDING.with(|pending| pending.borrow_mut().clear());
+}
+
+/// Buffer one payload for the flush at request end, reporting whether it was
+/// taken.
+///
+/// The bool is the whole point: the caller only stamps
+/// `messaging.message.body.stored` on its span when this said yes, so a marker
+/// never promises bytes the budget refused. Buffered rather than written inline
+/// because `CollectorEnvelope` and the request's start instant are only
+/// assembled at request end — and because per-call file I/O inside a publish
+/// loop would be its own outage.
+pub fn capture(body: PendingBody) -> bool {
+    PENDING.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.len() >= MAX_PENDING_BODIES {
+            return false;
+        }
+        pending.push(body);
+        true
+    })
+}
+
+pub fn drain() -> Vec<PendingBody> {
+    PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
+}
+
+/// Write every buffered payload, each keyed by the span that claimed it.
+///
+/// Separate from [`flush`] rather than a widening of it: the HTTP path holds one
+/// (trace, span) for every body it drained — they all belong to the request root
+/// — while these each name their own span. Both loop the same `flush_one`, so
+/// the document shape, the chunking and the derived identity are shared.
+pub fn flush_pending(
+    envelope: &CollectorEnvelope,
+    bodies: &[PendingBody],
+) -> std::io::Result<()> {
+    let mut result = Ok(());
+    for pending in bodies {
+        if pending.body.bytes.is_empty() {
+            continue;
+        }
+        // Every body is attempted even after a failure, for the reason [`flush`]
+        // gives about the chunks of one body: abandoning the rest because one
+        // write failed loses more than it protects.
+        if let Err(error) = flush_one(
+            envelope,
+            &pending.trace_id,
+            &pending.span_id,
+            &pending.observed_at,
+            &pending.body,
+        ) {
+            result = Err(error);
+        }
+    }
+    result
+}
 
 /// Write every body as numbered documents. Bodies with nothing in them are skipped.
 ///
@@ -144,6 +252,48 @@ mod tests {
         let chunks = split(&body);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks.concat(), body);
+    }
+
+    #[test]
+    fn the_pending_buffer_refuses_past_its_budget_and_says_so() {
+        reset();
+        for index in 0..MAX_PENDING_BODIES {
+            assert!(
+                capture(pending(&format!("span-{index}"))),
+                "body {index} must be taken"
+            );
+        }
+        // The refusal is the contract: a caller that is told "no" must not stamp
+        // `.stored`, which is the only thing standing between a marker and a
+        // promise nothing can honour.
+        assert!(!capture(pending("one-too-many")));
+        let drained = drain();
+        assert_eq!(drained.len(), MAX_PENDING_BODIES);
+        assert!(drain().is_empty(), "draining empties the buffer");
+    }
+
+    #[test]
+    fn each_pending_body_keeps_its_own_span() {
+        reset();
+        assert!(capture(pending("publish-span")));
+        assert!(capture(pending("root-span")));
+        let drained = drain();
+        assert_eq!(drained[0].span_id, "publish-span");
+        assert_eq!(drained[1].span_id, "root-span");
+        assert_eq!(drained[0].body.side, "message");
+    }
+
+    fn pending(span_id: &str) -> PendingBody {
+        PendingBody {
+            trace_id: "trace".to_owned(),
+            span_id: span_id.to_owned(),
+            observed_at: "2026-09-11T00:00:00.000000Z".to_owned(),
+            body: StoredBody {
+                side: "message",
+                content_type: "application/x-protobuf".to_owned(),
+                bytes: "AAEC".to_owned(),
+            },
+        }
     }
 
     #[test]

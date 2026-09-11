@@ -6,6 +6,7 @@ namespace Chronos\Collector\Framework\Messenger;
 
 use Chronos\Collector\Service\MessagingSpan;
 use Chronos\Collector\Service\NativeExtension;
+use Chronos\Collector\Service\SpanManager;
 use Throwable;
 
 /**
@@ -68,11 +69,24 @@ if (interface_exists(\Symfony\Component\Messenger\Middleware\MiddlewareInterface
         }
 
         /**
-         * Stamp the child traceparent onto the outgoing envelope BEFORE the send happens — a
-         * stamp added after `$stack->next()->handle()` returns would be too late for a real
-         * transport, which serializes stamps into the wire message as part of that call — then
-         * record the producer span once the send has actually happened, naming the destination
-         * from whichever transport `SendMessageMiddleware` sent it to.
+         * Stamp the RESERVED PRODUCER SPAN's traceparent onto the outgoing envelope BEFORE the
+         * send happens — a stamp added after `$stack->next()->handle()` returns would be too
+         * late for a real transport, which serializes stamps into the wire message as part of
+         * that call — then record that very span once the send has actually happened, naming
+         * the destination from whichever transport `SendMessageMiddleware` sent it to.
+         *
+         * The stamp used to carry `NativeExtension::childTraceparent()`, an id no span is ever
+         * recorded under, so a consumed message parented itself to nothing and shared only a
+         * trace id with its dispatch. The reservation fixes the identity; `ChronosTraceparentStamp`
+         * needs no change at all, because it was always just carrying a traceparent string —
+         * only the VALUE was wrong.
+         *
+         * A reservation that is stamped and never spent cannot produce an orphan HERE, which is
+         * why the SentStamp gate below needs no adjustment: `destinationName()` returns null
+         * exactly when no transport accepted the message, and in that case the message never
+         * left the process, so the only thing that can see the unused stamp is the sync
+         * re-dispatch path — which `handleConsume` deliberately passes through without calling
+         * requestStart, so the stamp is never turned into a parent.
          *
          * ONLY when a send happened: `SentStamp` is the proof a transport accepted the
          * message, and without it the whole downstream chain — including the handler itself —
@@ -85,7 +99,14 @@ if (interface_exists(\Symfony\Component\Messenger\Middleware\MiddlewareInterface
             \Symfony\Component\Messenger\Envelope $envelope,
             \Symfony\Component\Messenger\Middleware\StackInterface $stack,
         ): \Symfony\Component\Messenger\Envelope {
-            $traceparent = NativeExtension::childTraceparent();
+            $reservation = SpanManager::reserve();
+            // Tier 2 where there is no reservation to be had: the REQUEST ROOT's own
+            // traceparent names a span that really is recorded, so the consumer nests under
+            // the dispatching request rather than under the dispatch call. Tier 3 — neither —
+            // stamps nothing, and the worker roots its own trace, which is the honest outcome
+            // and is what the existing "dispatch with no traceparent available passes the
+            // envelope through unchanged" case asserts.
+            $traceparent = $reservation?->header() ?? NativeExtension::traceparent();
             if ($traceparent !== null && $traceparent !== '') {
                 $envelope = $envelope->with(new ChronosTraceparentStamp($traceparent));
             }
@@ -99,6 +120,8 @@ if (interface_exists(\Symfony\Component\Messenger\Middleware\MiddlewareInterface
                         'symfony_messenger',
                         $destination,
                         $envelope->getMessage()::class,
+                        [],
+                        $reservation,
                     );
                 }
             } catch (Throwable) {

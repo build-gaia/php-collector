@@ -31,10 +31,25 @@
 //! is the intended behaviour for telemetry on a host whose ingest is down or
 //! whose disk is finite — but it is only acceptable if it is counted, so every
 //! drop increments [`dropped`] and says so once per occurrence.
+//!
+//! The same rule now covers the case that cost the most: a spool directory the
+//! worker cannot WRITE. Every signal in this extension reaches the disk through
+//! [`append`] — spans, logs, profiles, bodies, DST, job markers, deterministic
+//! aggregates — and every one of their call sites discards the error with
+//! `let _ =`, deliberately, because telemetry must never break a request. The
+//! consequence was that an `EACCES` on the spool directory discarded a whole
+//! host's telemetry in perfect silence, indistinguishable from a collector that
+//! was never switched on. [`report_failure`] closes that: one chokepoint, one
+//! line per `io::ErrorKind` per process, naming the directory, the errno kind
+//! and the running totals. Latched per KIND rather than once globally, so a
+//! `PermissionDenied` at boot cannot mask a `StorageFull` an hour later; and
+//! once per process rather than per call, because a warning on a hot path is its
+//! own outage — which is the rule the segment-budget warning above already
+//! follows.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Serialize;
 
@@ -59,6 +74,57 @@ const SEGMENT_EXTENSION: &str = "spool";
 
 static DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
 static DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// One latch per `io::ErrorKind` this module can meet, indexed by
+/// [`error_slot`]. A fixed array rather than a map so the failure path allocates
+/// nothing and takes no lock — it is running because the disk already did not
+/// work.
+static ANNOUNCED: [AtomicBool; ERROR_KINDS] = [const { AtomicBool::new(false) }; ERROR_KINDS];
+
+const ERROR_KINDS: usize = 6;
+
+/// Which latch an error claims. Grouped by what an operator would DO about it,
+/// not by the full `ErrorKind` enum: permissions, a missing path, a full disk, a
+/// frame this module refused, a short write, and everything else.
+fn error_slot(kind: std::io::ErrorKind) -> usize {
+    match kind {
+        std::io::ErrorKind::PermissionDenied => 0,
+        std::io::ErrorKind::NotFound => 1,
+        std::io::ErrorKind::StorageFull => 2,
+        std::io::ErrorKind::InvalidInput => 3,
+        std::io::ErrorKind::WriteZero => 4,
+        _ => 5,
+    }
+}
+
+/// Announce a spool write that failed — once per process per error kind.
+///
+/// Called from [`append`]'s own error returns rather than from its eight
+/// callers. They all discard the error by design (a request must not fail
+/// because a span could not be spooled), so a warning at each would be eight
+/// latches, eight wordings and eight chances to forget the ninth; every one of
+/// them reaches this syscall, so one report here makes all of them audible.
+///
+/// The wording names the SAPI reality deliberately: under PHP-FPM each worker is
+/// its own process with its own latch, so a 32-worker pool prints up to 32 of
+/// these when the spool first fails. That is the correct trade — each worker
+/// counts its own losses — but a reader who did not know it would read the
+/// repetition as a loop.
+fn report_failure(spool_directory: &str, error: &std::io::Error) {
+    let slot = error_slot(error.kind());
+    if ANNOUNCED[slot].swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "[chronos-ext] spool write failed ({:?}: {error}) at {spool_directory}: this \
+         process's telemetry is being discarded. {} frames ({} bytes) lost so far. \
+         Reported once per process per error kind, and every PHP worker is its own \
+         process.",
+        error.kind(),
+        dropped(),
+        dropped_bytes(),
+    );
+}
 
 /// Frames this process has discarded, by any path: segment budget reached, or a
 /// write that could not be completed atomically.
@@ -261,29 +327,61 @@ pub fn append(
     let Some(encoded) = frame(signal, encoding, id, payload) else {
         DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
         DROPPED_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
-        return Err(std::io::Error::new(
+        let error = std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "document cannot be framed",
-        ));
+        );
+        // Counted since ADR 0035 and, until now, never announced: an oversized
+        // document was refused here and the signal simply never appeared.
+        report_failure(spool_directory, &error);
+        return Err(error);
     };
-    fs::create_dir_all(spool_directory)?;
-    let (generation, mut file) = open_active(spool_directory)?;
+    fs::create_dir_all(spool_directory).map_err(|error| {
+        report_failure(spool_directory, &error);
+        error
+    })?;
+    let (generation, mut file) = open_active(spool_directory).map_err(|error| {
+        report_failure(spool_directory, &error);
+        error
+    })?;
     let length = file.metadata().map(|data| data.len()).unwrap_or(0);
     if length >= SEGMENT_MAX_BYTES {
-        let (_, rotated) = rotate(spool_directory, generation)?;
+        let (_, rotated) = rotate(spool_directory, generation).map_err(|error| {
+            report_failure(spool_directory, &error);
+            error
+        })?;
         file = rotated;
     }
     // ONE write, and its result inspected. `write_all` would loop on a short
     // write and split the frame across two appends, which is precisely the
     // interleaving this design exists to avoid.
-    let written = file.write(&encoded)?;
+    let written = file.write(&encoded).map_err(|error| {
+        DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
+        DROPPED_BYTES.fetch_add(encoded.len() as u64, Ordering::Relaxed);
+        report_failure(spool_directory, &error);
+        error
+    })?;
     if written != encoded.len() {
         DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
         DROPPED_BYTES.fetch_add(encoded.len() as u64, Ordering::Relaxed);
-        eprintln!(
-            "[chronos-ext] spool append was short ({written} of {} bytes): frame dropped",
-            encoded.len()
-        );
+        // Latched on the WriteZero slot like every other failure, NOT printed per
+        // occurrence. A short write is exactly what a full filesystem produces —
+        // write(2) returns a partial count while anything still fits and only
+        // reports StorageFull once nothing does — and each segment rotation
+        // re-arms it, so a disk hovering at capacity would have every FPM worker
+        // streaming this line onto the disk that is already full. That is the
+        // outage this module's own rule forbids: once per process, because a
+        // warning on a hot path is its own outage.
+        if !ANNOUNCED[error_slot(std::io::ErrorKind::WriteZero)].swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[chronos-ext] spool append was short ({written} of {} bytes) at \
+                 {spool_directory}: frame dropped. {} frames ({} bytes) lost so far. \
+                 Reported once per process, and every PHP worker is its own process.",
+                encoded.len(),
+                dropped(),
+                dropped_bytes(),
+            );
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::WriteZero,
             "short spool append",
@@ -439,6 +537,46 @@ mod tests {
             ids.len(),
             writers * per_writer,
             "every appended frame must be present exactly once"
+        );
+    }
+
+    /// The failure that cost hours: a spool directory the worker cannot write.
+    /// The write must still fail open (the error is returned, never panicked)
+    /// AND be counted, which is what makes it findable in a container log.
+    #[test]
+    #[cfg(unix)]
+    fn an_unwritable_spool_directory_fails_open_and_is_announced() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = temporary_directory("unwritable");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o500))
+            .expect("make it read-only");
+        let slot = error_slot(std::io::ErrorKind::PermissionDenied);
+        ANNOUNCED[slot].store(false, Ordering::Relaxed);
+        let result = append(&directory, "trace", "json", "denied", b"{}");
+        // Restored before asserting, so a failure here cannot leave an
+        // undeletable directory behind for the next run.
+        let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
+        assert!(result.is_err(), "an unwritable spool must report the failure");
+        assert!(
+            ANNOUNCED[slot].load(Ordering::Relaxed),
+            "the failure must have been announced once"
+        );
+    }
+
+    #[test]
+    fn an_error_kind_is_latched_separately_from_the_others() {
+        // A PermissionDenied at boot must not silence a StorageFull an hour
+        // later — that is the whole reason the latch is per kind.
+        for slot in 0..ERROR_KINDS {
+            ANNOUNCED[slot].store(false, Ordering::Relaxed);
+        }
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        report_failure("/nowhere", &denied);
+        report_failure("/nowhere", &denied);
+        assert!(ANNOUNCED[error_slot(std::io::ErrorKind::PermissionDenied)].load(Ordering::Relaxed));
+        assert!(
+            !ANNOUNCED[error_slot(std::io::ErrorKind::StorageFull)].load(Ordering::Relaxed),
+            "a different kind keeps its own unspent latch"
         );
     }
 

@@ -7,6 +7,7 @@ namespace Chronos\Collector\Framework\Laravel;
 use Chronos\Collector\Service\MessagingDestination;
 use Chronos\Collector\Service\MessagingWait;
 use Chronos\Collector\Service\NativeExtension;
+use Chronos\Collector\Service\SpanManager;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
@@ -113,10 +114,28 @@ final class QueueTelemetry
     /**
      * The trace context and dispatch instant stamped into every outgoing payload.
      *
-     * A CHILD traceparent, not this request's own: the job is caused by the
-     * dispatching request but is not part of it, so it hangs beneath the
-     * dispatch rather than claiming to be the same span — the same shape an
-     * outbound HTTP call gets.
+     * The RESERVED PRODUCER SPAN's traceparent, so the job hangs beneath the
+     * dispatch itself — the same shape an outbound HTTP call gets, and now
+     * genuinely so. This used to call `NativeExtension::childTraceparent()`,
+     * which mints an id that no span is ever recorded under, and that is why
+     * every queued job on this estate was an ORPHAN: the worker's root span
+     * carried a parent id naming nothing, so the job shared a trace with the
+     * request that dispatched it and had no edge to it.
+     *
+     * The reservation is spent in a DIFFERENT call: this runs during `push`
+     * (via `Queue::createPayloadUsing`), while the producer span is recorded from
+     * the `JobQueued` event in `RequestFacts`. It recovers the id from the
+     * payload rather than from a side channel here — see
+     * `SpanReservation::fromTraceparent` on why the wire is the only alignment
+     * that cannot hand a producer span another message's id.
+     *
+     * The `?? traceparent()` fallback is KEPT, and it is the tier this code
+     * already got right by accident: the REQUEST ROOT is a span that really is
+     * recorded, so a dispatch with no reservation available still nests its job
+     * under the dispatching request. Less precise, still true. With neither, no
+     * traceparent is stamped at all and the worker roots its own trace — a
+     * traceparent on the wire is a promise, and a publisher with no open request
+     * cannot make it.
      *
      * `enqueued_at` rides alongside it because the wait is the fact a queue is
      * usually judged on and NOTHING else can supply it: the two halves of a job
@@ -141,7 +160,7 @@ final class QueueTelemetry
     {
         try {
             $context = [self::ENQUEUED_AT_KEY => \sprintf('%.6F', \microtime(true))];
-            $traceparent = NativeExtension::childTraceparent() ?? NativeExtension::traceparent();
+            $traceparent = SpanManager::reserve()?->header() ?? NativeExtension::traceparent();
             if (is_string($traceparent) && $traceparent !== '') {
                 $context['traceparent'] = $traceparent;
             }

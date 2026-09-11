@@ -39,10 +39,15 @@ use Chronos\Collector\Framework\Guzzle\ReplayMiddleware;
 use Chronos\Collector\Framework\Laravel\ExceptionCapture;
 use Chronos\Collector\Framework\Laravel\QueueTelemetry;
 use Chronos\Collector\Framework\Laravel\RequestFacts;
+use Chronos\Collector\Dto\SpanReservation;
 use Chronos\Collector\Service\CacheCapture;
 use Chronos\Collector\Service\CallSite;
+use Chronos\Collector\Service\Diagnostics;
+use Chronos\Collector\Service\MessagingBody;
 use Chronos\Collector\Service\MessagingDestination;
+use Chronos\Collector\Service\MessagingFailure;
 use Chronos\Collector\Service\Span;
+use Chronos\Collector\Service\SpanManager;
 use Chronos\Collector\Framework\Pdo\EffectConnection;
 
 spl_autoload_register(static function (string $class): void {
@@ -1295,6 +1300,189 @@ $runner->test('every dispatched payload carries the dispatch instant', static fu
         QueueTelemetry::waitMilliseconds($stamped, (float) $stamped),
         'the stamp this SDK writes is the one it can read back',
     );
+});
+
+// ---------------------------------------------------------------------------
+// Span reservations: the identity that makes messaging causality work.
+// ---------------------------------------------------------------------------
+
+$runner->test('a reservation renders the W3C shape byte for byte', static function (Runner $runner): void {
+    // Byte-identical to TraceContext::header(), to native context.rs's own header(), and to
+    // what chronos_child_traceparent emitted — so native parse_traceparent and PHP
+    // TraceContext::fromHeader both accept it with no change on either side.
+    $trace = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+    $span = '0102030405060708';
+    $runner->assertSame('00-'.$trace.'-'.$span.'-01', (new SpanReservation($trace, $span, true))->header());
+    // 00 is propagated, never upgraded: native start_request only re-rolls the sampling die
+    // when there is no inbound parent, so an unsampled trace is dropped WHOLE rather than
+    // half-recorded.
+    $runner->assertSame('00-'.$trace.'-'.$span.'-00', (new SpanReservation($trace, $span, false))->header());
+});
+
+$runner->test('a reservation round-trips through the header it emitted', static function (Runner $runner): void {
+    // The Laravel queue path depends on exactly this: the id is stamped during push and
+    // recovered from the payload when the producer span is finally recorded.
+    $original = new SpanReservation('a1b2c3d4e5f60718293a4b5c6d7e8f90', '0102030405060708', true);
+    $recovered = SpanReservation::fromTraceparent($original->header());
+    $runner->assertTrue($recovered !== null, 'its own header must parse');
+    $runner->assertSame($original->traceId, $recovered->traceId);
+    $runner->assertSame($original->spanId, $recovered->spanId);
+    $runner->assertSame(true, $recovered->sampled);
+    $runner->assertSame(false, SpanReservation::fromTraceparent('00-a1b2c3d4e5f60718293a4b5c6d7e8f90-0102030405060708-00')->sampled);
+});
+
+$runner->test('a reservation refuses every traceparent it could not honour', static function (Runner $runner): void {
+    foreach ([
+        'empty' => '',
+        'a future version' => '01-a1b2c3d4e5f60718293a4b5c6d7e8f90-0102030405060708-01',
+        'upper-case hex' => '00-A1B2C3D4E5F60718293A4B5C6D7E8F90-0102030405060708-01',
+        'a short trace id' => '00-a1b2c3d4-0102030405060708-01',
+        'a short span id' => '00-a1b2c3d4e5f60718293a4b5c6d7e8f90-01020304-01',
+        // W3C forbids both, and accepting one would put an unusable parent on a span.
+        'an all-zero trace id' => '00-00000000000000000000000000000000-0102030405060708-01',
+        'an all-zero span id' => '00-a1b2c3d4e5f60718293a4b5c6d7e8f90-0000000000000000-01',
+        'trailing junk' => '00-a1b2c3d4e5f60718293a4b5c6d7e8f90-0102030405060708-01-extra',
+    ] as $case => $header) {
+        $runner->assertTrue(
+            SpanReservation::fromTraceparent($header) === null,
+            "{$case} must be refused rather than turned into a parent",
+        );
+    }
+});
+
+$runner->test('reserving outside a request yields nothing, and never a fabricated id', static function (Runner $runner): void {
+    // The rule the whole contract rests on: a traceparent on the wire is a PROMISE that the
+    // span it names will be recorded, and there is no span to promise here. The bridges read
+    // null as "propagate the request root, or nothing at all".
+    SpanManager::reset();
+    $runner->assertTrue(SpanManager::reserve() === null, 'no open request can make that promise');
+});
+
+$runner->test('a reserved id is the id the span is finally recorded under', static function (Runner $runner): void {
+    $trace = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+    SpanManager::begin(Span::open($trace, '0102030405060708', '', 'request'));
+    try {
+        $reservation = SpanManager::reserve();
+        $runner->assertTrue($reservation !== null, 'a reservation inside a request');
+        $runner->assertSame($trace, $reservation->traceId, 'it stays in the publisher trace: ');
+        $span = SpanManager::openReserved($reservation, 'PUBLISH oms-orders');
+        $runner->assertSame($reservation->spanId, $span->id, 'the span carries the reserved id: ');
+        $runner->assertSame('0102030405060708', $span->parentSpanId, 'and parents onto the request root: ');
+        // DETACHED: never pushed onto the stack. A publish span finishes immediately, and one
+        // left open would become the parent of everything recorded after it.
+        $runner->assertTrue(SpanManager::active()?->id === '0102030405060708', 'the stack top is unchanged by openReserved');
+        $span->finish();
+    } finally {
+        SpanManager::end();
+    }
+});
+
+$runner->test('a reservation holds its span slot, and openReserved can never be refused', static function (Runner $runner): void {
+    // The cap is paid at RESERVATION time on purpose. Re-checking it when the span is finally
+    // recorded could refuse a span whose id is already on the wire — which is exactly the
+    // orphan this mechanism exists to remove.
+    SpanManager::begin(Span::open('a1b2c3d4e5f60718293a4b5c6d7e8f90', '0102030405060708', '', 'request'));
+    try {
+        $reservation = SpanManager::reserve();
+        $runner->assertTrue($reservation !== null, 'the first reservation succeeds');
+        // Commit the whole budget, then prove the outstanding reservation is still spendable.
+        $held = [];
+        for ($i = 0; $i < 80; ++$i) {
+            $held[] = SpanManager::open('filler-'.$i);
+        }
+        $runner->assertTrue(SpanManager::reserve() === null, 'a spent budget refuses to reserve again');
+        $span = SpanManager::openReserved($reservation, 'PUBLISH oms-orders');
+        $runner->assertSame(false, $span->isVoid(), 'a reserved span is recorded whatever the cap now says: ');
+        $runner->assertSame($reservation->spanId, $span->id);
+    } finally {
+        SpanManager::end();
+    }
+    // end() releases the slot, so one leaked publish cannot permanently shrink the next
+    // request's budget inside the same FPM worker.
+    SpanManager::begin(Span::open('a1b2c3d4e5f60718293a4b5c6d7e8f90', '0102030405060708', '', 'request'));
+    $runner->assertTrue(SpanManager::reserve() !== null, 'the next request starts with a clean budget');
+    SpanManager::end();
+});
+
+$runner->test('whole() and encode() agree, and both stay shut by default', static function (Runner $runner): void {
+    // The default posture for an inter-service payload: with capture off not one byte is read,
+    // copied or measured on either the preview path or the blob path.
+    $runner->assertSame([], MessagingBody::encode('{"order":1}', 16384));
+    $runner->assertSame(['', ''], MessagingBody::whole('{"order":1}', 16384));
+    // And with no extension loaded at all the gate is closed whatever the setting says — the
+    // fail-safe direction for a payload is "do not send it", never "nobody said otherwise".
+    $runner->assertSame(false, \Chronos\Collector\Service\NativeExtension::messagingCapturing());
+});
+
+$runner->test('the collector complains about itself exactly once per process', static function (Runner $runner): void {
+    // Fail-open is not negotiable; fail-SILENT is the bug. But a warning on a hot path is its
+    // own outage, so the latch is what makes the complaint affordable at all.
+    Diagnostics::reset();
+    $runner->assertSame(false, Diagnostics::announced('spool'));
+    Diagnostics::warnOnce('spool', 'the spool directory is not writable');
+    $runner->assertSame(true, Diagnostics::announced('spool'));
+    Diagnostics::warnOnce('spool', 'the spool directory is not writable');
+    $runner->assertSame(true, Diagnostics::announced('spool'), 'a second occurrence is silent, not a second line');
+    $runner->assertSame(false, Diagnostics::announced('manifest'), 'each condition keeps its own unspent latch');
+    Diagnostics::reset();
+});
+
+$runner->test('a noted delivery failure is taken exactly once', static function (Runner $runner): void {
+    // The slot is a static inside a long-lived worker, so anything left in it would be
+    // attributed to the NEXT message — a green delivery reported as red.
+    MessagingFailure::reset();
+    $runner->assertTrue(MessagingFailure::take() === null, 'nothing noted means nothing taken');
+    $boom = new \RuntimeException('protobuf decode failed');
+    MessagingFailure::note($boom);
+    $runner->assertTrue(MessagingFailure::take() === $boom, 'the exact throwable, not a copy');
+    $runner->assertTrue(MessagingFailure::take() === null, 'taking clears the slot');
+    // Last writer wins: a handler that caught, retried and failed again should report the
+    // failure it actually gave up on.
+    MessagingFailure::note(new \RuntimeException('first'));
+    MessagingFailure::note($boom);
+    $runner->assertTrue(MessagingFailure::take() === $boom, 'the last note is the one reported');
+    MessagingFailure::reset();
+});
+
+$runner->test('the Laravel producer span recovers its reserved id from the payload', static function (Runner $runner): void {
+    // Laravel is the only split case: the traceparent is stamped during push, by
+    // QueueTelemetry::payloadContext() through Queue::createPayloadUsing, while the producer
+    // span is recorded later from JobQueued. The payload IS the wire, so an id read out of THIS
+    // message's payload is this message's id by construction — which is why a park/claim FIFO
+    // between the two hooks was rejected: it misaligns on Queue::bulk and a misaligned claim
+    // gives a producer span ANOTHER message's id, a wrong parent that renders as a working trace.
+    $method = new \ReflectionMethod(RequestFacts::class, 'reservationFromPayload');
+    $header = '00-a1b2c3d4e5f60718293a4b5c6d7e8f90-0102030405060708-01';
+    $payload = json_encode([
+        'displayName' => 'App\\Jobs\\PublishOrderJob',
+        QueueTelemetry::PAYLOAD_KEY => ['traceparent' => $header, QueueTelemetry::ENQUEUED_AT_KEY => '1757000000.000000'],
+    ]);
+
+    $recovered = $method->invoke(null, $payload);
+    $runner->assertTrue($recovered !== null, 'the reserved id must come back out of the payload');
+    $runner->assertSame('0102030405060708', $recovered->spanId);
+    $runner->assertSame('a1b2c3d4e5f60718293a4b5c6d7e8f90', $recovered->traceId);
+
+    foreach ([
+        // No reservation to recover: record with a fresh id, exactly as before this existed —
+        // an orphaned consumer, which is the pre-existing behaviour and not a regression.
+        'a payload with no chronos context' => '{"displayName":"App\\\\Jobs\\\\X"}',
+        'an unparseable traceparent' => '{"chronos":{"traceparent":"nonsense"}}',
+        'an array rather than the JSON string' => ['chronos' => ['traceparent' => $header]],
+        'nothing at all' => null,
+        'an empty payload' => '',
+    ] as $case => $broken) {
+        $runner->assertTrue(
+            $method->invoke(null, $broken) === null,
+            "{$case} must fall back to a fresh span id rather than a wrong one",
+        );
+    }
+
+    // The bound is a real refusal, not a guess: a job over it carries data, not context, and
+    // paying a full json_decode per dispatch to fish out one 55-byte header is a cost a
+    // dispatch loop would feel.
+    $oversized = '{"chronos":{"traceparent":"'.$header.'"},"pad":"'.str_repeat('x', 300 * 1024).'"}';
+    $runner->assertTrue($method->invoke(null, $oversized) === null, 'an oversized payload is not decoded');
 });
 
 exit($runner->finish());

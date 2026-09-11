@@ -9,9 +9,17 @@ namespace Chronos\Collector\Service;
  * TraceparentMiddleware, the PSR-18 and Symfony HttpClient decorators, the
  * Laravel Http-facade middleware).
  *
- * traceparent itself is NOT handled here: each bridge keeps calling
- * NativeExtension::childTraceparent(), which mints a fresh child span id per
- * outbound call. What this class adds is the rest of the W3C contract — a
+ * traceparent itself is NOT handled here. On the CURL path each HTTP bridge
+ * calls NativeExtension::childTraceparent(), which mints a fresh child span id
+ * per outbound call — safe there and ONLY there, because the native observer
+ * strips that header off CURLOPT_HTTPHEADER on curl_exec and replaces it with
+ * the curl frame's own span id, a span it really does emit. Nothing else may use
+ * it: the id names a span nobody records, so a callee that parents itself to it
+ * is an orphan. Messaging propagation reserves a real publish span id instead
+ * (Service\SpanManager::reserve() and Dto\SpanReservation) and records the
+ * publish span under it, and the one HTTP site that opens its own client span
+ * (Laravel's Http-facade hook) propagates THAT span's id. What this class adds
+ * is the rest of the W3C contract — a
  * participant that forwards traceparent MUST also forward tracestate entries it
  * does not understand, and baggage follows the same forward-as-is rule. The .so
  * captured both verbatim on the inbound request and hands them back through

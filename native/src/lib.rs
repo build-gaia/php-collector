@@ -474,6 +474,10 @@ fn start_request(
 
     observer::set_request_context(context.clone());
     log_spool::reset();
+    // Same reason as the line above: a thread-local outlives one request inside
+    // an FPM worker, and a payload left buffered would be flushed against the
+    // NEXT request's envelope and start instant.
+    body_spool::reset();
     request_attributes::reset();
     // Deterministic aggregates (ADR 0029) are armed on EVERY request the collector
     // starts, not on the sample verdict and not behind `profiler_enabled`. Tier 1's
@@ -786,13 +790,22 @@ pub fn chronos_request_end(
             // the body first is the ordering that cannot show a promise the store
             // has not yet been able to honour.
             if !drained.bodies.is_empty() {
-                let _ = body_spool::flush(
+                report_body_flush(body_spool::flush(
                     &envelope,
                     &ctx.trace_id,
                     &ctx.span_id,
                     &started_at,
                     &drained.bodies,
-                );
+                ));
+            }
+            // Payloads userland handed over during the request, each keyed by
+            // the span that already claims `.stored`. Written HERE, before the
+            // span batch below and beside the HTTP bodies, for the same reason:
+            // a reader only asks for a payload after seeing a span promise it,
+            // so the bytes must never be the later of the two writes.
+            let pending = body_spool::drain();
+            if !pending.is_empty() {
+                report_body_flush(body_spool::flush_pending(&envelope, &pending));
             }
             let root = observer::root_http_span(
                 ctx,
@@ -1301,8 +1314,25 @@ pub fn chronos_pending_traceparent() -> String {
     observer::take_pending_traceparent().unwrap_or_default()
 }
 
-/// PHP-callable: generate a child traceparent for manual outbound propagation.
-/// Returns a W3C traceparent string with a fresh span_id linked to the current trace.
+/// PHP-callable: generate a child traceparent for an outbound CURL call.
+///
+/// HTTP-ONLY, and unsafe for anything else. The span id in the middle field is
+/// freshly minted here and NOBODY RECORDS IT: no span with that id is ever
+/// emitted, so a callee that parents itself to it becomes an orphan sharing only
+/// a trace id with its caller. On the curl path that is harmless because it is
+/// overwritten — `observer::merge_propagation_headers` strips every existing
+/// `traceparent:` off `CURLOPT_HTTPHEADER` and pushes the curl frame's OWN span
+/// id, which IS emitted — so the value handed back here is a placeholder the
+/// observer replaces.
+///
+/// Messaging propagation must NOT use this. A message crosses a process
+/// boundary, there is no later hook to correct the header, and the consumer's
+/// root span keeps the phantom as its parent forever — which is precisely why
+/// publish and consume shared a trace but never a tree. The PHP SDK reserves a
+/// real publish span id instead (`Service\SpanManager::reserve()` and
+/// `Dto\SpanReservation`), puts THAT on the wire, and then records the publish
+/// span under the same id. Kept unchanged and still registered because the curl
+/// bridges depend on its exact behaviour.
 #[php_function]
 pub fn chronos_child_traceparent() -> String {
     REQUEST_CONTEXT.with(|c| {
@@ -1347,6 +1377,106 @@ pub fn chronos_set_http_response_body(
             .map(|map| map.into_iter().collect())
             .unwrap_or_default(),
     );
+}
+
+/// PHP-callable: keep a whole payload beside the span that previews it.
+///
+/// The messaging counterpart of what `http_capture` does for an HTTP exchange,
+/// and it reuses that store rather than inventing one: the same
+/// `chronos.tracing.span-body.v1` documents, the same `(trace, span, side)` key,
+/// the same chunking, so the desktop's existing "load the rest" path reads a
+/// message payload with no new read plumbing. `side` is `message` — one value,
+/// not `publish`/`consume`, because a publish span and a consume span are
+/// different span ids in the same trace and the direction is already on the span
+/// as `messaging.operation`.
+///
+/// Empty `trace_id`/`span_id` mean "this request's root span", which is what the
+/// consume side wants: its preview rides the request-attribute bag and therefore
+/// lands on the root, so keying the blob anywhere else would break the one
+/// invariant the store rests on — the span that promises the payload is the span
+/// that owns it. The publish side passes its own ids, because a publish span is
+/// a child the PHP SDK minted.
+///
+/// `encoding` is the transfer encoding of `body` (`base64` for a payload that is
+/// not valid UTF-8, empty for text). It is NOT stored: the span's
+/// `messaging.message.body.encoding` attribute is the single authority, and a
+/// second copy on the wire document would be a second thing to disagree. It is
+/// still read here, to REFUSE an encoding this pipeline has no reader for — a
+/// stored payload nobody can decode is worse than no payload at all.
+///
+/// Returns whether the payload was taken. The caller stamps
+/// `messaging.message.body.stored` only on `true`, so a marker can never
+/// out-promise the store: false means the request is inert, APM is off, the side
+/// is not one this entry point serves, the body is empty, the encoding is
+/// unreadable, or the per-request buffer ([`body_spool`]) is full.
+#[php_function]
+pub fn chronos_store_span_body(
+    trace_id: String,
+    span_id: String,
+    side: String,
+    content_type: String,
+    body: String,
+    encoding: String,
+) -> bool {
+    // Checked before anything else touches the payload, in the order that costs
+    // least: two string compares, then an emptiness test, then the thread-locals.
+    if side != "message" {
+        return false;
+    }
+    if encoding != "base64" && !encoding.is_empty() {
+        return false;
+    }
+    if body.is_empty() {
+        return false;
+    }
+    // `apm_enabled` AND a sampled context, because the promise is only worth
+    // keeping if the span arrives: an unsampled request emits no spans at all
+    // (see `chronos_request_end`), so a payload stored for one would be a row no
+    // span ever points at.
+    let apm = REQUEST_CONFIG.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|config| config.apm_enabled)
+            .unwrap_or(false)
+    });
+    if !apm {
+        return false;
+    }
+    let Some((request_trace, request_span, sampled)) = REQUEST_CONTEXT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|ctx| (ctx.trace_id.clone(), ctx.span_id.clone(), ctx.sampled))
+    }) else {
+        return false;
+    };
+    if !sampled {
+        return false;
+    }
+
+    body_spool::capture(body_spool::PendingBody {
+        trace_id: if trace_id.is_empty() {
+            request_trace
+        } else {
+            trace_id
+        },
+        span_id: if span_id.is_empty() {
+            request_span
+        } else {
+            span_id
+        },
+        // The REQUEST's start instant, not "now": it is what keeps every chunk of
+        // one body in the same Timescale chunk as the span that owns it, and what
+        // makes the row's identity derived rather than assigned — which is what
+        // makes a redelivered chunk idempotent without a dedupe table.
+        observed_at: REQUEST_STARTED_AT.with(|started| started.borrow().clone()),
+        body: http_capture::StoredBody {
+            // A 'static literal, matching `StoredBody::side`'s type — the closed
+            // vocabulary is closed on purpose, and `message` is now one of three.
+            side: "message",
+            content_type,
+            bytes: body,
+        },
+    })
 }
 
 /// PHP-callable: mark the start of a named request phase for the Timeline tab.
@@ -1398,11 +1528,35 @@ pub fn module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(chronos_pending_traceparent))
         .function(wrap_function!(chronos_child_traceparent))
         .function(wrap_function!(chronos_set_http_response_body))
+        .function(wrap_function!(chronos_store_span_body))
         .function(wrap_function!(chronos_mark_phase))
 }
 
 fn cap(value: &str, max: usize) -> String {
     spool_common::cap(value, max)
+}
+
+/// Whether a body flush that failed has already been announced by THIS process.
+static BODY_FLUSH_ANNOUNCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Report a failed body flush — once per process, never per call.
+///
+/// `spool_log::report_failure` already announces the write itself, and that is
+/// the line an operator acts on. This one exists because a body failure has a
+/// consequence the generic message cannot state: the span it belongs to still
+/// went out carrying `.stored`, so the reader will be shown a promise and then a
+/// 404. Latched separately from the spool's own latches so a request-path span
+/// failure cannot consume the body path's only line.
+fn report_body_flush(result: std::io::Result<()>) {
+    if let Err(error) = result {
+        if !BODY_FLUSH_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[chronos-ext] a stored body could not be spooled ({error}): spans in this \
+                 process may claim a payload that never arrives. Reported once per process."
+            );
+        }
+    }
 }
 
 fn monotonic_nanos() -> u128 {

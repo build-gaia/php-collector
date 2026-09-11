@@ -6,6 +6,7 @@ namespace Chronos\Collector\Framework\Laravel;
 
 use Chronos\Collector\Service\ActivityCatalog;
 use Chronos\Collector\Service\CallSite;
+use Chronos\Collector\Service\Diagnostics;
 use Chronos\Collector\Service\MessagingDestination;
 use Chronos\Collector\Service\MessagingSpan;
 use Chronos\Collector\Service\NativeExtension;
@@ -36,6 +37,18 @@ final class RequestFacts
     private const MAX_UNIQUE = 32;
 
     private const MAX_NAME = 128;
+
+    /**
+     * The largest queue payload worth `json_decode`ing to recover a reserved
+     * producer-span id.
+     *
+     * A bound rather than a guess: a job whose serialised payload is over 256 KiB
+     * is carrying data, not context, and paying a full decode per dispatch to
+     * fish one 55-byte header out of it would put a real cost on a dispatch loop.
+     * Over the bound the span still records — with a fresh id, so its consumer is
+     * unparented, which is the pre-existing behaviour and not a regression.
+     */
+    private const MAX_PAYLOAD_DECODE_BYTES = 256 * 1024;
 
     /** @var array<string, int> */
     private static array $views = [];
@@ -548,11 +561,13 @@ final class RequestFacts
                         // WHERE it went, in the normalised vocabulary: the queue
                         // name alone does not identify a stream on an estate
                         // where six vhosts each have a `products`.
+                        // Recovered from the PAYLOAD, which is the only alignment
+                        // that cannot be wrong — see reservationFromPayload.
                         MessagingSpan::published($transport, $queue, $name, array_filter(
                             MessagingDestination::forLaravelQueue($transport, $connection) + [
                                 'messaging.message.body.size' => $payloadSize === null ? '' : (string) $payloadSize,
                             ],
-                        ));
+                        ), self::reservationFromPayload($observed->payload ?? null));
                     }
                 });
             }
@@ -854,6 +869,86 @@ final class RequestFacts
      * Read only, never re-encoded: the size is evidence about a payload that
      * exists, not a reason to build one.
      */
+    /**
+     * The producer span's reserved id, read back out of the queue payload.
+     *
+     * Laravel is the only split case in this SDK: the traceparent is stamped by
+     * `QueueTelemetry::payloadContext()` during `push` (through
+     * `Queue::createPayloadUsing`), while the producer span is recorded HERE,
+     * from `JobQueued`, in a different call. Something has to carry the reserved
+     * id across that gap, and the payload is the one carrier that cannot
+     * misalign: it IS the wire, so an id read out of THIS message's payload is
+     * this message's id by construction.
+     *
+     * A park/claim FIFO between the two hooks was the obvious alternative and is
+     * deliberately rejected: it misaligns on `Queue::bulk` and on a push that
+     * throws mid-batch, and a misaligned claim gives a producer span ANOTHER
+     * message's id — a wrong parent, which is strictly worse than an orphan
+     * because it renders as a working trace.
+     *
+     * Bounded before decoding, in the cheapest order: a string, a plausible size,
+     * and the literal key present. `json_decode` on a megabyte of job payload per
+     * dispatch would be a real cost on a dispatch loop, and it is avoidable for
+     * every payload that cannot contain a reservation.
+     *
+     * Null means "record with a fresh id", exactly as before this existed — an
+     * orphaned consumer, unchanged, not a regression. It is announced once per
+     * process when the payload was not even a string, which is the version-skew
+     * case: `JobQueued::$payload` is documented as the JSON string the driver
+     * pushed (`payloadSize` already assumes it), and a driver or Laravel version
+     * that hands over an array would silently un-parent every job on the estate.
+     */
+    private static function reservationFromPayload(mixed $payload): ?\Chronos\Collector\Dto\SpanReservation
+    {
+        try {
+            if (!is_string($payload)) {
+                // Only worth a line when a reservation should have been there:
+                // outside an active request nothing was stamped in the first
+                // place, so an absent payload says nothing about skew.
+                if ($payload !== null && NativeExtension::active()) {
+                    Diagnostics::warnOnce(
+                        'laravel.queue-payload',
+                        'the JobQueued payload was '.get_debug_type($payload).' rather than a JSON '
+                        .'string, so queued jobs cannot be parented to their dispatch and will '
+                        .'appear as unrelated traces',
+                    );
+                }
+
+                return null;
+            }
+            if ($payload === '' || strlen($payload) > self::MAX_PAYLOAD_DECODE_BYTES) {
+                return null;
+            }
+            if (!str_contains($payload, '"'.QueueTelemetry::PAYLOAD_KEY.'"')) {
+                return null;
+            }
+            $decoded = json_decode($payload, true);
+            if (!is_array($decoded)) {
+                return null;
+            }
+            $traceparent = $decoded[QueueTelemetry::PAYLOAD_KEY]['traceparent'] ?? null;
+            if (!is_string($traceparent)) {
+                return null;
+            }
+            // The stamp may be TIER 2 rather than a reservation: payloadContext()
+            // falls back to the REQUEST ROOT's own traceparent when no id could be
+            // reserved. Recovering that as a reservation would record this producer
+            // span under the ROOT's span id — two different spans claiming one id in
+            // one trace, which is worse than the orphan it was trying to fix. Tier 2
+            // is already complete without a reservation: the worker parents itself to
+            // the root, and this span records with a fresh id beside it.
+            if ($traceparent === NativeExtension::traceparent()) {
+                return null;
+            }
+
+            return \Chronos\Collector\Dto\SpanReservation::fromTraceparent($traceparent);
+        } catch (Throwable) {
+            // A payload that cannot be read is a span with a fresh id, never a
+            // dispatch that failed.
+            return null;
+        }
+    }
+
     private static function payloadSize(mixed $payload): ?int
     {
         if (is_string($payload) && $payload !== '') {

@@ -55,7 +55,101 @@ namespace {
             array $attributes,
             string $status,
         ): void {
-            $GLOBALS['chronos_recorded_spans'][] = ['name' => $name, 'attributes' => $attributes];
+            $GLOBALS['chronos_recorded_spans'][] = [
+                'name' => $name,
+                'attributes' => $attributes,
+                // The span's OWN identity, which the causality cases below compare
+                // against the traceparent that went out on the wire — the whole
+                // point of a reservation is that those two are the same id.
+                'traceId' => $traceId,
+                'spanId' => $spanId,
+                'parentSpanId' => $parentSpanId,
+                'status' => $status,
+            ];
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // The rest of the native seam the new behaviour needs. Each is guarded, for
+    // the reason above: a real chronos.so already defines them and redeclaring
+    // one is a fatal. Every stub reads its answer out of $GLOBALS so a case can
+    // set the state it needs and put it back.
+    // ---------------------------------------------------------------------
+
+    $GLOBALS['chronos_traceparent'] = '';
+    $GLOBALS['chronos_stored_bodies'] = [];
+    $GLOBALS['chronos_store_answer'] = true;
+    $GLOBALS['chronos_request_ends'] = [];
+    $GLOBALS['chronos_request_open'] = false;
+
+    if (!function_exists('chronos_traceparent')) {
+        function chronos_traceparent(): string
+        {
+            return (string) ($GLOBALS['chronos_traceparent'] ?? '');
+        }
+    }
+
+    if (!function_exists('chronos_store_span_body')) {
+        function chronos_store_span_body(
+            string $traceId,
+            string $spanId,
+            string $side,
+            string $contentType,
+            string $body,
+            string $encoding,
+        ): bool {
+            $GLOBALS['chronos_stored_bodies'][] = [
+                'traceId' => $traceId,
+                'spanId' => $spanId,
+                'side' => $side,
+                'contentType' => $contentType,
+                'body' => $body,
+                'encoding' => $encoding,
+            ];
+
+            return (bool) ($GLOBALS['chronos_store_answer'] ?? true);
+        }
+    }
+
+    if (!function_exists('chronos_setting')) {
+        function chronos_setting(string $name): string
+        {
+            return $name === 'CHRONOS_PHP_ENABLED' ? '1' : '';
+        }
+    }
+
+    if (!function_exists('chronos_request_start')) {
+        function chronos_request_start(...$arguments): void
+        {
+            $GLOBALS['chronos_request_open'] = true;
+        }
+    }
+
+    if (!function_exists('chronos_request_active')) {
+        function chronos_request_active(): bool
+        {
+            return (bool) ($GLOBALS['chronos_request_open'] ?? false);
+        }
+    }
+
+    if (!function_exists('chronos_request_end')) {
+        function chronos_request_end(
+            int $status,
+            string $route = '',
+            ?string $errorType = null,
+            ?string $errorMessage = null,
+            ?string $errorStack = null,
+            ?string $errorCode = null,
+            $errorExitCode = null,
+            ?bool $handled = null,
+        ): void {
+            $GLOBALS['chronos_request_open'] = false;
+            $GLOBALS['chronos_request_ends'][] = [
+                'route' => $route,
+                'errorType' => $errorType,
+                'errorMessage' => $errorMessage,
+                'handled' => $handled,
+            ];
         }
     }
 }
@@ -123,9 +217,11 @@ namespace Chronos\Collector\Tests {
 use Bunny\Channel;
 use Bunny\Client;
 use Bunny\Message;
+use Chronos\Collector\Dto\SpanReservation;
 use Chronos\Collector\Framework\Bunny\BunnyTelemetry;
 use Chronos\Collector\Service\MessagingBody;
 use Chronos\Collector\Service\MessagingDestination;
+use Chronos\Collector\Service\MessagingFailure;
 use Chronos\Collector\Service\MessagingSpan;
 use Chronos\Collector\Service\NativeExtension;
 use Chronos\Collector\Service\Span;
@@ -624,6 +720,390 @@ $runner->test('routeName prefers the subscribed queue and never falls back to a 
     $runner->assertSame('order.created', $method->invoke(null, new Message(routingKey: 'order.created'), ''));
     $runner->assertSame('organizations', $method->invoke(null, new Message(exchange: 'organizations'), ''));
     $runner->assertSame('amqp', $method->invoke(null, new Message(), ''));
+});
+
+// ---------------------------------------------------------------------------
+// CAUSALITY: the traceparent on the wire must name a span that is really recorded.
+// ---------------------------------------------------------------------------
+
+/**
+ * Force NativeExtension's memoised `loaded` flag, and the trace context the stubbed
+ * `chronos_traceparent()` hands back.
+ *
+ * Reflection for the same reason captureBodies() uses it: no amount of environment makes
+ * `extension_loaded('chronos')` true in this process, and `loaded()` is the first gate on every
+ * seam these cases exercise. Pass null to put both back.
+ */
+function nativeRequest(?string $traceparent): void
+{
+    (new \ReflectionProperty(NativeExtension::class, 'loaded'))->setValue(null, $traceparent === null ? null : true);
+    (new \ReflectionProperty(NativeExtension::class, 'enabled'))->setValue(null, $traceparent === null ? null : true);
+    $GLOBALS['chronos_traceparent'] = $traceparent ?? '';
+    $GLOBALS['chronos_request_open'] = false;
+    // Only on SETUP. Clearing these on teardown too would wipe the very
+    // observations the case is about to assert on.
+    if ($traceparent !== null) {
+        $GLOBALS['chronos_stored_bodies'] = [];
+        $GLOBALS['chronos_request_ends'] = [];
+    }
+    SpanManager::reset();
+    MessagingFailure::reset();
+}
+
+/** A well-formed 32-hex trace id and 16-hex span id, so a real W3C header can be asserted on. */
+const TRACE_ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+const ROOT_SPAN_ID = '0102030405060708';
+const ROOT_TRACEPARENT = '00-'.TRACE_ID.'-'.ROOT_SPAN_ID.'-01';
+
+/**
+ * Run a publish with a real request open, and return both halves of the join:
+ * the AMQP headers that went to the broker, and the spans that were recorded.
+ *
+ * @return array{headers: array<string, mixed>, spans: list<array<string, mixed>>}
+ */
+function publishWithRequest(callable $publish, string $traceparent = ROOT_TRACEPARENT): array
+{
+    nativeRequest($traceparent);
+    $GLOBALS['chronos_recorded_spans'] = [];
+    $channel = new Channel();
+    SpanManager::begin(Span::open(TRACE_ID, ROOT_SPAN_ID, '', 'request'));
+    try {
+        $publish($channel);
+    } finally {
+        SpanManager::end();
+    }
+    $result = [
+        'headers' => $channel->published[0]['headers'] ?? [],
+        'spans' => $GLOBALS['chronos_recorded_spans'],
+    ];
+    nativeRequest(null);
+
+    return $result;
+}
+
+$runner->test('the traceparent on the wire names the publish span that is really recorded', function () use ($runner): void {
+    if (!spansObservable()) {
+        $runner->skip('the traceparent on the wire names the publish span', 'a real chronos extension owns the span batch here');
+
+        return;
+    }
+    // THE BUG, in one assertion. Until the reservation existed the middle field of this header
+    // was a fresh id from chronos_child_traceparent() that nothing was ever recorded under, so
+    // the consumer's root span pointed at a span that did not exist: publish and consume shared
+    // a trace id and had no parent/child edge at all.
+    $result = publishWithRequest(static function (Channel $channel): void {
+        BunnyTelemetry::publish($channel, 'x', [], 'organizations', 'order.created', vhost: 'oms');
+    });
+
+    $header = $result['headers'][BunnyTelemetry::TRACEPARENT_HEADER] ?? null;
+    $runner->assertTrue(is_string($header), 'a publish inside a request must carry a traceparent');
+    $onTheWire = SpanReservation::fromTraceparent((string) $header);
+    $runner->assertTrue($onTheWire !== null, 'the header must be a valid W3C traceparent, got '.var_export($header, true));
+    $runner->assertSame(1, count($result['spans']), 'exactly one producer span: ');
+    $span = $result['spans'][0];
+    $runner->assertSame('PUBLISH organizations', $span['name']);
+    $runner->assertSame($onTheWire->spanId, $span['spanId'], 'the wire id must BE the recorded publish span id: ');
+    $runner->assertSame(TRACE_ID, $span['traceId'], 'and it stays in the publisher trace: ');
+    // The publish span parents onto the request root, so the consumer nests one level deeper
+    // than the request rather than beside it.
+    $runner->assertSame(ROOT_SPAN_ID, $span['parentSpanId'], 'the publish span hangs off the request root: ');
+    $runner->assertSame('producer', $span['attributes']['span.kind'] ?? null);
+});
+
+$runner->test('the wire carries the publisher\'s own sampled flag, unmodified', function () use ($runner): void {
+    if (!spansObservable()) {
+        $runner->skip('the wire carries the publisher\'s own sampled flag', 'a real chronos extension owns the span batch here');
+
+        return;
+    }
+    // Propagating 00 is what makes an unsampled trace get dropped WHOLE: native start_request
+    // only re-rolls the sampling die when there is no inbound parent, so a consumer with a
+    // parent honours 00 and emits nothing. Forcing 01 would produce a half-recorded trace.
+    $result = publishWithRequest(
+        static function (Channel $channel): void {
+            BunnyTelemetry::publish($channel, 'x', [], '', 'asn-items');
+        },
+        '00-'.TRACE_ID.'-'.ROOT_SPAN_ID.'-00',
+    );
+    $header = (string) ($result['headers'][BunnyTelemetry::TRACEPARENT_HEADER] ?? '');
+    $runner->assertTrue(str_ends_with($header, '-00'), 'an unsampled publisher must propagate 00, got '.$header);
+});
+
+$runner->test('with the span budget spent the REQUEST ROOT is propagated, never a fabricated id', function () use ($runner): void {
+    if (!spansObservable()) {
+        $runner->skip('with the span budget spent the request root is propagated', 'a real chronos extension owns the span batch here');
+
+        return;
+    }
+    // Tier 2. reserve() refuses once MAX_SPANS is committed, and the fallback names the request
+    // ROOT — a span the extension always emits for a sampled request. Less precise than the
+    // publish call, still a real parent, which is the whole distinction from the old phantom.
+    nativeRequest(ROOT_TRACEPARENT);
+    $channel = new Channel();
+    SpanManager::begin(Span::open(TRACE_ID, ROOT_SPAN_ID, '', 'request'));
+    $held = [];
+    for ($i = 0; $i < 80; ++$i) {
+        $held[] = SpanManager::open('filler-'.$i);
+    }
+    $runner->assertTrue(SpanManager::reserve() === null, 'a spent budget must refuse to reserve');
+    BunnyTelemetry::publish($channel, 'x', [], '', 'asn-items');
+    SpanManager::end();
+    $header = $channel->published[0]['headers'][BunnyTelemetry::TRACEPARENT_HEADER] ?? null;
+    $runner->assertSame(ROOT_TRACEPARENT, $header, 'the degraded tier names the request root: ');
+    nativeRequest(null);
+});
+
+$runner->test('with no request open at all, no traceparent is stamped', function () use ($runner): void {
+    // Tier 3, and the rule that makes the other two trustworthy: a traceparent on the wire is a
+    // PROMISE that the span it names will be recorded, and a publisher with no open request
+    // cannot make that promise. The consumer roots its own trace, which is the honest outcome.
+    $channel = new Channel();
+    BunnyTelemetry::publish($channel, 'x', [], 'organizations', 'order.created');
+    $runner->assertSame(
+        false,
+        isset($channel->published[0]['headers'][BunnyTelemetry::TRACEPARENT_HEADER]),
+        'no open request must contribute no traceparent: ',
+    );
+    // The wait stamp is still there — it is measurable whether or not there is a trace.
+    $runner->assertTrue(
+        isset($channel->published[0]['headers'][BunnyTelemetry::ENQUEUED_AT_HEADER]),
+        'the enqueued-at stamp does not depend on there being a trace',
+    );
+});
+
+$runner->test('a caller\'s own traceparent still beats a reservation', function () use ($runner): void {
+    if (!spansObservable()) {
+        $runner->skip('a caller\'s own traceparent still beats a reservation', 'a real chronos extension owns the span batch here');
+
+        return;
+    }
+    // The `$headers + contextHeaders()` union direction is unchanged by the reservation, so an
+    // application doing its own propagation is still never silently rewritten.
+    $result = publishWithRequest(static function (Channel $channel): void {
+        BunnyTelemetry::publish($channel, 'x', ['traceparent' => '00-caller-owns-this-01'], '', 'q');
+    });
+    $runner->assertSame('00-caller-owns-this-01', $result['headers']['traceparent'] ?? null);
+});
+
+// ---------------------------------------------------------------------------
+// PAYLOAD BLOBS
+// ---------------------------------------------------------------------------
+
+$runner->test('with capture ON the whole payload is stored against the publish span and claimed', function () use ($runner): void {
+    if (!spansObservable()) {
+        $runner->skip('the whole payload is stored against the publish span', 'a real chronos extension owns the span batch here');
+
+        return;
+    }
+    captureBodies(true);
+    try {
+        // A payload well past the 16 KiB span-attribute ceiling: the preview is a stub, and the
+        // blob is the only place the rest of it can live.
+        $payload = str_repeat("\x08\x96\x01\xff\xfe", 8000);
+        $result = publishWithRequest(static function (Channel $channel) use ($payload): void {
+            BunnyTelemetry::publish($channel, $payload, [], 'organizations', 'order.created', vhost: 'oms', contentType: 'application/x-protobuf');
+        });
+        $span = $result['spans'][0];
+        $stored = $GLOBALS['chronos_stored_bodies'];
+        $runner->assertSame(1, count($stored), 'exactly one payload must be handed over: ');
+        $runner->assertSame('message', $stored[0]['side'], 'side is one value, not publish/consume: ');
+        $runner->assertSame($span['spanId'], $stored[0]['spanId'], 'the blob is keyed by the span that previews it: ');
+        $runner->assertSame($span['traceId'], $stored[0]['traceId']);
+        $runner->assertSame('application/x-protobuf', $stored[0]['contentType'], 'the DECLARED content type, never the transfer encoding: ');
+        $runner->assertSame('base64', $stored[0]['encoding']);
+        $runner->assertTrue(base64_decode($stored[0]['body'], true) !== false, 'the stored payload must decode');
+        $runner->assertTrue(
+            strlen((string) base64_decode($stored[0]['body'], true)) > strlen((string) base64_decode($span['attributes'][MessagingBody::BODY], true)),
+            'the blob must hold more than the preview, or it buys nothing',
+        );
+        $runner->assertSame('true', $span['attributes'][MessagingBody::STORED] ?? null, 'a taken payload is claimed: ');
+    } finally {
+        captureBodies(null);
+    }
+});
+
+$runner->test('a refused payload is never claimed on the span', function () use ($runner): void {
+    if (!spansObservable()) {
+        $runner->skip('a refused payload is never claimed', 'a real chronos extension owns the span batch here');
+
+        return;
+    }
+    // The bool return is the whole reason the store has one. A `.stored` marker that resolves to
+    // nothing is the single failure this store was built to prevent — the desktop would show a
+    // "load the rest" action that 404s.
+    captureBodies(true);
+    $GLOBALS['chronos_store_answer'] = false;
+    try {
+        $result = publishWithRequest(static function (Channel $channel): void {
+            BunnyTelemetry::publish($channel, str_repeat('{"a":1}', 4000), [], '', 'asn-items', contentType: 'application/json');
+        });
+        $runner->assertTrue(count($GLOBALS['chronos_stored_bodies']) >= 1, 'the payload was offered');
+        $runner->assertSame(
+            false,
+            isset($result['spans'][0]['attributes'][MessagingBody::STORED]),
+            'a refusal must not be claimed: ',
+        );
+    } finally {
+        captureBodies(null);
+        $GLOBALS['chronos_store_answer'] = true;
+    }
+});
+
+$runner->test('with capture OFF not one byte is offered to the store', function () use ($runner): void {
+    if (!spansObservable()) {
+        $runner->skip('with capture OFF not one byte is offered to the store', 'a real chronos extension owns the span batch here');
+
+        return;
+    }
+    captureBodies(false);
+    try {
+        $result = publishWithRequest(static function (Channel $channel): void {
+            BunnyTelemetry::publish($channel, str_repeat('x', 100000), [], '', 'asn-items');
+        });
+        $runner->assertSame([], $GLOBALS['chronos_stored_bodies'], 'the default posture copies nothing: ');
+        $runner->assertSame(false, isset($result['spans'][0]['attributes'][MessagingBody::STORED]));
+        // The size still survives the gate, which is what lets the desktop explain that capture
+        // is off rather than imply the message was empty.
+        $runner->assertSame('100000', $result['spans'][0]['attributes']['messaging.message.body.size'] ?? null);
+    } finally {
+        captureBodies(null);
+    }
+});
+
+$runner->test('whole() stores nothing when the allowance adds nothing over the preview', function () use ($runner): void {
+    // http_capture's own rule, and for the same reason: a blob identical to the attribute beside
+    // it costs a NATS message, a hypertable row and a round trip to say what the span already said.
+    captureBodies(true, 8192);
+    try {
+        $runner->assertSame(['', ''], MessagingBody::whole(str_repeat('x', 50000), 16384));
+        // Raise the allowance past the preview bound and the same payload IS worth storing.
+        captureBodies(true, 65536);
+        [$payload, $encoding] = MessagingBody::whole(str_repeat('x', 50000), 16384);
+        $runner->assertSame(50000, strlen($payload), 'the whole payload fits the raised allowance: ');
+        $runner->assertSame('', $encoding, 'text needs no transfer encoding: ');
+    } finally {
+        captureBodies(null);
+    }
+});
+
+$runner->test('whole() cuts binary BEFORE base64 and text on a character boundary', function () use ($runner): void {
+    captureBodies(true, 1024);
+    try {
+        // Same two rules encode() is held to, because they are the same implementation: a
+        // preview and a stored copy that disagreed about one payload would be worse than either.
+        [$binary, $encoding] = MessagingBody::whole(str_repeat("\x00\xff", 5000), 16);
+        $runner->assertSame('base64', $encoding);
+        $runner->assertTrue(strlen($binary) <= 1024, 'the ENCODED value must fit the allowance, got '.strlen($binary));
+        $runner->assertTrue(base64_decode($binary, true) !== false, 'it must still decode');
+
+        [$text] = MessagingBody::whole('{"city":"'.str_repeat('é', 2000).'"}', 16);
+        $runner->assertSame(1, preg_match('//u', $text), 'a cut text payload must still be valid UTF-8: ');
+        $runner->assertTrue(strlen($text) <= 1024, 'and must respect the byte budget, got '.strlen($text));
+    } finally {
+        captureBodies(null);
+    }
+});
+
+$runner->test('the consume side stores its payload against the request ROOT span', function () use ($runner): void {
+    captureBodies(true);
+    $GLOBALS['chronos_stored_bodies'] = [];
+    try {
+        // Empty ids on purpose: the consume preview rides the request-attribute bag, whose 8 KiB
+        // native cap is the tightest bound in this pipeline, and those values land on the ROOT.
+        // Keying the blob anywhere else would split the preview from the payload it previews.
+        $message = new Message(exchange: 'organizations', routingKey: 'order.created', headers: ['content-type' => 'application/x-protobuf'], content: str_repeat("\x08\x96\x01", 5000));
+        $method = new \ReflectionMethod(BunnyTelemetry::class, 'consumeAttributes');
+        $attributes = $method->invoke(null, $message, 'admin_oms_orders', 'admin_oms_orders', 'shared', '', microtime(true));
+
+        $stored = $GLOBALS['chronos_stored_bodies'];
+        $runner->assertSame(1, count($stored), 'the consume payload must be offered once: ');
+        $runner->assertSame('', $stored[0]['spanId'], 'empty span id means "this request\'s root": ');
+        $runner->assertSame('', $stored[0]['traceId']);
+        $runner->assertSame('message', $stored[0]['side']);
+        $runner->assertSame('base64', $stored[0]['encoding']);
+        $runner->assertSame('true', $attributes[MessagingBody::STORED] ?? null, 'and the bag claims it: ');
+    } finally {
+        captureBodies(null);
+        $GLOBALS['chronos_stored_bodies'] = [];
+    }
+});
+
+// ---------------------------------------------------------------------------
+// EXCEPTIONS: a swallowed delivery must not close as a success.
+// ---------------------------------------------------------------------------
+
+$runner->test('a delivery the application caught and acked closes as an ERROR', function () use ($runner): void {
+    nativeRequest(ROOT_TRACEPARENT);
+    try {
+        // The application's own shape: catch every Throwable, report it, return normally so the
+        // ack still runs. Before the failure slot the span closed with no error.type at all, so
+        // a failed message was indistinguishable from a successful one.
+        $boom = new \RuntimeException('protobuf decode failed');
+        $callback = BunnyTelemetry::consumer(static function (Message $message) use ($boom): string {
+            try {
+                throw $boom;
+            } catch (\Throwable $caught) {
+                MessagingFailure::note($caught);
+            }
+
+            return 'acked';
+        }, 'admin_oms_orders', 'shared');
+
+        $runner->assertSame('acked', $callback(new Message()), 'the handler still returns normally, so the ack still runs: ');
+        $ends = $GLOBALS['chronos_request_ends'];
+        $runner->assertSame(1, count($ends), 'exactly one request end: ');
+        $runner->assertSame('RuntimeException', $ends[0]['errorType'], 'the span must carry the error identity: ');
+        $runner->assertSame('protobuf decode failed', $ends[0]['errorMessage']);
+        // handled = true: the throwable never reached the transport. That is what separates
+        // "failed and was swallowed" from "failed and killed the consumer" — only the second
+        // stops a queue.
+        $runner->assertSame(true, $ends[0]['handled']);
+    } finally {
+        nativeRequest(null);
+    }
+});
+
+$runner->test('a successful delivery still closes clean, and the slot never leaks forward', function () use ($runner): void {
+    nativeRequest(ROOT_TRACEPARENT);
+    try {
+        // The slot is a static inside a long-lived worker, so a failure nobody took would be
+        // attributed to the NEXT message — a green delivery reported as red, which is worse than
+        // the bug the slot fixes.
+        MessagingFailure::note(new \RuntimeException('from a previous delivery'));
+        $callback = BunnyTelemetry::consumer(static fn (Message $message): string => 'ok', 'admin_oms_orders');
+        $runner->assertSame('ok', $callback(new Message()));
+        $ends = $GLOBALS['chronos_request_ends'];
+        $runner->assertSame(1, count($ends), 'exactly one request end: ');
+        // array_key_exists, not `??`: the value under test IS null, which `??`
+        // cannot tell apart from an absent key.
+        $runner->assertTrue(array_key_exists('errorType', $ends[0]), 'the end was recorded');
+        $runner->assertSame(null, $ends[0]['errorType'], 'a clean delivery reports no error: ');
+    } finally {
+        nativeRequest(null);
+    }
+});
+
+$runner->test('a tier-2 stamp is never recovered as a reservation (it would duplicate the root span id)', function () use ($runner): void {
+    // The one way the two tiers could collide. payloadContext() falls back to the REQUEST
+    // ROOT's own traceparent when nothing could be reserved, and recovering THAT as a
+    // reservation would record the producer span under the root's span id — two different spans
+    // claiming one id in one trace, which is worse than the orphan it was trying to fix.
+    // Tier 2 needs no reservation: the worker parents itself to the root, and the producer span
+    // records with a fresh id beside it.
+    nativeRequest(ROOT_TRACEPARENT);
+    try {
+        $method = new \ReflectionMethod(\Chronos\Collector\Framework\Laravel\RequestFacts::class, 'reservationFromPayload');
+        $tierTwo = json_encode(['chronos' => ['traceparent' => ROOT_TRACEPARENT]]);
+        $runner->assertTrue($method->invoke(null, $tierTwo) === null, 'the request root must not be recovered as a publish-span reservation');
+
+        // A genuine reservation in the same request still comes back.
+        $reserved = '00-'.TRACE_ID.'-99aabbccddeeff00-01';
+        $recovered = $method->invoke(null, json_encode(['chronos' => ['traceparent' => $reserved]]));
+        $runner->assertTrue($recovered !== null, 'a real reservation is still recovered');
+        $runner->assertSame('99aabbccddeeff00', $recovered->spanId);
+    } finally {
+        nativeRequest(null);
+    }
 });
 
 $runner->exit();

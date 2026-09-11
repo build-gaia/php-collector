@@ -4,13 +4,17 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Bunny;
 
+use Chronos\Collector\Dto\SpanReservation;
+use Chronos\Collector\Service\Diagnostics;
 use Chronos\Collector\Service\MessagingBody;
 use Chronos\Collector\Service\MessagingDestination;
+use Chronos\Collector\Service\MessagingFailure;
 use Chronos\Collector\Service\MessagingSpan;
 use Chronos\Collector\Service\MessagingWait;
 use Chronos\Collector\Service\NativeExtension;
 use Chronos\Collector\Service\Propagation;
 use Chronos\Collector\Service\Span;
+use Chronos\Collector\Service\SpanManager;
 use Throwable;
 
 /**
@@ -153,11 +157,24 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
             string $contentType = '',
             string $server = '',
         ): mixed {
+            // The publish span's id is minted HERE, before anything reaches the
+            // broker, and recorded under that same id after the send returns.
+            // That ordering is the whole fix: the header has to be on the wire
+            // before the publish, while the span may only be recorded once the
+            // publish has happened, and the id is what bridges the two instants.
+            // Until this existed the wire carried an id nothing was ever recorded
+            // under, so every consumer of this message was an orphan.
+            //
+            // If $channel->publish() throws below, the reservation is simply
+            // never spent: nothing reached the broker, so no consumer can
+            // reference it.
+            $reservation = SpanManager::reserve();
+
             // Union, not array_merge and not a merge in the other direction: a
             // caller that already set its own `traceparent` WINS. Instrumentation
             // silently rewriting an application's own propagation would be the
             // worst kind of bug — it would look like a working trace.
-            $headers = $headers + self::contextHeaders();
+            $headers = $headers + self::contextHeaders($reservation);
 
             // Declaring a content type to the span but not to the BROKER would
             // leave the two halves of every stream disagreeing: the publish span
@@ -196,15 +213,36 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
                 // honestly rather than in Span::cap() where it cannot.
                 $extra += MessagingBody::encode($payload, Span::MAX_TEXT_LENGTH);
 
+                // The same payload cut only to the operator's allowance, for the
+                // span-body store. `['', '']` when capture is off, when the
+                // allowance adds nothing over the preview above, or when there is
+                // no payload — so the common case hands over nothing at all.
+                [$whole, $wholeEncoding] = MessagingBody::whole($payload, Span::MAX_TEXT_LENGTH);
+
                 MessagingSpan::published(
                     self::SYSTEM,
                     $destination[MessagingDestination::NAME] ?? '',
                     $messageName,
                     $extra,
+                    $reservation,
+                    $whole,
+                    $wholeEncoding,
                 );
-            } catch (Throwable) {
+            } catch (Throwable $error) {
                 // The message is already gone. Nothing that happens while
                 // describing it may reach the caller.
+                //
+                // Announced once per process, though: the send SUCCEEDED and its
+                // producer span was lost, so the trace is missing exactly the
+                // half that makes it a topology edge — and because the consumer
+                // is now parented to the reserved id, it is an orphan again. An
+                // operator chasing "the publish side never appears" would
+                // otherwise have nothing at all to go on.
+                self::warn(
+                    'bunny.publish-span',
+                    'a RabbitMQ publish succeeded but its producer span could not be '
+                    .'recorded, so its consumer will appear unparented: '.$error->getMessage(),
+                );
             }
 
             return $result;
@@ -295,14 +333,32 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
                     if (NativeExtension::enabled() && !NativeExtension::active()) {
                         $opened = self::openMessage($message, $queue, $name);
                     }
-                } catch (Throwable) {
+                } catch (Throwable $error) {
+                    // Announced once per process, and it is the most expensive
+                    // silent failure in this file: a throw part-way through
+                    // requestStart can leave a native request OPEN, and every
+                    // later delivery on this worker is then swallowed into that
+                    // one trace until the process dies. An operator seeing one
+                    // enormous trace containing thousands of unrelated messages
+                    // has no other clue where it came from.
+                    self::warn(
+                        'bunny.open-message',
+                        'opening a traced request for a RabbitMQ delivery failed; later '
+                        .'deliveries may be folded into one trace: '.$error->getMessage(),
+                    );
                     try {
                         if (NativeExtension::active()) {
                             NativeExtension::requestEnd(0, $name);
                         }
-                    } catch (Throwable) {
+                    } catch (Throwable $closing) {
                         // Nothing left to try. The process is in a state this
                         // bridge cannot repair, and the message still has to run.
+                        self::warn(
+                            'bunny.open-message-recovery',
+                            'a RabbitMQ delivery left a Chronos request open that could not be '
+                            .'closed; this worker\'s traces are unreliable until it restarts: '
+                            .$closing->getMessage(),
+                        );
                     }
                     $opened = false;
                 }
@@ -312,6 +368,14 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
                 }
 
                 $enqueuedAt = self::header($message, self::ENQUEUED_AT_HEADER);
+
+                // Cleared BEFORE the fail-open block below, not inside it. The
+                // slot is a static on a worker that runs for hours, so a failure
+                // nobody took would be attributed to the NEXT message — and the
+                // block below can throw (consumeAttributes reads the message,
+                // jobStarted crosses the FFI), which would skip the clear on
+                // exactly the delivery whose instrumentation already misbehaved.
+                self::resetFailure();
 
                 try {
                     $attributes = self::consumeAttributes($message, $name, $queue, $vhost, $server, $startedAt);
@@ -359,10 +423,27 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
                 }
 
                 self::flushRequestFacts();
+                // A delivery the application caught, reported and then ACKED did
+                // not succeed, and until this was read the span said it had: no
+                // error.type, no error.message, isError false. The handler
+                // returned normally — the ack still runs, propagation is
+                // untouched — so the only thing that changes is the span's
+                // status, which is the honest description of what happened.
+                //
+                // $handled = true, matching ExceptionCapture's idiom: the
+                // throwable never reached the transport, the application caught
+                // it. That is what separates "failed and was swallowed" from
+                // "failed and killed the consumer" — only the second stops a
+                // queue.
+                $failure = self::takeFailure();
                 // Zero, not 200: a consumed message has no HTTP status, and
                 // borrowing one would put a number in the column that means
                 // something it does not mean.
-                NativeExtension::requestEnd(0, $name);
+                if ($failure !== null) {
+                    NativeExtension::requestEnd(0, $name, $failure, true);
+                } else {
+                    NativeExtension::requestEnd(0, $name);
+                }
 
                 return $result;
             };
@@ -419,12 +500,85 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
         }
 
         /**
+         * Whether the Service/ siblings this bridge leans on are actually present.
+         *
+         * Cached class_exists, and NOT a formality. The estate installs this SDK
+         * by copying api/src into each service's vendor tree, so version skew
+         * ACROSS FILES is the normal state rather than an edge case — one service
+         * was observed carrying this bridge with neither Diagnostics nor
+         * MessagingFailure beside it. An unguarded static call would then raise
+         * `Error: Class not found` from a spot outside every try/catch: after the
+         * handler had already returned (so the ack never runs and the queue
+         * stops), or from inside publish()'s catch AFTER the send succeeded (so
+         * the application retries a message that was already delivered). Both are
+         * telemetry deciding what happens to a message.
+         */
+        private static ?bool $diagnostics = null;
+
+        private static ?bool $failures = null;
+
+        /** Announce a lost span once per process, or stay silent if it cannot. */
+        private static function warn(string $key, string $message): void
+        {
+            try {
+                if (self::$diagnostics ??= class_exists(Diagnostics::class)) {
+                    Diagnostics::warnOnce($key, $message);
+                }
+            } catch (Throwable) {
+                // A diagnostic that throws is worse than a missing diagnostic.
+            }
+        }
+
+        /** The throwable an application caught for this delivery, if any. */
+        private static function takeFailure(): ?Throwable
+        {
+            try {
+                if (self::$failures ??= class_exists(MessagingFailure::class)) {
+                    return MessagingFailure::take();
+                }
+            } catch (Throwable) {
+            }
+
+            return null;
+        }
+
+        /** Clear any failure left by an earlier delivery on this worker. */
+        private static function resetFailure(): void
+        {
+            try {
+                if (self::$failures ??= class_exists(MessagingFailure::class)) {
+                    MessagingFailure::reset();
+                }
+            } catch (Throwable) {
+            }
+        }
+
+        /**
          * The W3C context and the enqueued-at stamp, as AMQP application headers.
          *
-         * A CHILD traceparent, not the publisher's own: the consumed message is
-         * caused by this request but is not part of it, so it hangs beneath the
-         * publish rather than claiming to be the same span — the same shape an
-         * outbound HTTP call gets.
+         * The RESERVED PUBLISH SPAN's traceparent, so the consumed message hangs
+         * beneath the publish itself — the same shape an outbound HTTP call gets,
+         * and now genuinely so. This used to call
+         * `NativeExtension::childTraceparent()`, which mints an id that no span
+         * is ever recorded under: the consumer parented itself to a span that did
+         * not exist, so publish and consume shared a trace id and had no edge
+         * between them at all.
+         *
+         * Three tiers, and the third is the one that makes the other two
+         * trustworthy — a traceparent on the wire is a PROMISE that the span it
+         * names will be recorded:
+         *
+         *   1. A reservation: propagate it, and `published()` records the publish
+         *      span under that exact id.
+         *   2. No reservation but a request IS open (a capacity-bound stack, a
+         *      void top): propagate `NativeExtension::traceparent()`, the REQUEST
+         *      ROOT's own. That is a legitimate parent, not a phantom — the root
+         *      is always emitted for a sampled request — so the consumer nests
+         *      under the publishing request rather than under the publish call.
+         *      Less precise, still true.
+         *   3. Neither (a scheduled command that never opened a request): no
+         *      traceparent at all. The consumer roots its own trace, which is the
+         *      honest outcome. An id is never fabricated.
          *
          * tracestate and baggage ride along because W3C requires a participant
          * that forwards traceparent to forward tracestate it does not understand,
@@ -444,11 +598,11 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
          *
          * @return array<string, string>
          */
-        private static function contextHeaders(): array
+        private static function contextHeaders(?SpanReservation $reservation = null): array
         {
             try {
                 $headers = [self::ENQUEUED_AT_HEADER => \sprintf('%.6F', \microtime(true))];
-                $traceparent = NativeExtension::childTraceparent();
+                $traceparent = $reservation?->header() ?? NativeExtension::traceparent();
                 if (is_string($traceparent) && $traceparent !== '') {
                     $headers[self::TRACEPARENT_HEADER] = $traceparent;
                 }
@@ -534,6 +688,16 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
             // where `.truncated` cannot be set, and an oversized body would
             // arrive looking complete.
             $attributes += MessagingBody::encode($content, 8192);
+            // The consume side is where the blob store earns the most: that 8192
+            // is the tightest bound anywhere in this pipeline, so a payload of
+            // any size arrives as a stub. Empty ids on purpose — the blob is then
+            // keyed by the CONSUMER REQUEST's ROOT span, which is the span the
+            // request-attribute bag's values land on, and keeping the preview and
+            // the payload on one span is the invariant the whole store rests on.
+            [$whole, $wholeEncoding] = MessagingBody::whole($content, 8192);
+            if ($whole !== '' && NativeExtension::storeSpanBody('', '', 'message', $contentType, $whole, $wholeEncoding)) {
+                $attributes[MessagingBody::STORED] = 'true';
+            }
 
             // setRequestAttributes drops non-scalars but not empty strings, and
             // absent-never-guessed means an empty fact is no fact.

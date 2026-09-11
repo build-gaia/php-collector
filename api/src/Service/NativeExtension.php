@@ -101,20 +101,25 @@ final class NativeExtension
     /**
      * Whether captured message PAYLOADS are wanted at all.
      *
-     * Deliberately not modelled on `httpCapturing()`, which is a per-request
-     * sampling probe and answers TRUE against an older extension that lacks it
-     * (capture was unconditional there, so true preserved the old behaviour).
-     * This is a process-level operator decision, and its safe direction is the
-     * other one: DEFAULT FALSE, so an older .so with no `chronos_setting()` —
-     * and any deployment that simply has not set the flag — ships no payloads.
-     * For a body, an unset setting must mean "do not send it", never "send it
-     * because nobody said otherwise".
+     * ON whenever the collector is on, and OFF only when an operator says so.
      *
-     * `messaging_capture_bodies` defaults off where `http_capture_bodies`
-     * defaults on because an inter-service payload is a data-sharing decision
-     * the operator has not already made by installing an APM agent, and no
-     * field-level masking applies to a body on either path — see
-     * [`MessagingBody`].
+     * This used to default OFF, on the reasoning that an inter-service payload
+     * is a data-sharing decision an operator had not already made. That reasoning
+     * was wrong about what tracing IS. A message body is the single fact that
+     * makes a messaging span answer the question it exists to answer — what
+     * crossed the boundary — and a span that records only that 1,676 bytes went
+     * somewhere is a span that cost the same to collect and tells you nothing.
+     * The same argument would leave `db.statement` off, and nobody argues that.
+     *
+     * So the gate is now the one the operator ALREADY set: turning APM on is the
+     * decision to collect what a trace is made of. An explicitly false
+     * `CHRONOS_PHP_MESSAGING_CAPTURE_BODIES` still switches payloads off for a
+     * service handling data it does not want leaving the process, and
+     * `_MAX_BODY` still bounds how much of each is kept.
+     *
+     * Note what is unchanged: nothing on this path is field-redacted, on either
+     * the HTTP or the messaging side — see [`MessagingBody`]. The bound is the
+     * size cap and the operator's off switch, not a masking pass.
      */
     public static function messagingCapturing(): bool
     {
@@ -123,11 +128,12 @@ final class NativeExtension
         }
         if (self::$messagingCapture === null) {
             $value = function_exists('chronos_setting')
-                ? \chronos_setting('CHRONOS_PHP_MESSAGING_CAPTURE_BODIES')
+                ? strtolower(trim(\chronos_setting('CHRONOS_PHP_MESSAGING_CAPTURE_BODIES')))
                 : '';
-            // The same truthiness list enabled() uses, so one spelling rule
-            // covers every boolean setting an operator can write.
-            self::$messagingCapture = in_array(strtolower($value), ['1', 'true', 'yes', 'on'], true);
+            // Unset means ON, so the test is for an explicit off. The falsey list
+            // mirrors the truthy one enabled() uses, so one spelling rule covers
+            // every boolean setting an operator can write — in both directions.
+            self::$messagingCapture = !in_array($value, ['0', 'false', 'no', 'off'], true);
         }
 
         return self::$messagingCapture;
@@ -244,8 +250,18 @@ final class NativeExtension
                     return;
                 }
             }
-        } catch (\Throwable) {
-            // A broken manifest must never take down the application.
+        } catch (\Throwable $error) {
+            // A broken manifest must never take down the application — but it
+            // must not be invisible either. The manifest is an OPERATOR-supplied
+            // PHP file, and a failed require means their trace allowlist is
+            // silently not in effect: every method they asked to be traced simply
+            // never appears, which reads as a broken collector rather than a
+            // broken file.
+            Diagnostics::warnOnce(
+                'manifest',
+                'the instrumentation manifest could not be loaded, so no userland '
+                .'trace allowlist is in effect: '.$error->getMessage(),
+            );
         }
     }
 
@@ -662,6 +678,48 @@ final class NativeExtension
     }
 
     /**
+     * Hand the collector a whole message payload, keyed by the span that previews
+     * it, and report whether it was taken.
+     *
+     * Reuses the HTTP body store rather than inventing a second one: the same
+     * `chronos.tracing.span-body.v1` documents, the same `(trace, span, side)`
+     * key, the same chunking and the same read route — so the desktop's existing
+     * "load the rest" path serves a message payload with no new plumbing. `$side`
+     * is `message`: one value, not `publish`/`consume`, because the two sides are
+     * different span ids in the same trace and the direction is already on the
+     * span as `messaging.operation`.
+     *
+     * Empty `$traceId`/`$spanId` mean "this request's root span" — what the
+     * consume side wants, since its preview rides the request-attribute bag and
+     * therefore lands on the root. The publish side passes its own span's ids.
+     *
+     * The BOOL is the whole reason this returns anything. A caller may only stamp
+     * `messaging.message.body.stored` when it is true, so the marker can never
+     * out-promise the store. False on an older .so that has no such function —
+     * probed with `function_exists`, not assumed from `loaded()`, because this
+     * SDK release can be deployed against an extension that predates it.
+     */
+    public static function storeSpanBody(
+        string $traceId,
+        string $spanId,
+        string $side,
+        string $contentType,
+        string $body,
+        string $encoding,
+    ): bool {
+        if (!self::loaded() || !function_exists('chronos_store_span_body')) {
+            return false;
+        }
+        try {
+            return \chronos_store_span_body($traceId, $spanId, $side, $contentType, $body, $encoding) === true;
+        } catch (\Throwable) {
+            // Fail open, and fail HONEST: a payload that could not be handed over
+            // is a payload nothing may claim to have stored.
+            return false;
+        }
+    }
+
+    /**
      * Get the outbound traceparent header for downstream propagation.
      */
     public static function traceparent(): ?string
@@ -674,8 +732,22 @@ final class NativeExtension
     }
 
     /**
-     * Get a child traceparent for manual outbound propagation (e.g. queue
-     * messages, custom HTTP clients).
+     * Get a child traceparent for an outbound CURL call — and nothing else.
+     *
+     * HTTP-ONLY, and unsafe for messaging, which is the opposite of what this
+     * docblock used to say. The span id in the middle field is minted fresh by
+     * the extension and NO SPAN IS EVER RECORDED UNDER IT: a callee that parents
+     * itself to it becomes an orphan sharing only a trace id with its caller. On
+     * the curl path that is harmless, because the native observer overwrites it —
+     * `merge_propagation_headers` strips every existing `traceparent:` off
+     * `CURLOPT_HTTPHEADER` and pushes the curl frame's own span id, which IS
+     * emitted — so what comes back here is a placeholder.
+     *
+     * A queue message has no such second chance: it crosses a process boundary,
+     * nothing corrects the header afterwards, and the consumer keeps the phantom
+     * as its parent forever. Messaging propagation therefore reserves a REAL
+     * publish span id — `SpanManager::reserve()` and `Dto\SpanReservation` — and
+     * records the publish span under it.
      */
     public static function childTraceparent(): ?string
     {

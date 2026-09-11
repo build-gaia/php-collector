@@ -160,10 +160,50 @@ namespace Symfony\Component\Messenger\Exception {
     }
 }
 
+namespace {
+    // The native seam, only as far as the causality case below needs it. Guarded
+    // because a real chronos.so already defines these and redeclaring one is a
+    // fatal; every answer is read out of $GLOBALS so a case can set the state it
+    // needs and put it back.
+    $GLOBALS['chronos_recorded_spans'] = [];
+    $GLOBALS['chronos_traceparent'] = '';
+
+    if (!function_exists('chronos_record_span')) {
+        function chronos_record_span(
+            string $traceId,
+            string $spanId,
+            string $parentSpanId,
+            string $name,
+            string $startedAt,
+            string $endedAt,
+            array $attributes,
+            string $status,
+        ): void {
+            $GLOBALS['chronos_recorded_spans'][] = [
+                'name' => $name,
+                'traceId' => $traceId,
+                'spanId' => $spanId,
+                'parentSpanId' => $parentSpanId,
+            ];
+        }
+    }
+
+    if (!function_exists('chronos_traceparent')) {
+        function chronos_traceparent(): string
+        {
+            return (string) ($GLOBALS['chronos_traceparent'] ?? '');
+        }
+    }
+}
+
 namespace Chronos\Collector\Tests {
 
+use Chronos\Collector\Dto\SpanReservation;
 use Chronos\Collector\Framework\Messenger\ChronosMiddleware;
 use Chronos\Collector\Framework\Messenger\ChronosTraceparentStamp;
+use Chronos\Collector\Service\NativeExtension;
+use Chronos\Collector\Service\Span;
+use Chronos\Collector\Service\SpanManager;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\HandlerFailedException;
 use Symfony\Component\Messenger\Middleware\MiddlewareInterface;
@@ -254,6 +294,12 @@ final class Runner
             $actualText = is_scalar($actual) || $actual === null ? var_export($actual, true) : get_debug_type($actual);
             throw new \RuntimeException("{$context}expected {$expectedText}, got {$actualText}");
         }
+    }
+
+    /** Report a case as not run, with the reason — never as a pass. */
+    public function skip(string $name, string $why): void
+    {
+        fwrite(STDOUT, "SKIP {$name}: {$why}\n");
     }
 
     public function exit(): never
@@ -421,6 +467,49 @@ $runner->test('unwrap leaves a plain exception alone', function () use ($runner)
     $plain = new \RuntimeException('plain');
 
     $runner->assertTrue(invokePrivateStatic('unwrap', $plain) === $plain, 'unwrap must leave a plain exception untouched');
+});
+
+$runner->test('the stamped traceparent names the producer span that is really recorded', function () use ($runner): void {
+    if (\extension_loaded('chronos') || \extension_loaded('chronos-ext')) {
+        $runner->skip('the stamped traceparent names the producer span', 'a real chronos extension owns the span batch here');
+
+        return;
+    }
+    // Messenger had the identical phantom-parent bug and for the identical reason: the stamp
+    // carried NativeExtension::childTraceparent(), an id no span is ever recorded under, so a
+    // consumed message parented itself to nothing. ChronosTraceparentStamp itself needed no
+    // change — it was always just carrying a traceparent string; only the VALUE was wrong.
+    $traceId = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+    $rootSpanId = '0102030405060708';
+    $GLOBALS['chronos_traceparent'] = '00-'.$traceId.'-'.$rootSpanId.'-01';
+    $GLOBALS['chronos_recorded_spans'] = [];
+    (new \ReflectionProperty(NativeExtension::class, 'loaded'))->setValue(null, true);
+    SpanManager::begin(Span::open($traceId, $rootSpanId, '', 'request'));
+
+    try {
+        $middleware = new ChronosMiddleware();
+        $envelope = new Envelope(new FakeMessage());
+        // The SentStamp is what proves a transport accepted the message. Its gate is unchanged
+        // and must stay: a bus that handled the dispatch synchronously in-process crossed no
+        // boundary and gets no producer span.
+        $sent = $envelope->with(new SentStamp(FakeMessage::class, 'async'));
+        $inner = new RecordingMiddleware($sent);
+        $middleware->handle($envelope, new FakeStack($inner));
+
+        $stamp = $inner->seen?->last(ChronosTraceparentStamp::class);
+        $runner->assertTrue($stamp instanceof ChronosTraceparentStamp, 'the envelope must be stamped before the send');
+        $onTheWire = SpanReservation::fromTraceparent($stamp->getTraceparent());
+        $runner->assertTrue($onTheWire !== null, 'the stamp must be a valid W3C traceparent, got '.$stamp->getTraceparent());
+        $spans = $GLOBALS['chronos_recorded_spans'];
+        $runner->assertSame(1, count($spans), 'exactly one producer span: ');
+        $runner->assertSame($onTheWire->spanId, $spans[0]['spanId'], 'the stamped id must BE the recorded span id: ');
+        $runner->assertSame($traceId, $spans[0]['traceId']);
+        $runner->assertSame($rootSpanId, $spans[0]['parentSpanId'], 'the producer span hangs off the dispatching request: ');
+    } finally {
+        SpanManager::end();
+        (new \ReflectionProperty(NativeExtension::class, 'loaded'))->setValue(null, null);
+        $GLOBALS['chronos_traceparent'] = '';
+    }
 });
 
 $runner->exit();

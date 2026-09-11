@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Chronos\Collector\Service;
 
 use Chronos\Collector\Dto\SpanRecord;
+use Chronos\Collector\Dto\SpanReservation;
 use Throwable;
 
 /**
@@ -23,6 +24,17 @@ final class SpanManager
 
     /** @var list<SpanRecord> */
     private static array $finished = [];
+
+    /**
+     * Span ids handed out by [`reserve`] and not yet spent by [`openReserved`].
+     *
+     * It counts toward MAX_SPANS exactly as an open or finished span does, which
+     * is the whole point: re-checking the cap when the span is finally RECORDED
+     * could refuse a span whose id is already on the wire, recreating the orphan
+     * this mechanism exists to remove. Holding the slot at reservation time keeps
+     * the 64-span ceiling honest and guarantees that an id which shipped is an id
+     * that gets recorded.
+     */
 
     public static function begin(Span $root): void
     {
@@ -47,6 +59,10 @@ final class SpanManager
         $finished = self::$finished;
         self::$stack = [];
         self::$finished = [];
+        // A reservation that outlived its request was never recorded. Releasing
+        // the slot here is what stops one leaked publish (a send that threw, a
+        // Laravel payload the driver rewrote) from permanently shrinking the next
+        // request's span budget inside the same FPM worker.
 
         return $finished;
     }
@@ -94,6 +110,123 @@ final class SpanManager
         self::$stack[] = $child;
 
         return $child;
+    }
+
+    /**
+     * Reserve the id a span will be recorded under, before that span exists.
+     *
+     * The messaging bridges need this because the two halves of a publish happen
+     * at different instants and in that order: the trace context must be on the
+     * wire BEFORE the send, and the publish span must be recorded strictly AFTER
+     * it (`MessagingSpan::published()` reports a send that already happened, and
+     * recording it first would claim a publish that had not). So the ID is
+     * allocated here, put on the wire, and spent by [`openReserved`] once the
+     * send has returned.
+     *
+     * Minted in PHP, with NO new native function, for two reasons. The .so is
+     * deployed independently of the composer package — baked into images,
+     * installed per host — so a fix needing a new `chronos_*` function would be
+     * gated on rebuilding and redeploying the extension across an estate, for a
+     * defect that is entirely PHP-side. And it is not expressible natively
+     * anyway: the publish span's parent is the top of THIS stack, which the
+     * native observer's own span stack knows nothing about.
+     *
+     * Returns null in exactly the cases where no span could have been recorded —
+     * no request open (so `top()` cannot even seed from the native context), a
+     * void top, or the span budget spent. A null answer is a signal to the
+     * caller, not a failure: it means propagate the request root's traceparent
+     * or nothing, never a fabricated id.
+     */
+    public static function reserve(): ?SpanReservation
+    {
+        $top = self::top();
+        if ($top === null || $top->isVoid()) {
+            return null;
+        }
+        // The cap is checked HERE and nowhere else, and no slot is held.
+        //
+        // A held slot leaked: only openReserved() released it, and a reservation
+        // is legitimately abandoned on several paths — RequestFacts cannot
+        // recover the id from a payload over its decode ceiling, from a tier-2
+        // stamp, or from any decode failure, and MessagingSpan then takes the
+        // plain open() branch. A request dispatching many such jobs exhausted the
+        // counter and silently lost publish spans for the rest of itself, which
+        // is the failure the reservation exists to prevent.
+        //
+        // Checking only here is the right trade: refusing at reserve() time
+        // means no id goes on the wire, so the caller falls back to the request
+        // root's traceparent — a real parent, one step less precise. Refusing at
+        // record time would strand an id that had already shipped. The window
+        // between the two calls can overshoot MAX_SPANS by the number of
+        // concurrent reservations, which is a soft guard overshooting slightly
+        // rather than a budget that stops working.
+        if (count(self::$stack) + count(self::$finished) >= self::MAX_SPANS) {
+            return null;
+        }
+
+        return new SpanReservation($top->traceId, TraceContext::newSpanId(), self::sampled());
+    }
+
+    /**
+     * Open the span a reservation promised, under the id that already went out.
+     *
+     * DETACHED, never pushed onto the stack, for the reason [`openDetached`]
+     * gives at greater length: a publish span is zero-duration and finishes
+     * immediately, and a pushed span that never finished would re-parent
+     * everything opened after it.
+     *
+     * Constructed UNCONDITIONALLY — the cap was already paid at reservation time
+     * — because the alternative is to refuse a span whose id is on the wire,
+     * which is the orphan this whole mechanism removes. The parent is resolved
+     * afresh from the current top rather than remembered: a reservation carries
+     * an identity, not a position, and the enclosing span is whatever is open
+     * when the publish is finally described.
+     */
+    public static function openReserved(SpanReservation $reservation, string $name): Span
+    {
+        return Span::open(
+            $reservation->traceId,
+            $reservation->spanId,
+            self::top()?->id ?? '',
+            $name,
+        );
+    }
+
+    /**
+     * The reservation shape of a span that is ALREADY open.
+     *
+     * For the one HTTP site that records its own client span and must propagate
+     * that span's real id (Laravel's Http-facade hook): there is nothing to
+     * reserve there, the span exists, but the traceparent still has to be built
+     * with the request's real sampled flag rather than a hardcoded `01`. Reusing
+     * this type keeps one spelling of the header in the SDK instead of two.
+     */
+    public static function reservationOf(Span $span): SpanReservation
+    {
+        return new SpanReservation($span->traceId, $span->id, self::sampled());
+    }
+
+    /**
+     * This request's sampling decision, as the flag that goes on the wire.
+     *
+     * Read from the native traceparent's last segment, because that string is the
+     * one place the two facts PHP cannot mint itself already live — it is exactly
+     * what [`seedFromNative`] parses for the trace id. The pure-PHP path falls
+     * back to the ambient context, and a request with neither is treated as
+     * sampled: propagating `00` for a request whose decision is unknown would
+     * silence a downstream service that was recording perfectly well.
+     */
+    private static function sampled(): bool
+    {
+        $traceparent = NativeExtension::traceparent();
+        if (is_string($traceparent)) {
+            $parts = explode('-', $traceparent);
+            if (count($parts) === 4 && strlen($parts[3]) === 2 && ctype_xdigit($parts[3])) {
+                return (hexdec($parts[3]) & 1) === 1;
+            }
+        }
+
+        return TraceContext::ambient()?->sampled ?? true;
     }
 
     public static function complete(Span $span): void
