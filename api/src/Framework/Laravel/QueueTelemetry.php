@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Laravel;
 
+use Chronos\Collector\Service\MessagingBody;
 use Chronos\Collector\Service\MessagingDestination;
 use Chronos\Collector\Service\MessagingWait;
 use Chronos\Collector\Service\NativeExtension;
@@ -238,7 +239,7 @@ final class QueueTelemetry
             NativeExtension::suppressNative('cache');
             ChronosViewEngine::resetRequestState();
             ExceptionCapture::reset();
-            $attributes = self::jobAttributes($event, $job, $name, $payload, $startedAt);
+            $attributes = self::jobAttributes($event, $job, $name, $payload, $startedAt, self::jobRawBody($job));
             NativeExtension::setRequestAttributes($attributes);
             // Announced AFTER requestStart, never before: the marker's whole job
             // is to name the span that will later close it, and that span does
@@ -316,6 +317,7 @@ final class QueueTelemetry
      * the producer and consumer halves of one queue join on the same keys.
      *
      * @param array<string, mixed> $payload the message as the broker carried it
+     * @param string $rawBody the job's undecoded wire payload — see [`jobRawBody`]
      *
      * @return array<string, string>
      */
@@ -325,6 +327,7 @@ final class QueueTelemetry
         string $name,
         array $payload,
         float $startedAt,
+        string $rawBody = '',
     ): array {
         $attributes = [
             'span.kind' => 'consumer',
@@ -364,6 +367,32 @@ final class QueueTelemetry
                     $attributes['messaging.message.attempt'] = (string) $attempts;
                 }
             }
+            // Stated, not sniffed: a queue payload is always what
+            // Queue::createPayload() produced, i.e. json_encode() over the job —
+            // the same fact the publish side now states in
+            // RequestFacts::queuePublishExtra().
+            if ($rawBody !== '') {
+                $attributes['messaging.protocol'] = 'json';
+                $attributes['messaging.message.body.content_type'] = 'application/json';
+            }
+            // 8192, not Span::MAX_TEXT_LENGTH: this bag is what
+            // NativeExtension::setRequestAttributes() carries it into, and that
+            // native cap (request_attributes.rs MAX_VALUE_BYTES) is 8 KiB — the
+            // same bound BunnyTelemetry::consumeAttributes() encodes against, for
+            // the same reason: a preview cut anywhere looser would arrive at the
+            // native side already truncated, where `.truncated` cannot be set.
+            $attributes += MessagingBody::encode($rawBody, 8192);
+            // The consume side is where the blob store earns the most: 8192 is
+            // the tightest bound anywhere in this pipeline, so a payload of any
+            // size otherwise arrives as a stub. Empty ids on purpose — see
+            // NativeExtension::storeSpanBody's own docblock — the blob is then
+            // keyed by the CONSUMER REQUEST's ROOT span, the span these
+            // attributes land on, mirroring BunnyTelemetry::consumeAttributes()
+            // exactly.
+            [$whole, $wholeEncoding] = MessagingBody::whole($rawBody, 8192);
+            if ($whole !== '' && NativeExtension::storeSpanBody('', '', 'message', 'application/json', $whole, $wholeEncoding)) {
+                $attributes[MessagingBody::STORED] = 'true';
+            }
         } catch (Throwable) {
         }
 
@@ -399,6 +428,33 @@ final class QueueTelemetry
         }
 
         return [];
+    }
+
+    /**
+     * The job's undecoded wire payload — the JSON string `Queue::createPayload()`
+     * produced, before `payload()` above `json_decode`s it.
+     *
+     * `getRawBody()` is declared on every driver's job class
+     * (`Illuminate\Contracts\Queue\Job`), and it is the one call that hands back
+     * the actual bytes rather than a re-encoding of them:
+     * `json_encode(json_decode($raw))` is not guaranteed byte-identical to
+     * `$raw` (key order, numeric-string coercion, unicode escaping all vary by
+     * PHP/driver version), and MessagingBody exists to report what really
+     * crossed the wire, not a reconstruction of it. Same discipline
+     * `RequestFacts::payloadSize()`'s own docblock states for the publish side.
+     */
+    private static function jobRawBody(object $job): string
+    {
+        try {
+            if (method_exists($job, 'getRawBody')) {
+                $body = $job->getRawBody();
+
+                return is_string($body) ? $body : '';
+            }
+        } catch (Throwable) {
+        }
+
+        return '';
     }
 
     /** The connection's driver, which is where to look; the name is not. */

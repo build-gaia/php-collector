@@ -219,6 +219,8 @@ use Bunny\Client;
 use Bunny\Message;
 use Chronos\Collector\Dto\SpanReservation;
 use Chronos\Collector\Framework\Bunny\BunnyTelemetry;
+use Chronos\Collector\Framework\Laravel\QueueTelemetry;
+use Chronos\Collector\Framework\Laravel\RequestFacts;
 use Chronos\Collector\Service\MessagingBody;
 use Chronos\Collector\Service\MessagingDestination;
 use Chronos\Collector\Service\MessagingFailure;
@@ -1103,6 +1105,200 @@ $runner->test('a tier-2 stamp is never recovered as a reservation (it would dupl
         $runner->assertSame('99aabbccddeeff00', $recovered->spanId);
     } finally {
         nativeRequest(null);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// LARAVEL QUEUE PAYLOAD BLOBS (G1): RequestFacts::queuePublishExtra() is the
+// publish-side counterpart of BunnyTelemetry::publish()'s own $extra build
+// above, and QueueTelemetry::jobAttributes() is the consume-side counterpart
+// of consumeAttributes() tested above it — same MessagingBody gate, same
+// storeSpanBody keying, proved here against the same stubs.
+// ---------------------------------------------------------------------------
+
+$runner->test('Laravel queue publish: the preview and content-type land in the producer extra', function () use ($runner): void {
+    captureBodies(true);
+    try {
+        $method = new \ReflectionMethod(RequestFacts::class, 'queuePublishExtra');
+        $payload = json_encode(['displayName' => 'App\\Jobs\\SendWelcome', 'data' => ['userId' => 42]]);
+        $extra = $method->invoke(null, 'redis', 'redis', strlen($payload), $payload);
+
+        $runner->assertSame('json', $extra['messaging.protocol'] ?? null);
+        $runner->assertSame('application/json', $extra['messaging.message.body.content_type'] ?? null, 'stated, not sniffed: a queue payload is always json_encode: ');
+        $runner->assertSame((string) strlen($payload), $extra['messaging.message.body.size'] ?? null);
+        $runner->assertSame($payload, $extra[MessagingBody::BODY] ?? null, 'a payload inside the cap previews whole: ');
+        $runner->assertSame(false, isset($extra[MessagingBody::TRUNCATED]));
+    } finally {
+        captureBodies(null);
+    }
+});
+
+$runner->test('Laravel queue publish: with capture OFF the extra carries no payload bytes', function () use ($runner): void {
+    captureBodies(false);
+    try {
+        $method = new \ReflectionMethod(RequestFacts::class, 'queuePublishExtra');
+        $payload = json_encode(['displayName' => 'App\\Jobs\\SendWelcome']);
+        $extra = $method->invoke(null, 'redis', 'redis', strlen($payload), $payload);
+
+        $runner->assertSame(false, isset($extra[MessagingBody::BODY]), 'no payload may be emitted with capture off: ');
+        // Size, protocol and content-type all survive the gate — they are facts about the
+        // message, not a copy of it, exactly as messaging.message.body.size does on every path.
+        $runner->assertSame((string) strlen($payload), $extra['messaging.message.body.size'] ?? null);
+        $runner->assertSame('application/json', $extra['messaging.message.body.content_type'] ?? null);
+    } finally {
+        captureBodies(null);
+    }
+});
+
+$runner->test('Laravel queue publish: an empty payload states no content-type and previews nothing', function () use ($runner): void {
+    captureBodies(true);
+    try {
+        $method = new \ReflectionMethod(RequestFacts::class, 'queuePublishExtra');
+        $extra = $method->invoke(null, 'redis', 'redis', null, '');
+
+        $runner->assertSame(false, isset($extra['messaging.message.body.content_type']), 'no payload means no fact about its format: ');
+        $runner->assertSame(false, isset($extra['messaging.message.body.size']));
+        $runner->assertSame(false, isset($extra[MessagingBody::BODY]));
+    } finally {
+        captureBodies(null);
+    }
+});
+
+/** A minimal stand-in for Illuminate's queue Job contract: just the four calls jobAttributes() reads. */
+function fakeQueueJob(string $rawBody, string $queue = 'emails', string $jobId = 'job-123', int $attempts = 1): object
+{
+    return new class($rawBody, $queue, $jobId, $attempts) {
+        public function __construct(
+            private string $rawBody,
+            private string $queue,
+            private string $jobId,
+            private int $attempts,
+        ) {
+        }
+
+        public function getRawBody(): string
+        {
+            return $this->rawBody;
+        }
+
+        public function getQueue(): string
+        {
+            return $this->queue;
+        }
+
+        public function getJobId(): string
+        {
+            return $this->jobId;
+        }
+
+        public function attempts(): int
+        {
+            return $this->attempts;
+        }
+    };
+}
+
+$runner->test('Laravel queue consume: the whole payload is stored against the request ROOT, mirroring Bunny\'s consumer', function () use ($runner): void {
+    captureBodies(true);
+    $GLOBALS['chronos_stored_bodies'] = [];
+    try {
+        // Well past the 8 KiB request-attribute-bag ceiling: the preview is a stub, and the
+        // blob is the only place the rest of the payload can live — same shape as Bunny's own
+        // "the consume side stores its payload against the request ROOT span" case above.
+        $rawBody = json_encode(['data' => ['pad' => str_repeat('x', 20000)]]);
+        $job = fakeQueueJob($rawBody);
+        $event = new class {
+            public $connectionName = 'redis';
+        };
+
+        $method = new \ReflectionMethod(QueueTelemetry::class, 'jobAttributes');
+        $attributes = $method->invoke(null, $event, $job, 'App\\Jobs\\SendWelcome', [], microtime(true), $rawBody);
+
+        $stored = $GLOBALS['chronos_stored_bodies'];
+        $runner->assertSame(1, count($stored), 'the consume payload must be offered exactly once: ');
+        $runner->assertSame('', $stored[0]['spanId'], 'empty span id means "this request\'s root", same as Bunny\'s consumer: ');
+        $runner->assertSame('', $stored[0]['traceId']);
+        $runner->assertSame('message', $stored[0]['side']);
+        $runner->assertSame('application/json', $stored[0]['contentType']);
+        $runner->assertSame($rawBody, $stored[0]['body'], 'the WHOLE payload, not the truncated preview: ');
+        $runner->assertSame('true', $attributes[MessagingBody::STORED] ?? null, 'and the request-attribute bag claims it: ');
+        $runner->assertTrue(
+            strlen($attributes[MessagingBody::BODY] ?? '') < strlen($rawBody),
+            'the preview attribute itself must still be the 8 KiB-capped stub, not the whole thing: ',
+        );
+        $runner->assertSame('json', $attributes['messaging.protocol'] ?? null);
+        $runner->assertSame('emails', $attributes['messaging.destination.name'] ?? null);
+        $runner->assertSame('job-123', $attributes['messaging.message.id'] ?? null);
+        $runner->assertSame('1', $attributes['messaging.message.attempt'] ?? null);
+    } finally {
+        captureBodies(null);
+        $GLOBALS['chronos_stored_bodies'] = [];
+    }
+});
+
+$runner->test('Laravel queue consume: a refused payload is never claimed on the request root', function () use ($runner): void {
+    captureBodies(true);
+    $GLOBALS['chronos_stored_bodies'] = [];
+    $GLOBALS['chronos_store_answer'] = false;
+    try {
+        $rawBody = json_encode(['data' => ['pad' => str_repeat('x', 20000)]]);
+        $job = fakeQueueJob($rawBody);
+        $event = new class {
+            public $connectionName = 'redis';
+        };
+
+        $method = new \ReflectionMethod(QueueTelemetry::class, 'jobAttributes');
+        $attributes = $method->invoke(null, $event, $job, 'App\\Jobs\\SendWelcome', [], microtime(true), $rawBody);
+
+        $runner->assertTrue(count($GLOBALS['chronos_stored_bodies']) >= 1, 'the payload was offered');
+        $runner->assertSame(false, isset($attributes[MessagingBody::STORED]), 'a refusal must not be claimed: ');
+    } finally {
+        captureBodies(null);
+        $GLOBALS['chronos_store_answer'] = true;
+        $GLOBALS['chronos_stored_bodies'] = [];
+    }
+});
+
+$runner->test('Laravel queue consume: with capture OFF not one byte is offered to the store', function () use ($runner): void {
+    captureBodies(false);
+    $GLOBALS['chronos_stored_bodies'] = [];
+    try {
+        $rawBody = json_encode(['data' => ['pad' => str_repeat('x', 20000)]]);
+        $job = fakeQueueJob($rawBody);
+        $event = new class {
+            public $connectionName = 'redis';
+        };
+
+        $method = new \ReflectionMethod(QueueTelemetry::class, 'jobAttributes');
+        $attributes = $method->invoke(null, $event, $job, 'App\\Jobs\\SendWelcome', [], microtime(true), $rawBody);
+
+        $runner->assertSame([], $GLOBALS['chronos_stored_bodies'], 'the default posture copies nothing: ');
+        $runner->assertSame(false, isset($attributes[MessagingBody::STORED]));
+        $runner->assertSame(false, isset($attributes[MessagingBody::BODY]));
+    } finally {
+        captureBodies(null);
+        $GLOBALS['chronos_stored_bodies'] = [];
+    }
+});
+
+$runner->test('Laravel queue consume: an empty raw body (getRawBody missing/blank) never calls the store', function () use ($runner): void {
+    captureBodies(true);
+    $GLOBALS['chronos_stored_bodies'] = [];
+    try {
+        $job = fakeQueueJob('');
+        $event = new class {
+            public $connectionName = 'redis';
+        };
+
+        $method = new \ReflectionMethod(QueueTelemetry::class, 'jobAttributes');
+        $attributes = $method->invoke(null, $event, $job, 'App\\Jobs\\SendWelcome', [], microtime(true), '');
+
+        $runner->assertSame([], $GLOBALS['chronos_stored_bodies'], 'nothing to store means nothing offered: ');
+        $runner->assertSame(false, isset($attributes[MessagingBody::STORED]));
+        $runner->assertSame(false, isset($attributes['messaging.protocol']), 'no payload means no fact about its format: ');
+    } finally {
+        captureBodies(null);
+        $GLOBALS['chronos_stored_bodies'] = [];
     }
 });
 

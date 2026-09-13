@@ -7,9 +7,11 @@ namespace Chronos\Collector\Framework\Laravel;
 use Chronos\Collector\Service\ActivityCatalog;
 use Chronos\Collector\Service\CallSite;
 use Chronos\Collector\Service\Diagnostics;
+use Chronos\Collector\Service\MessagingBody;
 use Chronos\Collector\Service\MessagingDestination;
 use Chronos\Collector\Service\MessagingSpan;
 use Chronos\Collector\Service\NativeExtension;
+use Chronos\Collector\Service\Span;
 use Throwable;
 
 /**
@@ -558,16 +560,31 @@ final class RequestFacts
                         $connection = is_string($observed->connectionName ?? null)
                             ? $observed->connectionName
                             : '';
+                        // The wire form JobQueued hands over: the JSON string
+                        // Queue::createPayload() produced, which is what
+                        // MessagingBody has to encode — not the size, which
+                        // payloadSize() already read off the same string above.
+                        $rawPayload = is_string($observed->payload ?? null) ? $observed->payload : '';
+                        // The same [whole, encoding] split Bunny's publish() uses:
+                        // the preview above rides the span attribute (capped at
+                        // Span::MAX_TEXT_LENGTH), this is the copy — cut only to
+                        // the operator's allowance — that goes to the span-body
+                        // store MessagingSpan::published() writes to below.
+                        [$whole, $wholeEncoding] = MessagingBody::whole($rawPayload, Span::MAX_TEXT_LENGTH);
                         // WHERE it went, in the normalised vocabulary: the queue
                         // name alone does not identify a stream on an estate
                         // where six vhosts each have a `products`.
                         // Recovered from the PAYLOAD, which is the only alignment
                         // that cannot be wrong — see reservationFromPayload.
-                        MessagingSpan::published($transport, $queue, $name, array_filter(
-                            MessagingDestination::forLaravelQueue($transport, $connection) + [
-                                'messaging.message.body.size' => $payloadSize === null ? '' : (string) $payloadSize,
-                            ],
-                        ), self::reservationFromPayload($observed->payload ?? null));
+                        MessagingSpan::published(
+                            $transport,
+                            $queue,
+                            $name,
+                            self::queuePublishExtra($transport, $connection, $payloadSize, $rawPayload),
+                            self::reservationFromPayload($observed->payload ?? null),
+                            $whole,
+                            $wholeEncoding,
+                        );
                     }
                 });
             }
@@ -947,6 +964,41 @@ final class RequestFacts
             // dispatch that failed.
             return null;
         }
+    }
+
+    /**
+     * The producer span's `messaging.*` attributes for one queued job: the
+     * destination (already known) joined with the payload preview
+     * `MessagingBody::encode` computes — factored out of the `JobQueued`
+     * closure so the part actually worth pinning in a test (the encoding, the
+     * gate, the content-type fact) can be exercised without Laravel's event
+     * machinery, exactly as `reservationFromPayload` already is.
+     *
+     * `content_type` is stated, not sniffed: `Queue::createPayload()` always
+     * `json_encode`s, so `application/json` is a fact about the wire format
+     * this bridge produced, not a guess about bytes it did not write.
+     *
+     * @return array<string, string>
+     */
+    private static function queuePublishExtra(
+        string $transport,
+        string $connection,
+        ?int $payloadSize,
+        string $rawPayload,
+    ): array {
+        $extra = array_filter(
+            MessagingDestination::forLaravelQueue($transport, $connection) + [
+                'messaging.protocol' => 'json',
+                'messaging.message.body.content_type' => $rawPayload === '' ? '' : 'application/json',
+                'messaging.message.body.size' => $payloadSize === null ? '' : (string) $payloadSize,
+            ],
+        );
+
+        // Span::MAX_TEXT_LENGTH, not the generic 512-byte attribute ceiling:
+        // this rides MessagingSpan::BODY, which gets that same exemption — see
+        // MessagingSpan::published()'s own note on why a payload cut at 512
+        // bytes is worse than useless.
+        return $extra + MessagingBody::encode($rawPayload, Span::MAX_TEXT_LENGTH);
     }
 
     private static function payloadSize(mixed $payload): ?int
