@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "scratch-verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "scratch-verify"
+path = "src/main.rs"

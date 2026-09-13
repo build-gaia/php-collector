@@ -36,6 +36,7 @@ pub mod dst_spool;
 pub mod http_capture;
 pub mod job_spool;
 pub mod log_spool;
+pub mod messaging;
 pub mod observer;
 pub mod profile_spool;
 pub mod rate;
