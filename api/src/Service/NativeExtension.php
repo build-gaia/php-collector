@@ -29,6 +29,11 @@ final class NativeExtension
     /** Resolved once per process, for the same reason. */
     private static ?int $messagingCeiling = null;
 
+    /** Resolved once per process, same reason as $messagingCapture: the setting
+     * read is an FFI call, and whether the native logs pipeline is on for this
+     * process cannot change mid-process. */
+    private static ?bool $logsCapture = null;
+
     /** Once-per-process guard for the instrumentation-manifest load (the native
      * trace allowlist is per-process and only ever grows, so once is enough). */
     private static bool $manifestLoaded = false;
@@ -137,6 +142,37 @@ final class NativeExtension
         }
 
         return self::$messagingCapture;
+    }
+
+    /**
+     * Whether the native LOGS pipeline is on for this process.
+     *
+     * `Framework\Laravel\ChronosServiceProvider::boot()` gates the Monolog handler
+     * on this — with it false (the default) the provider does not even construct
+     * a `ChronosHandler`, so the whole cost of shipping with logs off is the one
+     * memoised bool this method reads once per process.
+     *
+     * Unlike `messagingCapturing()` (on unless explicitly turned off), this
+     * defaults OFF and needs an explicit truthy value to turn on: shipping
+     * application logs off the box is a data-egress decision an operator makes on
+     * purpose, exactly the reasoning `CHRONOS_PHP_LOGS_ENABLED`'s own default
+     * encodes on the native side (`native/src/config.rs`, `flag(..., false)`).
+     * The truthy list mirrors `enabled()`'s, so one spelling rule covers every
+     * boolean setting an operator can write.
+     */
+    public static function logsEnabled(): bool
+    {
+        if (!self::loaded()) {
+            return false;
+        }
+        if (self::$logsCapture === null) {
+            $value = function_exists('chronos_setting')
+                ? strtolower(trim(\chronos_setting('CHRONOS_PHP_LOGS_ENABLED')))
+                : '';
+            self::$logsCapture = in_array($value, ['1', 'true', 'yes', 'on'], true);
+        }
+
+        return self::$logsCapture;
     }
 
     /**

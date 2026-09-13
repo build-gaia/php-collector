@@ -64,14 +64,26 @@ final class RichTelemetryHooks
                     self::closeTransaction($event, 'rollback');
                 });
             }
-            if (class_exists(Log::class)) {
-                Log::listen(static function (object $event): void {
-                    self::recordLog($event);
-                });
-            } elseif (class_exists(Event::class) && class_exists(\Illuminate\Log\Events\MessageLogged::class)) {
-                Event::listen(\Illuminate\Log\Events\MessageLogged::class, static function (object $event): void {
-                    self::recordLog($event);
-                });
+            // Skipped entirely once logs are enabled: `ChronosServiceProvider::
+            // boot()` then pushes `ChronosHandler` straight onto the default
+            // Monolog channel, and `Illuminate\Log\Logger::writeLog()` dispatches
+            // this very MessageLogged event AND forwards the same call to that
+            // same underlying Monolog logger in one breath — registering both
+            // would capture every application log line twice. With logs off
+            // (the default) this registration is harmless but pointless (the
+            // native `chronos_capture_log()` no-ops when logs are off anyway),
+            // so skipping it there too costs nothing and keeps the rule simple:
+            // exactly one of the two capture paths is ever armed.
+            if (!NativeExtension::logsEnabled()) {
+                if (class_exists(Log::class)) {
+                    Log::listen(static function (object $event): void {
+                        self::recordLog($event);
+                    });
+                } elseif (class_exists(Event::class) && class_exists(\Illuminate\Log\Events\MessageLogged::class)) {
+                    Event::listen(\Illuminate\Log\Events\MessageLogged::class, static function (object $event): void {
+                        self::recordLog($event);
+                    });
+                }
             }
             if (class_exists(Event::class) && class_exists(CacheHit::class)) {
                 Event::listen(CacheHit::class, static function (object $event): void {

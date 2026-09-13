@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace Chronos\Collector\Framework\Laravel;
 
 use Chronos\Collector\Chronos;
+use Chronos\Collector\Framework\Monolog\ChronosHandler;
 use Chronos\Collector\Service\NativeExtension;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Http\Kernel;
 use Illuminate\Contracts\View\Engine;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\ServiceProvider;
 use Throwable;
 
@@ -43,9 +45,62 @@ final class ChronosServiceProvider extends ServiceProvider
         $this->observeBootCompletion();
         $this->instrumentViewEngines();
         $this->captureReportedExceptions();
+        $this->wireMonologHandler();
 
         QueueTelemetry::install();
         RichTelemetryHooks::install();
+    }
+
+    /**
+     * Push `ChronosHandler` onto the application's default Monolog channel, so
+     * logging ships with zero call-site changes — the "add the .so + a .chronos
+     * file + `composer require`" contract this integration otherwise fails, since
+     * every OTHER piece of telemetry here (middleware, queue jobs, DB/cache/HTTP
+     * spans) wires itself in `boot()` already and logs alone did not.
+     *
+     * Gated on `NativeExtension::logsEnabled()`, which is a SEPARATE decision
+     * from `enabled()`: `CHRONOS_PHP_LOGS_ENABLED` defaults OFF (unlike APM),
+     * because shipping application log bodies off the box is a data-egress
+     * decision an operator makes on purpose. With it off this method returns
+     * before constructing anything — no handler object, no Monolog stack
+     * mutation — so the cost of the default (off) configuration is the one
+     * memoised bool `logsEnabled()` reads.
+     *
+     * `Log::getLogger()` reaches the actual `Monolog\Logger` behind Laravel's
+     * default log channel (`LogManager` forwards unknown static calls to it),
+     * which is the standard way Laravel itself documents adding a handler.
+     *
+     * Deliberately fail-open and guarded on `class_exists` for both the Monolog
+     * base handler class and `ChronosHandler` itself (which only declares when
+     * Monolog is present — see that file's own docblock): monolog/monolog is not
+     * a dependency of this package, and an application that has removed it (or
+     * not installed it yet) must boot exactly as it did before this method
+     * existed.
+     *
+     * Does NOT duplicate `ChronosHandler`'s own job (severity mapping, body
+     * capping, trace/span correlation) here — this method only wires it in. And
+     * `RichTelemetryHooks::install()` skips its OWN `Log::listen`/`MessageLogged`
+     * registration whenever logs are enabled (see that method's docblock),
+     * specifically so this handler is the ONE place a Laravel log line is
+     * captured rather than two.
+     */
+    private function wireMonologHandler(): void
+    {
+        if (!NativeExtension::logsEnabled()) {
+            return;
+        }
+        if (!class_exists(\Monolog\Logger::class)
+            || !class_exists(\Monolog\Handler\AbstractProcessingHandler::class)
+            || !class_exists(ChronosHandler::class)) {
+            return;
+        }
+        try {
+            $logger = Log::getLogger();
+            if (is_object($logger) && method_exists($logger, 'pushHandler')) {
+                $logger->pushHandler(new ChronosHandler());
+            }
+        } catch (Throwable) {
+        }
     }
 
     /**

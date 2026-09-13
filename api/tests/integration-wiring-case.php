@@ -275,6 +275,86 @@ namespace Monolog\Handler {
 }
 
 // ---------------------------------------------------------------------------
+// Laravel fixtures: just enough of ServiceProvider/Log for
+// ChronosServiceProvider::boot() to run to completion (section 6 below).
+// ---------------------------------------------------------------------------
+
+namespace Illuminate\Support {
+    abstract class ServiceProvider
+    {
+        public function __construct(protected $app)
+        {
+        }
+    }
+}
+
+namespace Illuminate\Support\Facades {
+    /**
+     * Stands in for Laravel's Log facade. `getLogger()` returns whatever the test
+     * parked in the global slot (a RecordingMonologLogger), matching the real
+     * facade's own contract: it forwards to the default channel's actual
+     * Monolog\Logger.
+     */
+    final class Log
+    {
+        public static function listen(callable $callback): void
+        {
+            $GLOBALS['chronos_log_listen_calls'][] = $callback;
+        }
+
+        public static function getLogger(): object
+        {
+            return $GLOBALS['chronos_fake_monolog_logger'];
+        }
+    }
+}
+
+namespace Chronos\Collector\Tests\Fixtures {
+    /** Records every pushHandler() call, standing in for the real Monolog\Logger. */
+    final class RecordingMonologLogger
+    {
+        /** @var list<object> */
+        public array $pushed = [];
+
+        public function pushHandler(object $handler): static
+        {
+            $this->pushed[] = $handler;
+
+            return $this;
+        }
+    }
+
+    /**
+     * Minimal Laravel container: enough for ChronosServiceProvider::boot() to run
+     * to completion. Every OTHER optional wiring path in boot() (Kernel
+     * middleware, view-engine instrumentation, the exception reportable hook) is
+     * already wrapped in its own try/catch in the provider — see that class's own
+     * doc blocks — so a make() that always throws exercises exactly those
+     * fail-open paths without a real container standing behind them.
+     */
+    final class FakeLaravelApp
+    {
+        public function make(string $abstract): mixed
+        {
+            throw new \RuntimeException("not bound in this fixture: {$abstract}");
+        }
+
+        public function booted(callable $callback): void
+        {
+        }
+
+        public function afterResolving(string $abstract, callable $callback): void
+        {
+        }
+
+        public function resolved(string $abstract): bool
+        {
+            return false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The test proper.
 // ---------------------------------------------------------------------------
 
@@ -282,8 +362,15 @@ namespace Chronos\Collector\Tests\IntegrationWiring {
 
     use Chronos\Collector\Framework\Guzzle\TraceparentMiddleware;
     use Chronos\Collector\Framework\HttpClient\ChronosHttpClient;
+    use Chronos\Collector\Framework\Laravel\ChronosServiceProvider;
+    use Chronos\Collector\Framework\Laravel\QueueTelemetry;
+    use Chronos\Collector\Framework\Laravel\RichTelemetryHooks;
+    use Chronos\Collector\Framework\Monolog\ChronosHandler;
     use Chronos\Collector\Framework\Symfony\ChronosIntegrationsPass;
+    use Chronos\Collector\Service\NativeExtension;
     use Chronos\Collector\Service\Propagation;
+    use Chronos\Collector\Tests\Fixtures\FakeLaravelApp;
+    use Chronos\Collector\Tests\Fixtures\RecordingMonologLogger;
     use Symfony\Component\DependencyInjection\ContainerBuilder;
     use Symfony\Contracts\HttpClient\HttpClientInterface;
     use Symfony\Contracts\HttpClient\ResponseInterface;
@@ -551,6 +638,82 @@ namespace Chronos\Collector\Tests\IntegrationWiring {
         assertTrue($container->definitions === [], 'no service is registered, http_kernel is left undecorated');
         assertTrue($container->compilerPasses === [], 'no compiler pass is added');
     });
+
+    // ---- 6. Laravel: ChronosServiceProvider wires ChronosHandler onto Monolog ---
+
+    /**
+     * Force NativeExtension's memoised process-level answers via reflection — the
+     * same technique bunny-case.php's captureBodies() uses, and for the same
+     * reason: enabled()/logsEnabled() both gate on loaded() first, and no amount
+     * of env makes extension_loaded('chronos') true in this process. Pass null to
+     * put a memo back the way it started.
+     */
+    function forceNativeState(?bool $loadedAndEnabled, ?bool $logsEnabled): void
+    {
+        (new \ReflectionProperty(NativeExtension::class, 'loaded'))->setValue(null, $loadedAndEnabled);
+        (new \ReflectionProperty(NativeExtension::class, 'enabled'))->setValue(null, $loadedAndEnabled);
+        (new \ReflectionProperty(NativeExtension::class, 'logsCapture'))->setValue(null, $logsEnabled);
+    }
+
+    /**
+     * RichTelemetryHooks and QueueTelemetry each install at most once per
+     * process; reset the guard so ChronosServiceProvider::boot() can be
+     * exercised more than once across the two cases below.
+     */
+    function resetLaravelInstallGuards(): void
+    {
+        (new \ReflectionProperty(RichTelemetryHooks::class, 'installed'))->setValue(null, false);
+        (new \ReflectionProperty(QueueTelemetry::class, 'installed'))->setValue(null, false);
+    }
+
+    function bootChronosServiceProvider(): RecordingMonologLogger
+    {
+        $GLOBALS['chronos_log_listen_calls'] = [];
+        $logger = new RecordingMonologLogger();
+        $GLOBALS['chronos_fake_monolog_logger'] = $logger;
+        (new ChronosServiceProvider(new FakeLaravelApp()))->boot();
+
+        return $logger;
+    }
+
+    test(
+        'Laravel: logs enabled pushes ChronosHandler onto Monolog, and RichTelemetryHooks skips its own listener',
+        function (): void {
+            forceNativeState(true, true);
+            resetLaravelInstallGuards();
+
+            $logger = bootChronosServiceProvider();
+
+            assertSame(1, count($logger->pushed), 'exactly one handler pushed onto the Monolog stack');
+            assertTrue($logger->pushed[0] instanceof ChronosHandler, 'the pushed handler is ChronosHandler');
+            assertSame(
+                0,
+                count($GLOBALS['chronos_log_listen_calls']),
+                'RichTelemetryHooks must not also register Log::listen — every log line would double',
+            );
+
+            forceNativeState(null, null);
+        },
+    );
+
+    test(
+        'Laravel: logs disabled (the default) constructs no handler, and RichTelemetryHooks keeps its own listener',
+        function (): void {
+            forceNativeState(true, false);
+            resetLaravelInstallGuards();
+
+            $logger = bootChronosServiceProvider();
+
+            assertSame(0, count($logger->pushed), 'no handler is even constructed when logs are off');
+            assertSame(
+                1,
+                count($GLOBALS['chronos_log_listen_calls']),
+                'RichTelemetryHooks still owns log capture when the handler is not wired',
+            );
+
+            forceNativeState(null, null);
+        },
+    );
 
     if ($failures > 0) {
         fwrite(STDERR, "{$failures} of {$tests} integration-wiring tests failed\n");
