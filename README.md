@@ -17,6 +17,14 @@ for the one thing that is not free by default.
 
 ## Install
 
+The whole contract is three steps, and nothing else: drop in `chronos.so`, add a
+`.chronos` file, `composer require build-gaia/php-collector`. That is true for a
+bare extension install (traces/profiles/HTTP capture, no PHP code) and it is true
+with the framework package too — Laravel wires itself in via Composer's package
+auto-discovery, and Symfony either picks up the bundle automatically through a
+Flex recipe or needs the one documented line in `config/bundles.php` (see step 3).
+Nothing beyond these three steps is required for either framework.
+
 ### 1. The native extension
 
 Grab the `chronos.so` matching your PHP version and libc from the releases page
@@ -162,9 +170,18 @@ The extension works without it; the package adds what only userland can know:
   and leaving it off is better for the same reason. `bunny/bunny` stays a
   composer `suggest`: the bridge only declares for an application that already
   has it.
-- **Symfony** — register `Chronos\Collector\Framework\Symfony\ChronosBundle`
-  (or decorate the kernel with `ChronosHttpKernel`). Cache pools are wrapped so
-  reads show hit/miss and the unserialized hit value.
+- **Symfony** — a Flex recipe ships in [`recipe/`](recipe/) so a Symfony Flex
+  application picks up `ChronosBundle` automatically the moment
+  `composer require` runs, the same zero-touch contract Laravel gets from
+  package auto-discovery. An application not on Flex (or pointed at an index
+  this private package is not published to) needs the one line the recipe
+  would otherwise have added — see [`recipe/README.md`](recipe/README.md) for
+  the exact line and why Flex alone cannot reach a private package without it.
+  Once registered — by either path — cache pools are wrapped so reads show
+  hit/miss and the unserialized hit value, Messenger/HttpClient/DBAL/Monolog
+  wire themselves via one compiler pass, and the kernel is decorated
+  automatically (`ChronosHttpKernel` is available to decorate by hand instead,
+  for an application that does not use the bundle).
 - **symfony1** — register `Chronos\Collector\Framework\Symfony1\ChronosFilter`
   in `filters.yml`.
 - **Custom spans** — `$chronos->span->create('name')`, or declare an

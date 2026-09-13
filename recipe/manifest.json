@@ -1,0 +1,5 @@
+{
+    "bundles": {
+        "Chronos\\Collector\\Framework\\Symfony\\ChronosBundle": ["all"]
+    }
+}
