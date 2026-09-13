@@ -46,10 +46,13 @@ from the document root):
 ```ini
 # Identity: all four are required; without them the collector stays inert.
 enabled=1
-organisation=my-org
-project=my-project
+organisation=org_a2a69137-6d90-49cc-90b9-5d3e49f1ef96
+team_id=my-team
 application=my-app
-spool_directory=/var/lib/chronos/spool   # the mounted chronos-spool volume, see step 4
+# The mounted chronos-spool volume, see step 4. Comments must sit on their own
+# line: the parser does not strip a trailing `# ...` from a value, so an inline
+# comment would become part of the path.
+spool_directory=/var/lib/chronos/spool
 
 # Capture tiers. Rates are fractions: 1 = all, 0.1 = a tenth. All default to off
 # EXCEPT the counted profile (`profile_deterministic`), which is on — see below.
@@ -66,6 +69,18 @@ Every setting can equally be set as an environment variable
 (`chronos.enabled=1`, `chronos.organisation=my-org`, …). Precedence:
 **env > php.ini > `.chronos` file**. The `.chronos` file accepts both spellings
 (`enabled=1` and `CHRONOS_PHP_ENABLED=1`), so it can double as a dotenv include.
+
+That precedence is the whole security model, not an implementation detail: the
+`.chronos` file ships with your application's own code, so anyone who can edit it
+can already run code in the process — trusting it grants no new capability. Env
+and php.ini, by contrast, are set by whoever controls the platform underneath the
+application, and a value pinned at that layer can never be overridden by a file
+the application ships. On top of the ordering, `organisation` / `team_id` /
+`project` / `application` read from the `.chronos` file are validated as
+identifier-shaped (`[A-Za-z0-9._-]`, 1–128 bytes) and `spool_directory` as an
+absolute path with no `..` segment; a value that fails validation is treated as
+absent (never half-applied) and logged once, by key name only — env and php.ini
+values are trusted as given and never validated.
 
 ### 3. The PHP package (optional, recommended)
 

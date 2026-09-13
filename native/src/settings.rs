@@ -16,9 +16,9 @@
 //! Format is dotenv-ish: `key=value` lines, `#` comments, optional `export `,
 //! optional single/double quotes around the value.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// The full set of settings, by canonical env name. Also the INI registration list —
 /// an unregistered `chronos.*` INI name can never be set from php.ini, so growing a
@@ -141,6 +141,92 @@ pub fn get(env_name: &str) -> Option<String> {
 /// one way and the earlier spelling wins outright rather than merging.
 pub fn first(env_names: &[&str]) -> Option<String> {
     env_names.iter().find_map(|name| get(name))
+}
+
+/// Resolve one setting through env > INI > `.chronos` file, exactly like [`get`],
+/// except the `.chronos`-file tier must pass `validate` before it is trusted.
+///
+/// SECURITY MODEL — precedence env > ini > `.chronos` file is the security
+/// property here, and this function does not change it. The file ships alongside
+/// the application's own code: anyone who can edit it can already run code in
+/// this process, so trusting its contents grants no capability an attacker did
+/// not already have. Env and ini, by contrast, are set by whoever controls the
+/// platform underneath the application — the container's env, the FPM pool,
+/// php.ini — and a value fixed at THAT layer must never be overridable by a file
+/// the application ships; that is the whole point of the ordering. Consequently
+/// validation applies ONLY to the file tier below: an env or ini value is used
+/// exactly as given, unvalidated, because an operator does not need protecting
+/// from their own platform configuration.
+///
+/// What the file tier needs protecting from is a value nobody with platform
+/// authority ever reviewed — a stray `;` from a copy-paste, a whole INI line
+/// pasted into the wrong slot, a relative path, a `../..` escape. A file value
+/// that fails `validate` is treated as ABSENT, never substituted and never
+/// half-applied, so the setting resolves exactly as if the file had not set it —
+/// a caller that requires the value (see `context::CollectorEnvelope::resolve`)
+/// then stays inert rather than emit spans against a mangled tenant id or write
+/// a spool file somewhere unintended. Rejection is reported once per process,
+/// naming only the key: the value itself is deliberately never repeated into a
+/// log, since it may be exactly the malformed input a log stream should not give
+/// a second life.
+pub fn get_validated(env_name: &str, validate: fn(&str) -> bool) -> Option<String> {
+    if let Ok(value) = std::env::var(env_name) {
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    let src = sources();
+    if let Some(value) = src.ini.get(&ini_name(env_name)) {
+        if !value.is_empty() {
+            return Some(value.clone());
+        }
+    }
+    let file = &src.file;
+    let raw = file
+        .get(env_name)
+        .or_else(|| file.get(&short_key(env_name)))
+        .filter(|value| !value.is_empty());
+    match raw {
+        Some(value) if validate(value) => Some(value.clone()),
+        Some(_) => {
+            warn_once_rejected(env_name);
+            None
+        }
+        None => None,
+    }
+}
+
+/// The validated counterpart of [`first`]: the first of several spellings that
+/// resolves under [`get_validated`], for a setting spelled more than one way
+/// where the file tier still needs shape-checking (e.g. `CHRONOS_PHP_TEAM_ID` /
+/// `CHRONOS_PHP_PROJECT`).
+pub fn first_validated(env_names: &[&str], validate: fn(&str) -> bool) -> Option<String> {
+    env_names.iter().find_map(|name| get_validated(name, validate))
+}
+
+/// Reject-once bookkeeping for [`get_validated`].
+///
+/// `CollectorEnvelope::resolve()` runs on every request; a `.chronos` file that
+/// is malformed stays malformed for the life of the worker, so without this a
+/// busy process would print the same rejection thousands of times a minute. One
+/// line per process per key is enough for someone to find, and quiet after that
+/// — the same "once per process" shape `spool_log::report_failure` already uses
+/// for its own per-process warnings.
+static REJECTED_ONCE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn warn_once_rejected(env_name: &str) {
+    let set = REJECTED_ONCE.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match set.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert(env_name.to_owned()) {
+        eprintln!(
+            "[chronos-ext] rejected .chronos value for {env_name}: not shaped like a valid \
+             identifier/path, falling through as unset (env and ini are unaffected). Value not \
+             logged. Reported once per process."
+        );
+    }
 }
 
 /// The value of a boolean setting AT MODULE STARTUP, resolved without touching the
@@ -368,5 +454,35 @@ mod tests {
         assert_eq!(map.get("project").unwrap(), "shop");
         assert_eq!(map.get("apm_enabled").unwrap(), "1");
         assert!(!map.contains_key("broken line"));
+    }
+
+    #[test]
+    fn get_validated_trusts_env_unconditionally() {
+        // env sits ABOVE the file tier `validate` guards; a value this shape-free
+        // would be rejected if it came from the file, but env is the operator's own
+        // platform config and is never second-guessed here.
+        std::env::set_var("CHRONOS_TEST_VALIDATED_ENV", "not;shaped;at;all");
+        assert_eq!(
+            get_validated("CHRONOS_TEST_VALIDATED_ENV", |_| false).as_deref(),
+            Some("not;shaped;at;all"),
+        );
+        std::env::remove_var("CHRONOS_TEST_VALIDATED_ENV");
+    }
+
+    #[test]
+    fn get_validated_with_nothing_set_is_none() {
+        std::env::remove_var("CHRONOS_TEST_VALIDATED_ABSENT");
+        assert_eq!(get_validated("CHRONOS_TEST_VALIDATED_ABSENT", |_| true), None);
+    }
+
+    #[test]
+    fn first_validated_tries_each_name_in_order() {
+        std::env::remove_var("CHRONOS_TEST_FIRST_A");
+        std::env::set_var("CHRONOS_TEST_FIRST_B", "value-b");
+        assert_eq!(
+            first_validated(&["CHRONOS_TEST_FIRST_A", "CHRONOS_TEST_FIRST_B"], |_| true).as_deref(),
+            Some("value-b"),
+        );
+        std::env::remove_var("CHRONOS_TEST_FIRST_B");
     }
 }
