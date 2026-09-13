@@ -80,8 +80,38 @@ pub struct CallFrame {
     kept_child: bool,
     /// Payload detail captured at call begin (cache.key, db.statement, http.url, …).
     attributes: Vec<(String, String)>,
+    /// A display name that replaces the function identity on the emitted span,
+    /// when the begin handler derived a better one ("PUBLISH oms.webhooks"
+    /// rather than "Bunny\AbstractClient::publish"). `None` everywhere else, and
+    /// `on_end` is the only consumer.
+    span_name: Option<String>,
+    /// This frame opened a message-scoped REQUEST (`begin_messaging_delivery`),
+    /// and its end must close it — attaching the scope's LastThrow — before the
+    /// frame is retired. A field rather than a name check because a NESTED
+    /// dispatch of the same method (a delivery pumped inside an open request)
+    /// runs as a plain pass-through frame and must not close a scope it never
+    /// opened.
+    owns_delivery_scope: bool,
     /// A known I/O call, so its measured duration also becomes an I/O profile sample.
     io: bool,
+    /// GAP 2 (causality contract): true only for a `MessagingPublish`/
+    /// `MessagingNatsSend`-publish frame whose begin handler ACTUALLY put
+    /// this span's id on the wire as a `traceparent` before the frame exists
+    /// — a consumer downstream may already be holding that promise by the
+    /// time this call returns, so letting `push_span` drop the span at
+    /// `MAX_SPANS_PER_REQUEST` would re-create exactly the orphan the
+    /// causality contract forbids. Set by the broker-specific begin handler
+    /// AFTER it knows whether propagation was attempted and (where a headers
+    /// slot exists to fail) whether the write actually succeeded — NOT
+    /// derived purely from `policy`, which was the bug the RdKafka contract
+    /// caught: `RdKafka\ProducerTopic::produce()` shares `MessagingPublish`
+    /// with `producev()` but has no headers argument at all, so nothing is
+    /// ever on the wire for it and the promise this flag protects can never
+    /// be true. The cap's own docblock calls it a runaway-loop backstop on
+    /// MEMORY, not a budget — publish spans are rare and small, so exempting
+    /// the ones that really did wire a promise spends nothing a real request
+    /// would miss.
+    bypass_span_cap: bool,
     /// The DETERMINISTIC clock and this frame's child-time accumulator (ADR 0029).
     /// Carried on the observer's own frame stack so the aggregate never maintains a
     /// parallel stack of its own — which is what would desync it on the requests where
@@ -107,7 +137,10 @@ impl CallFrame {
             on_stack: false,
             kept_child: false,
             attributes: Vec::new(),
+            span_name: None,
+            owns_delivery_scope: false,
             io: false,
+            bypass_span_cap: false,
             // Stamped by `push_frame`, which is the only thing allowed to create a
             // counted frame. See its doc comment for why it cannot be stamped here.
             timing: crate::deterministic::FrameTiming::default(),
@@ -127,6 +160,40 @@ enum SpanPolicy {
     ManifestSpan,
     /// A known I/O call: span + payload attributes + span.kind=client.
     IoSpan,
+    /// A vendored messaging client's publish call (`MESSAGING_PUBLISH_METHODS`):
+    /// producer span + destination vocabulary + native header injection. Its own
+    /// variant rather than a widened `IoSpan` because the begin handler does
+    /// something no I/O span does — writes an argument zval — and because the
+    /// `/vendor/` excluded-path demotion (which is `UserSpan`-only) must visibly
+    /// not apply to it: the whole point is that this IS vendor code.
+    MessagingPublish,
+    /// A messaging client's own dispatch of one delivery to the application's
+    /// callback (`MESSAGING_CONSUME_DISPATCH`): opens and closes a
+    /// message-scoped REQUEST rather than emitting a span of its own — the
+    /// native replacement for `BunnyTelemetry::consumer`'s wrapper.
+    MessagingDeliver,
+    /// A PULL-style consume call with no callback boundary at all
+    /// (`RdKafka\KafkaConsumer::consume`/`RdKafka\ConsumerTopic::consume`,
+    /// `Basis\Nats\Queue::fetchAll`): a plain span, never a message-scoped
+    /// request (there is no application code inside this call to bracket —
+    /// see the RdKafka contract's "poll-span contract" and the NATS
+    /// contract §5(d)). Its own variant rather than `IoSpan` because almost
+    /// everything worth saying about the call is only knowable from its
+    /// RETURN VALUE — the generic BEGIN (mint a frame if a request is
+    /// already open, nothing otherwise) is exactly what this policy wants
+    /// with no special-casing, so unlike `IoSpan` it needs no begin-time
+    /// `capture_io_detail` branch at all; a dedicated END-time reader
+    /// (`capture_messaging_poll_result`) builds the span's name and
+    /// attributes from the retval instead.
+    MessagingPoll,
+    /// NATS's single wire choke point, `Connection::sendMessage` — publish
+    /// span+injection when arg 0 is a `Publish` message, subscribe-sid
+    /// banking when it is a `Subscribe` message, `ObserveOnly` for anything
+    /// else (ping/pong/connect/…). Its own variant because `observe_policy`
+    /// caches ONE verdict per function, and this one function serves three
+    /// different roles decided only at runtime — see
+    /// `MESSAGING_NATS_SEND_METHOD`'s docblock.
+    MessagingNatsSend,
     /// Observed for side channels (DST recording, curl header tracking, begin/end
     /// pairing for unlisted userland calls) — no span.
     ObserveOnly,
@@ -194,6 +261,14 @@ thread_local! {
     /// and split the service map into a "host not reported" ghost node.
     static SUPPRESS_SQL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SUPPRESS_CACHE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Publish-side messaging suppression: the userland bridge
+    /// (`BunnyTelemetry::publish`) already reserved a span id and put it on the
+    /// wire, so the native publish observation must neither emit a duplicate
+    /// span nor inject anything. PUBLISH ONLY — consume-side ownership cannot be
+    /// a per-request flag, because the native delivery scope opens before any
+    /// userland code of the delivery runs (see `chronos_suppress_native`'s
+    /// docblock in lib.rs); the process switch is `CHRONOS_PHP_MESSAGING_AUTO`.
+    static SUPPRESS_MESSAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Called over the `chronos_suppress_native` FFI. Unknown kinds are ignored.
@@ -201,6 +276,7 @@ pub fn suppress_native(kind: &str) {
     match kind {
         "sql" => SUPPRESS_SQL.with(|flag| flag.set(true)),
         "cache" => SUPPRESS_CACHE.with(|flag| flag.set(true)),
+        "messaging" => SUPPRESS_MESSAGING.with(|flag| flag.set(true)),
         _ => {}
     }
 }
@@ -221,12 +297,19 @@ pub fn set_request_context(context: TraceContext) {
     REQUEST_SPANS.with(|spans| spans.borrow_mut().clear());
     SUPPRESS_SQL.with(|flag| flag.set(false));
     SUPPRESS_CACHE.with(|flag| flag.set(false));
+    SUPPRESS_MESSAGING.with(|flag| flag.set(false));
     #[cfg(feature = "zend-observer")]
     CURL_HEADERS.with(|h| h.borrow_mut().clear());
     #[cfg(feature = "zend-observer")]
     PREPARED_STATEMENTS.with(|m| m.borrow_mut().clear());
     #[cfg(feature = "zend-observer")]
     LAST_THROW.with(|t| *t.borrow_mut() = None);
+    #[cfg(feature = "zend-observer")]
+    MESSAGE_BANK.with(|bank| bank.borrow_mut().clear());
+    // CONSUMER_QUEUES is deliberately NOT cleared here: a Bunny subscription
+    // outlives every message-scoped request the worker will open (one
+    // `Channel::consume`, thousands of deliveries), so per-request clearing
+    // would blind the queue lookup after the first message. See its docblock.
 }
 
 /// Update the propagation headers on the observer's own copy of the request
@@ -251,6 +334,8 @@ pub fn clear_request_context() {
     CURL_HEADERS.with(|h| h.borrow_mut().clear());
     #[cfg(feature = "zend-observer")]
     PREPARED_STATEMENTS.with(|m| m.borrow_mut().clear());
+    #[cfg(feature = "zend-observer")]
+    MESSAGE_BANK.with(|bank| bank.borrow_mut().clear());
 }
 
 fn on_begin(
@@ -271,7 +356,14 @@ fn on_begin(
         SPAN_STACK.with(|stack| stack.borrow_mut().push(span_id.clone()));
     }
 
-    let traceparent = if is_network_function(function_name) {
+    // The same pre-send mint the curl path proved: the child span id exists
+    // BEFORE the call runs, is put on the wire by the begin handler, and IS
+    // recorded when the frame ends — which is the whole causality contract
+    // (a traceparent on the wire is a promise the named span is recorded),
+    // satisfied with none of the PHP SDK's SpanReservation machinery. Messaging
+    // publishes join the network functions here for exactly that reason.
+    let traceparent = if is_network_function(function_name) || policy == SpanPolicy::MessagingPublish
+    {
         Some(format!(
             "00-{}-{}-{}",
             context.trace_id,
@@ -294,7 +386,22 @@ fn on_begin(
         on_stack: emit_span,
         kept_child: false,
         attributes: Vec::new(),
+        span_name: None,
+        owns_delivery_scope: false,
         io: policy == SpanPolicy::IoSpan,
+        // FIX (RdKafka contract, "a real bug this contract surfaces"):
+        // `bypass_span_cap` used to be derived purely from `policy ==
+        // MessagingPublish`, which was correct for Bunny/`producev()` (their
+        // traceparent really is on the wire by the time this frame exists)
+        // but WRONG for RdKafka's `produce()` — it has no headers argument at
+        // all, so nothing is ever on the wire and there is no promise to
+        // protect from the span cap. Each broker's begin handler now sets
+        // this explicitly, AFTER it knows whether propagation was actually
+        // attempted (and, for the brokers with a headers slot, actually
+        // written) — see `begin_messaging_publish_bunny` /
+        // `_rdkafka` / `_amqplib` and `begin_nats_send_message`'s Publish
+        // branch. `false` here is just the default every OTHER policy keeps.
+        bypass_span_cap: false,
         // Stamped by `push_frame`. See its doc comment.
         timing: crate::deterministic::FrameTiming::default(),
     }
@@ -315,7 +422,7 @@ fn min_span_duration_nanos() -> u128 {
 
 /// Finish a frame; returns true when a span was emitted (so the caller can mark
 /// the parent frame's `kept_child`).
-fn on_end(frame: CallFrame, threw: bool) -> bool {
+fn on_end(mut frame: CallFrame, threw: bool) -> bool {
     if frame.on_stack {
         SPAN_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
@@ -343,27 +450,39 @@ fn on_end(frame: CallFrame, threw: bool) -> bool {
         return false;
     }
 
+    // The one place the interned identity is copied into an owned String: a span
+    // that actually survives the keep rule. Rare by construction, unlike the
+    // per-call allocation this replaced. A begin handler that derived a better
+    // display name ("PUBLISH oms.webhooks") wins over the function identity —
+    // the destination is the shared identity two services see, where the method
+    // name is one side's implementation detail.
+    let name = frame
+        .span_name
+        .take()
+        .unwrap_or_else(|| frame.name.to_string());
+    let bypass_span_cap = frame.bypass_span_cap;
     let span = NativeSpan {
         trace_id: frame.trace_id,
         span_id: frame.span_id,
         parent_span_id: frame.parent_span_id,
-        // The one place the interned identity is copied into an owned String: a span
-        // that actually survives the keep rule. Rare by construction, unlike the
-        // per-call allocation this replaced.
-        name: frame.name.to_string(),
+        name,
         started_at: frame.started_at,
         ended_at: now_utc(),
         status: if threw { "error".into() } else { "ok".into() },
         duration_nanoseconds: duration,
         attributes: frame.attributes,
     };
-    push_span(span)
+    push_span(span, bypass_span_cap)
 }
 
-fn push_span(span: NativeSpan) -> bool {
+/// `bypass_cap`: see `CallFrame::bypass_span_cap`'s docblock — GAP 2 exempts a
+/// `MessagingPublish` span from `MAX_SPANS_PER_REQUEST` because its
+/// traceparent is already on the wire by the time this call is even made.
+/// Every other caller passes `false` and keeps the existing backstop.
+fn push_span(span: NativeSpan, bypass_cap: bool) -> bool {
     REQUEST_SPANS.with(|spans| {
         let mut spans = spans.borrow_mut();
-        if spans.len() < MAX_SPANS_PER_REQUEST {
+        if bypass_cap || spans.len() < MAX_SPANS_PER_REQUEST {
             spans.push(span);
             true
         } else {
@@ -397,17 +516,22 @@ pub fn record_userland_span(
     } else {
         trace_id
     };
-    push_span(NativeSpan {
-        trace_id,
-        span_id,
-        parent_span_id: parent,
-        name,
-        started_at,
-        ended_at,
-        status,
-        duration_nanoseconds: 0,
-        attributes,
-    });
+    push_span(
+        NativeSpan {
+            trace_id,
+            span_id,
+            parent_span_id: parent,
+            name,
+            started_at,
+            ended_at,
+            status,
+            duration_nanoseconds: 0,
+            attributes,
+        },
+        // A userland-recorded span is never a MessagingPublish frame (those
+        // are native-only), so the cap applies exactly as before GAP 2.
+        false,
+    );
 }
 
 pub fn drain() -> Vec<NativeSpan> {
@@ -455,6 +579,215 @@ const NETWORK_FUNCTIONS: &[&str] = &["curl_exec", "curl_multi_exec", "file_get_c
 
 fn is_network_function(name: &str) -> bool {
     NETWORK_FUNCTIONS.contains(&name)
+}
+
+/// Messaging PUBLISH calls: producer span + destination vocabulary + native W3C
+/// header injection into the client's application-header table, with zero app
+/// changes — the replacement for the estates' bespoke publish shims.
+///
+/// `Bunny\AbstractClient::publish` — the trait method `ClientMethods::publish`
+/// (ClientMethods.php:1769), trait-copied into `AbstractClient` (`common.scope`
+/// reports `Bunny\AbstractClient`, inherited by pointer into
+/// SyncClient/AsyncClient) — chosen over `Bunny\Channel::publish` deliberately
+/// and finally:
+///
+///   * Bunny's own chain `Channel::publish` → `publishImpl` (trait alias) →
+///     `AbstractClient::publish` always passes all seven arguments POSITIONALLY,
+///     so the headers array is always a real, present argument — the
+///     default-argument / `RECV_INIT` clobber problem (see
+///     `zend_helpers::inject_array_entries`) never arises at this frame.
+///   * It sidesteps trait-alias naming (`publishImpl`'s reported name) entirely,
+///     and cannot double-observe: neither `Bunny\Channel::publish` nor
+///     `publishImpl` enters any table.
+///   * Args here: 0=`$channel`(int), 1=`$body`, 2=`$headers`(array),
+///     3=`$exchange`, 4=`$routingKey` — and `$this` IS the client, so its
+///     protected `$options` (vhost, host, port) is one native property read
+///     away. That read is what makes this path strictly better than the bespoke
+///     bridge, which had to take the vhost as an argument and could never set
+///     `server.address` at all (the "broker not identified" map node).
+///
+/// This is vendor code and stays observable anyway: the `/vendor/` excluded-path
+/// demotion applies only to `SpanPolicy::UserSpan` (see the begin trampoline),
+/// never to a table-named policy.
+///
+/// UPDATE (RdKafka/amqplib waves): the FOLLOW-UPS this docblock used to list
+/// have landed — see `begin_messaging_publish_rdkafka` and
+/// `begin_messaging_publish_amqplib` for their own begin handlers, and their
+/// contracts (`chronos-desktop`'s task record) for the reasoning behind each
+/// broker's shape. The corrected premise for amqplib: injection does NOT need
+/// a userland call after all — `$msg->properties['application_headers']` has
+/// no runtime type enforcement, so a raw PHP array is exactly as legal a wire
+/// value as a real `AMQPTable` (see `inject_amqp_application_headers`'s
+/// docblock). NATS is a separate table below (`Connection::sendMessage`
+/// serves publish AND subscribe banking by runtime type, so it cannot share a
+/// name-keyed policy with these three).
+///
+/// STILL listed, not built — each its own follow-up, cited by its contract:
+///   * RdKafka: the `Conf::set`/`newTopic` handle-keyed side-channel bank that
+///     would recover `server.address`/cluster/consumer.group (v2 candidate;
+///     needs a new librdkafka C dependency to do properly — see the RdKafka
+///     contract's "vhost/cluster/server.address recovery" section).
+///   * amqplib: `batch_basic_publish`/`publish_batch` (messages queued and
+///     wire-written later, in a loop this table entry never sees) and
+///     `basic_get` (a one-shot PULL API with no callback boundary — a poll
+///     span is possible, a message-scoped request is not, same reasoning as
+///     RdKafka's own pull API — but out of scope of the callback-consumer ask
+///     this wave targeted).
+#[cfg_attr(not(feature = "zend-observer"), allow(dead_code))]
+const MESSAGING_PUBLISH_METHODS: &[&str] = &[
+    "Bunny\\AbstractClient::publish",
+    "RdKafka\\ProducerTopic::produce",
+    "RdKafka\\ProducerTopic::producev",
+    "PhpAmqpLib\\Channel\\AMQPChannel::basic_publish",
+];
+
+/// Messaging consume DISPATCH points: the client's own method that hands one
+/// delivery to the application callback — the only stable native scope boundary
+/// a raw AMQP consumer has (there is no framework seam, no envelope, no stamp).
+///
+/// `Bunny\Channel::onBodyComplete` (Channel.php:707) is where a completed
+/// deliver frame becomes `$callback($message, $this, $this->client)` (:743).
+/// Its begin opens a message-scoped request ('QUEUE', the queue name, the
+/// traceparent from the message's application headers); its end closes it,
+/// attaching the scope's LastThrow — which is what replaces the estates'
+/// explicit `consumeFailed()` call sites with no app code at all.
+///
+/// `PhpAmqpLib\Channel\AMQPChannel::basic_deliver` joins it for the identical
+/// reason (amqplib contract, "Consume scoping"): its whole body IS
+/// `call_user_func($this->callbacks[$consumer_tag], $message)` plus
+/// delivery-info bookkeeping, so it is the only stable native callback
+/// boundary this client has. `Basis\Nats\Client::processMsg` joins for the
+/// same shape (NATS contract §5(a)) — its own begin handler additionally
+/// declines (falls to `ObserveOnly`) when the dispatch target is a `Queue`
+/// buffer (§5(b), no application code runs) or an RPC reply to this client's
+/// own `dispatch()` (§5(c)), neither of which is a real inbound job.
+/// `close_messaging_delivery` is broker-agnostic (it only reads `LastThrow`
+/// and `DELIVERY_SCOPE`) and is reused verbatim for all three.
+const MESSAGING_CONSUME_DISPATCH: &[&str] = &[
+    "Bunny\\Channel::onBodyComplete",
+    "PhpAmqpLib\\Channel\\AMQPChannel::basic_deliver",
+    "Basis\\Nats\\Client::processMsg",
+];
+
+/// Messaging consume SUBSCRIBE points, observed as a side channel only (like
+/// `curl_setopt`): `Bunny\Channel::consume`'s END banks
+/// `(channel handle, retval->consumerTag) → arg-1 queue` into `CONSUMER_QUEUES`
+/// so the dispatch scope can name the queue this consumer actually asked for.
+/// `Channel::run` needs no entry — it calls `consume()` internally, which is
+/// observed. The AsyncClient promise retval banks nothing and naming falls back
+/// to routing key / exchange, honestly.
+///
+/// `PhpAmqpLib\Channel\AMQPChannel::basic_consume` joins for the identical
+/// reason — its retval is the FINAL consumer tag (server-assigned when the
+/// caller passed `''`), a plain STRING rather than Bunny's
+/// `MethodBasicConsumeOkFrame` object, so its own END-time banking function
+/// (`maybe_bank_amqplib_consumer_queue`) reads the retval differently even
+/// though it writes into the SAME `CONSUMER_QUEUES` map (see
+/// `ConsumeSubscribeKind`, which tells the two apart at END without a second
+/// map). NATS needs no entry here at all: subscribe banking for NATS happens
+/// inside `Connection::sendMessage`'s OWN begin handler
+/// (`begin_nats_send_message`'s `Subscribe` branch) — its `sid` is minted
+/// client-side, before the wire write, so there is no "wait for the server's
+/// OK frame" step to bank at END the way Bunny/amqplib need.
+const MESSAGING_CONSUME_SUBSCRIBE: &[&str] = &[
+    "Bunny\\Channel::consume",
+    "PhpAmqpLib\\Channel\\AMQPChannel::basic_consume",
+];
+
+/// PULL-style consume calls with no callback boundary at all — see
+/// `SpanPolicy::MessagingPoll`'s docblock. `RdKafka\ConsumerTopic::consume` is
+/// the legacy per-topic form; `RdKafka\KafkaConsumer::consume` is the modern
+/// one. `Basis\Nats\Queue::fetchAll` is JetStream's pull-batch fetch (NATS
+/// contract §5(d)) — `Consumer::handle()`, which calls it internally and then
+/// invokes the app's handler in its own `foreach`, gets no span of its own
+/// (same reasoning as `Bunny\Channel::run`, which also just calls an observed
+/// method).
+const MESSAGING_POLL_METHODS: &[&str] = &[
+    "RdKafka\\KafkaConsumer::consume",
+    "RdKafka\\ConsumerTopic::consume",
+    "Basis\\Nats\\Queue::fetchAll",
+];
+
+/// NATS's single wire choke point (NATS contract §0): every publish AND every
+/// subscribe registration passes through this ONE method, disambiguated only
+/// at runtime by the class of arg 0 (`Basis\Nats\Message\Publish` vs
+/// `Basis\Nats\Message\Subscribe`) — `observe_policy` cannot express that with
+/// a fixed per-function verdict the way the name-keyed tables above do, so it
+/// gets its own `SpanPolicy` (`MessagingNatsSend`) whose begin handler
+/// (`begin_nats_send_message`) does the runtime dispatch instead.
+const MESSAGING_NATS_SEND_METHOD: &str = "Basis\\Nats\\Connection::sendMessage";
+
+/// NATS's synchronous request/reply wrapper (NATS contract §6): `span.kind =
+/// client`, RPC-shaped, not a messaging producer+consumer pair — the
+/// underlying `publish()` call already gets its own full PUBLISH span via
+/// `Connection::sendMessage` (nested inside this one), so this span only adds
+/// the "this was a round trip, not fire-and-forget" fact. Folded into the
+/// generic `IoSpan` policy (`is_messaging_rpc` joins the `IoSpan` eligibility
+/// check) rather than given its own `SpanPolicy` variant: unlike
+/// `MessagingPoll`, everything this span needs (the subject argument, the
+/// destination vocabulary) is knowable at BEGIN from a plain scalar argument,
+/// exactly the shape `capture_io_detail`'s other branches already handle.
+const MESSAGING_NATS_RPC_METHOD: &str = "Basis\\Nats\\Client::dispatch";
+
+/// Process kill switch for the whole native messaging table set:
+/// `CHRONOS_PHP_MESSAGING_AUTO`, default ON; an explicit off empties every
+/// messaging table (publish, dispatch, subscribe) at once. Resolved once per
+/// process — the same `OnceLock` shape as `span_all_userland`, and that
+/// process-stability is what makes it safe under `cached_policy`.
+///
+/// This flag is also the CONSUME-side ownership switch: unlike publish (which
+/// the per-request `suppress_native("messaging")` seam covers), a userland
+/// consumer wrapper runs strictly AFTER the native dispatch scope has opened,
+/// so no per-request declaration can reach the decision in time.
+fn messaging_auto() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| crate::settings::flag("CHRONOS_PHP_MESSAGING_AUTO", true))
+}
+
+fn is_messaging_publish(name: &str) -> bool {
+    messaging_auto() && MESSAGING_PUBLISH_METHODS.contains(&name)
+}
+
+fn is_messaging_dispatch(name: &str) -> bool {
+    messaging_auto() && MESSAGING_CONSUME_DISPATCH.contains(&name)
+}
+
+fn is_messaging_subscribe(name: &str) -> bool {
+    messaging_auto() && MESSAGING_CONSUME_SUBSCRIBE.contains(&name)
+}
+
+fn is_messaging_poll(name: &str) -> bool {
+    messaging_auto() && MESSAGING_POLL_METHODS.contains(&name)
+}
+
+fn is_nats_send(name: &str) -> bool {
+    messaging_auto() && name == MESSAGING_NATS_SEND_METHOD
+}
+
+fn is_messaging_rpc(name: &str) -> bool {
+    messaging_auto() && name == MESSAGING_NATS_RPC_METHOD
+}
+
+/// GAP 1's other observed point: the protobuf runtime's own serializer. This
+/// estate's publishers never set the AMQP `type` header (`begin_messaging_publish`'s
+/// PRIMARY source of `messaging.message.name`), so nothing marks a publish
+/// body with its schema class — and without that name the schema registry
+/// cannot map a span to a protobuf type at all.
+///
+/// The fix needs no application code because `serializeToString`'s RETURN
+/// VALUE is the exact bytes about to be published and `$this` is exactly the
+/// generated DTO class the registry needs — see `bank_serialized_message`'s
+/// docblock for how the two are joined to a later publish body.
+///
+/// One name only, not a class-prefix table like `CACHE_CLASS_PREFIXES`:
+/// every generated message, whatever its own namespace, calls this ONE
+/// inherited method (`Google\Protobuf\Internal\Message::serializeToString`),
+/// never overriding it — so matching the declaring method's qualified name
+/// covers every schema class in one entry, with no per-class registration.
+const PROTOBUF_SERIALIZE_METHOD: &str = "Google\\Protobuf\\Internal\\Message::serializeToString";
+
+fn messaging_auto_serialize_hook(name: &str) -> bool {
+    messaging_auto() && name == PROTOBUF_SERIALIZE_METHOD
 }
 
 /// Stream functions that are network calls only SOMETIMES. `file_get_contents` is the
@@ -682,10 +1015,53 @@ fn observe_policy(name: &str, is_internal: bool) -> Option<SpanPolicy> {
     if sql_prepare_method(name) || sql_this_prepare_method(name) {
         return Some(SpanPolicy::ObserveOnly);
     }
+    // Messaging tables, checked BEFORE the `is_internal` early-return below
+    // because these are userland vendor methods — and immune to the `/vendor/`
+    // excluded-path demotion, which applies to `UserSpan` only (see the begin
+    // trampoline): being vendor code is the point of a name table.
+    if is_messaging_publish(name) {
+        return Some(SpanPolicy::MessagingPublish);
+    }
+    if is_messaging_dispatch(name) {
+        return Some(SpanPolicy::MessagingDeliver);
+    }
+    if is_messaging_subscribe(name) {
+        // Side channel only, like curl_setopt: the END handler banks the
+        // consumerTag → queue mapping. No span.
+        return Some(SpanPolicy::ObserveOnly);
+    }
+    if is_messaging_poll(name) {
+        return Some(SpanPolicy::MessagingPoll);
+    }
+    if is_nats_send(name) {
+        // The runtime-typed publish/subscribe/neither dispatch — see
+        // `MESSAGING_NATS_SEND_METHOD`'s docblock. `RdKafka::produce`/
+        // `producev` are both C-extension methods (`is_internal` true for
+        // both) and this NATS method is userland — all still checked here,
+        // ahead of the `is_internal` return below, for the identical reason
+        // the other messaging tables are.
+        return Some(SpanPolicy::MessagingNatsSend);
+    }
+    if messaging_auto_serialize_hook(name) {
+        // Checked here rather than after the `is_internal` return below for
+        // exactly the reason the messaging tables are: whichever protobuf
+        // runtime an estate ships (the C extension's compiled `Message`, or
+        // the pure-PHP composer fallback) this method must be observed either
+        // way — the C extension form IS internal, and would be silently
+        // skipped by the `is_internal` early return two branches down.
+        // Side channel only, like `curl_setopt` / the subscribe table above:
+        // the END handler banks `$this`'s class against the returned bytes
+        // (`bank_serialized_message`). No span of its own.
+        return Some(SpanPolicy::ObserveOnly);
+    }
     if dst_event_kind_for(name).is_some() {
         return Some(SpanPolicy::ObserveOnly);
     }
-    if is_network_function(name) || sql_io_function(name) || cache_io_method(name) {
+    if is_network_function(name)
+        || sql_io_function(name)
+        || cache_io_method(name)
+        || is_messaging_rpc(name)
+    {
         return Some(SpanPolicy::IoSpan);
     }
     if is_internal {
@@ -1151,6 +1527,61 @@ unsafe extern "C" fn chronos_begin_trampoline(
         policy = SpanPolicy::ObserveOnly;
     }
 
+    // Native messaging observation, handled ahead of the generic paths because
+    // every one of these does something no other policy does: a publish writes
+    // an argument (or property) zval and must do part of it even with no open
+    // request (the enqueued-at stamp), a dispatch opens/closes a whole request,
+    // and NATS's single send method decides its own role from arg 0's runtime
+    // type. Each handler keeps the begin/end frame pairing itself, mirroring
+    // the ObserveOnly branch's guard exactly on every pass-through path.
+    if policy == SpanPolicy::MessagingPublish {
+        if SUPPRESS_MESSAGING.with(std::cell::Cell::get) {
+            // The userland bridge (`BunnyTelemetry::publish`) declared ownership
+            // for this request: its reserved span id is already on the wire, so
+            // the native path emits no duplicate span and writes no header —
+            // demoted to a plain paired frame, exactly like a suppressed I/O
+            // span. (Even unsuppressed, the caller-wins hash-add could not have
+            // clobbered the bridge's traceparent; suppression removes the SPAN.)
+            policy = SpanPolicy::ObserveOnly;
+        } else {
+            // One name-keyed table, three broker shapes — dispatched here
+            // rather than inside one shared function, because the argument
+            // layout, the header-injection mechanic and the destination
+            // vocabulary genuinely differ per broker (see each function's
+            // own docblock); only the SpanPolicy and the surrounding
+            // begin/end pairing are shared.
+            match &*name {
+                "RdKafka\\ProducerTopic::produce" | "RdKafka\\ProducerTopic::producev" => {
+                    begin_messaging_publish_rdkafka(execute_data, &name, &interned)
+                }
+                "PhpAmqpLib\\Channel\\AMQPChannel::basic_publish" => {
+                    begin_messaging_publish_amqplib(execute_data, &name, &interned)
+                }
+                _ => begin_messaging_publish_bunny(execute_data, &name, &interned),
+            }
+            return;
+        }
+    } else if policy == SpanPolicy::MessagingDeliver {
+        match &*name {
+            "PhpAmqpLib\\Channel\\AMQPChannel::basic_deliver" => {
+                begin_messaging_delivery_amqplib(execute_data, &name, &interned)
+            }
+            "Basis\\Nats\\Client::processMsg" => {
+                begin_messaging_delivery_nats(execute_data, &name, &interned)
+            }
+            _ => begin_messaging_delivery_bunny(execute_data, &name, &interned),
+        }
+        return;
+    } else if policy == SpanPolicy::MessagingNatsSend {
+        begin_nats_send_message(execute_data, &name, &interned);
+        return;
+    } else if policy == SpanPolicy::MessagingPoll && SUPPRESS_MESSAGING.with(std::cell::Cell::get) {
+        // Symmetry with the `MessagingPublish` demotion above (RdKafka
+        // contract, "Suppression seam"): a userland bridge that declared
+        // messaging ownership for this request covers the poll side too.
+        policy = SpanPolicy::ObserveOnly;
+    }
+
     // A dual-purpose stream call is a client span only when its target is actually
     // remote. Read once here: the verdict decides the policy, and a remote target is
     // also the span's `http.url`, so re-reading the argument later would be waste.
@@ -1187,6 +1618,26 @@ unsafe extern "C" fn chronos_begin_trampoline(
         track_curl_setopt(execute_data);
     } else if &*name == "curl_setopt_array" {
         track_curl_setopt_array(execute_data);
+    } else if is_messaging_subscribe(&name) {
+        // Remember the subscribe method's own zend_function pointer, TAGGED
+        // with which broker's END-time banking shape it needs, so the END
+        // trampoline can recognise it with one pointer scan (the end handler
+        // has no interned frame for calls made outside any request, which is
+        // exactly when a subscribe call runs — worker startup). The banking
+        // itself happens at end, where the retval exists. See
+        // `maybe_bank_consumer_queue` and `ConsumeSubscribeKind`.
+        let kind = if &*name == "PhpAmqpLib\\Channel\\AMQPChannel::basic_consume" {
+            ConsumeSubscribeKind::Amqplib
+        } else {
+            ConsumeSubscribeKind::Bunny
+        };
+        let function = zend_helpers::function_ptr(execute_data);
+        CONSUME_FNS.with(|fns| {
+            let mut fns = fns.borrow_mut();
+            if !fns.iter().any(|(known, _)| *known == function) {
+                fns.push((function, kind));
+            }
+        });
     }
 
     // ObserveOnly is the bulk path (every unlisted userland call lands here): push a
@@ -1344,6 +1795,30 @@ unsafe fn capture_io_detail(
                 .push((crate::http_capture::URL_FULL.into(), url.clone()));
             frame.attributes.push(("http.url".into(), url));
         }
+    } else if name == MESSAGING_NATS_RPC_METHOD {
+        // NATS contract §6: `span.kind=client` is already pushed above (every
+        // `IoSpan` gets it); everything else this span needs is `dispatch`'s
+        // own arg 0 — the "name" it sends and blocks for a reply against, the
+        // same fact the RPC-shaped span is named after. The underlying
+        // publish (via `Connection::sendMessage`, nested inside this call)
+        // gets its own full PUBLISH span with the payload facts — this span
+        // only adds "this was a round trip," not a second copy of the
+        // message vocabulary.
+        use crate::messaging;
+        if let Some(subject) = zend_helpers::arg_scalar_string(execute_data, 0, 512) {
+            frame
+                .attributes
+                .push(("messaging.system".into(), messaging::SYSTEM_NATS.into()));
+            let destination = messaging::nats_destination(&subject);
+            for (key, value) in destination.attributes() {
+                frame.attributes.push((key.into(), value));
+            }
+            frame.span_name = Some(messaging::labeled(
+                "NATS.request",
+                &destination,
+                messaging::SYSTEM_NATS,
+            ));
+        }
     }
 }
 
@@ -1355,6 +1830,13 @@ unsafe extern "C" fn chronos_end_trampoline(
     // A function call observed while an exception is propagating (or that itself
     // threw) unwinds with EG(exception) set — mark the span errored.
     let threw = zend_helpers::exception_pending();
+
+    // Consumer-subscription banking runs OUTSIDE the frame stack, because
+    // `Channel::consume` usually runs where no frame was pushed at all (worker
+    // startup, no request open, CLI auto-start off — the ObserveOnly push is
+    // context-gated). The recognition inside is one pointer compare per end
+    // call, so every other function pays essentially nothing for it.
+    maybe_bank_consumer_queue(execute_data, retval);
 
     CALL_FRAMES.with(|frames| {
         let frame = frames.borrow_mut().pop();
@@ -1402,6 +1884,16 @@ unsafe extern "C" fn chronos_end_trampoline(
                 bank_prepared_statement(execute_data, retval, prepare_sql_arg_index(&frame.name));
             } else if sql_this_prepare_method(&frame.name) {
                 rebank_prepared_statement_for_this(execute_data, retval, &frame.name);
+            } else if &*frame.name == PROTOBUF_SERIALIZE_METHOD {
+                // GAP 1: only the END handler holds the serialized bytes (the
+                // return value) — see `bank_serialized_message`.
+                bank_serialized_message(execute_data, retval);
+            } else if MESSAGING_POLL_METHODS.contains(&frame.name.as_ref()) {
+                // `SpanPolicy::MessagingPoll`'s END-time reader: almost
+                // everything worth saying about a pull-style consume call is
+                // only knowable from its RETURN VALUE — see that policy's
+                // own docblock.
+                capture_messaging_poll_result(execute_data, retval, &mut frame);
             }
             // DST: record the observed result of known non-deterministic builtins.
             if crate::dst_spool::is_active() {
@@ -1424,6 +1916,13 @@ unsafe extern "C" fn chronos_end_trampoline(
                 }
                 let is_internal = zend_helpers::is_internal_function(execute_data);
                 record_call_path_leave(is_internal);
+            }
+            // A frame that OPENED a message-scoped request closes it before it
+            // is retired — after the DST bookkeeping above (the recording must
+            // still be active when the leave is counted) and before `on_end`
+            // (which for this ObserveOnly-shaped frame emits nothing anyway).
+            if frame.owns_delivery_scope {
+                close_messaging_delivery(execute_data, threw);
             }
             if on_end(frame, threw) {
                 // A kept child pins its ancestor so the waterfall stays connected.
@@ -1460,6 +1959,2298 @@ thread_local! {
     /// — never to a dropped span.
     static PREPARED_STATEMENTS: RefCell<std::collections::HashMap<u32, String>> =
         RefCell::new(std::collections::HashMap::new());
+    /// `(channel object handle, consumer tag) → queue name`, banked at
+    /// `Bunny\Channel::consume`'s end so the delivery scope can name the queue
+    /// this consumer actually asked for (the deliver frame itself only carries
+    /// exchange + routing key). Unlike CURL_HEADERS / PREPARED_STATEMENTS this
+    /// is NOT cleared in `set_request_context`: a subscription outlives every
+    /// message-scoped request the worker opens — one `consume()`, thousands of
+    /// deliveries — so per-request clearing would blind the lookup after the
+    /// first message. Process lifetime, capped, insert-overwrites: consumer tags
+    /// are server-unique per channel, so an object-handle recycle colliding with
+    /// a still-live identical tag is a non-issue in practice — and the overwrite
+    /// means the newest subscription always wins anyway.
+    static CONSUMER_QUEUES: RefCell<std::collections::HashMap<(u32, String), String>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// The `zend_function` pointers of every observed subscribe method seen
+    /// this PROCESS (`Bunny\Channel::consume`, `AMQPChannel::basic_consume`),
+    /// each tagged with which broker's END-time retval shape it needs —
+    /// banked at BEGIN so the END trampoline can recognise it with a small
+    /// linear scan (the end handler often has no frame for it: subscription
+    /// happens outside any request, where `ObserveOnly` frames are not
+    /// pushed). A `Vec`, not the single `Cell` an earlier version of this
+    /// design used: that assumed exactly one subscribe method existed at
+    /// all, which stopped being true the moment a second broker's table
+    /// entry landed — TWO different vendored clients can be loaded in one
+    /// estate, and the old single-slot design would have let the second
+    /// one's registration silently clobber the first's, breaking whichever
+    /// broker's subscribe call ran less recently. Bounded by construction: as
+    /// many entries as there are subscribe methods in the messaging tables
+    /// (currently 2), so the scan is never a real cost. Function structs are
+    /// process-lifetime engine allocations, the same stability the interner
+    /// relies on.
+    static CONSUME_FNS: RefCell<Vec<(usize, ConsumeSubscribeKind)>> =
+        RefCell::new(Vec::new());
+    /// The route of the message-scoped request the CURRENT delivery frame
+    /// opened, taken by the close. Depth-1 by construction: a nested dispatch
+    /// hits the already-active guard and never owns a scope. See
+    /// `DeliveryRoute`'s docblock for why amqplib defers the actual name to
+    /// close time instead of knowing it here.
+    static DELIVERY_SCOPE: RefCell<Option<DeliveryRoute>> = const { RefCell::new(None) };
+    /// NATS subscribe-side banking (NATS contract §4): `sid → (subject,
+    /// group)`, banked inside `begin_nats_send_message`'s `Subscribe` branch
+    /// — client-minted BEFORE the wire write, so (unlike Bunny/amqplib's
+    /// server-assigned consumer tags) there is no "wait for the server's OK
+    /// frame" step; banking happens at the same begin handler already doing
+    /// publish-side work, no END hook needed. Process lifetime, like
+    /// CONSUMER_QUEUES: a subscription outlives every message-scoped request
+    /// the worker opens.
+    static SUBSCRIBE_SIDS: RefCell<std::collections::HashMap<String, (String, String)>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// GAP 1's identity bank (`messaging::MessageBank`): `(class, bytes)`
+    /// banked at every observed `serializeToString`, looked up by a
+    /// `MessagingPublish` begin with no `type` header. PER-REQUEST, unlike
+    /// CONSUMER_QUEUES above — a publish body only ever needs to match
+    /// something serialized THIS request (a stale cross-request match would
+    /// be exactly the kind of coincidence `MessageBank`'s docblock argues a
+    /// short-lived, per-request scope is what keeps cheap), so it is cleared
+    /// in both `set_request_context` and `clear_request_context` alongside
+    /// CURL_HEADERS / PREPARED_STATEMENTS.
+    static MESSAGE_BANK: RefCell<crate::messaging::MessageBank> =
+        RefCell::new(crate::messaging::MessageBank::new());
+}
+
+/// Ceiling on remembered consumer subscriptions per process. A worker owns a
+/// handful; 256 is a runaway backstop, not a budget. Insert always lands (the
+/// map overwrites known keys and refuses only NEW keys past the cap), because a
+/// re-subscribe under a recycled handle must never keep the OLD queue name.
+#[cfg(feature = "zend-observer")]
+const MAX_CONSUMER_QUEUES: usize = 256;
+
+/// Ceiling on remembered NATS subscriptions per process — the `SUBSCRIBE_SIDS`
+/// sibling of `MAX_CONSUMER_QUEUES` above, same reasoning: a worker owns a
+/// handful of subjects, insert always lands for a KNOWN sid (client-minted
+/// sids do not collide within one process), and only a brand new sid past the
+/// cap is refused.
+#[cfg(feature = "zend-observer")]
+const MAX_SUBSCRIBE_SIDS: usize = 256;
+
+/// What a message-scoped delivery request's ROUTE — the string
+/// `close_messaging_delivery` hands `crate::end_request` as `http.route`, and
+/// (in provisional form, see below) the name `chronos_job_started` marks the
+/// delivery in-flight under — is known as, at the moment `DELIVERY_SCOPE` is
+/// written.
+///
+///   * `Known`: Bunny and NATS. Every fact the route needs (the banked
+///     subscription queue / NATS subject, the routing key / exchange
+///     fallback) is a plain PHP property already populated by the time this
+///     call's BEGIN handler runs — there is nothing left to discover later,
+///     so the resolved `String` is carried to CLOSE unchanged.
+///   * `DeferredAmqplib`: `PhpAmqpLib\Channel\AMQPChannel::basic_deliver`'s
+///     envelope — consumer tag, exchange, routing key, `redelivered` — is
+///     NOT yet a property on `$message` at BEGIN. It lives in `$reader`, the
+///     raw AMQP method-frame buffer this call's OWN body has not parsed yet;
+///     `$reader->read_shortstr()`/`read_longlong()`/`read_bit()` are the
+///     FIRST statements of `basic_deliver`'s body (verified against the
+///     vendored source), and calling them ourselves from the begin handler
+///     would consume the exact same cursor the function's real parse is
+///     about to run — corrupting the very call we are only supposed to be
+///     watching. The one place these facts become safely re-readable
+///     PROPERTIES is on `$message` itself, once `setDeliveryInfo()` /
+///     `setConsumerTag()` (both called before `call_user_func`, so
+///     unconditionally done by the time this call ends) have run.
+///     `DeferredAmqplib` is a bare marker carrying nothing: resolution
+///     (`resolve_amqplib_delivery_route`) re-reads arg 1 fresh off the SAME
+///     `execute_data` the end trampoline is already holding, at CLOSE, when
+///     those properties are finally live. A consequence stated plainly: the
+///     in-flight job marker `begin_messaging_delivery_amqplib` writes is
+///     named with the `"amqp"` floor, not the real queue — an operator
+///     inspecting a HUNG delivery (worker killed mid-message, never
+///     reaching `close_messaging_delivery`) sees the broker, not the queue,
+///     until the message finishes. Narrow and structurally forced by the
+///     wire-parsing order, not a missed lookup.
+#[cfg(feature = "zend-observer")]
+enum DeliveryRoute {
+    Known(String),
+    DeferredAmqplib,
+}
+
+#[cfg(feature = "zend-observer")]
+impl DeliveryRoute {
+    /// Resolve to the actual route string. `execute_data` is the CLOSING
+    /// call's own — for a `DeferredAmqplib` scope this is always
+    /// `basic_deliver`'s `execute_data`, since `owns_delivery_scope` frames
+    /// close in the SAME end-trampoline invocation that popped them, never a
+    /// nested one (depth-1 by construction, `DELIVERY_SCOPE`'s own docblock).
+    ///
+    /// # Safety
+    /// Called from the Zend observer end handler with a valid `execute_data`
+    /// for the call being unwound.
+    unsafe fn resolve(self, execute_data: *mut ext_php_rs::ffi::zend_execute_data) -> String {
+        match self {
+            DeliveryRoute::Known(route) => route,
+            DeliveryRoute::DeferredAmqplib => resolve_amqplib_delivery_route(execute_data),
+        }
+    }
+}
+
+/// amqplib's queue-name fallback chain, re-read at CLOSE (see
+/// `DeliveryRoute::DeferredAmqplib`'s docblock): the queue this consumer
+/// subscribed with (`CONSUMER_QUEUES`, keyed by channel handle + the now-live
+/// `consumerTag` property), else the routing key, else the exchange, else
+/// the `"amqp"` floor — the exact chain `begin_messaging_delivery_bunny`
+/// already uses, restated for amqplib's (private, but engine-readable)
+/// property names. Also merges the destination + `redelivered` facts into
+/// the request-attribute bag here, since those too are only readable now —
+/// `crate::end_request` (called immediately after this returns) drains that
+/// bag into the root span, so a merge here still lands on the right span.
+///
+/// # Safety
+/// Called from the Zend observer end handler with a valid `execute_data` for
+/// the `basic_deliver` call being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn resolve_amqplib_delivery_route(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+) -> String {
+    use crate::messaging;
+
+    const FLOOR: &str = "amqp";
+
+    let Some(message) = zend_helpers::arg_object(execute_data, 1) else {
+        return FLOOR.to_owned();
+    };
+    let consumer_tag =
+        zend_helpers::object_property_string(message, "consumerTag", 256).unwrap_or_default();
+    let channel_handle = zend_helpers::this_object_handle(execute_data);
+    let queue = match (channel_handle, consumer_tag.is_empty()) {
+        (Some(handle), false) => CONSUMER_QUEUES.with(|map| {
+            map.borrow()
+                .get(&(handle, consumer_tag.clone()))
+                .cloned()
+                .unwrap_or_default()
+        }),
+        _ => String::new(),
+    };
+    let routing_key = zend_helpers::object_property_string(message, "routingKey", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let exchange = zend_helpers::object_property_string(message, "exchange", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let redelivered =
+        zend_helpers::object_property_bool(message, "redelivered").unwrap_or(false);
+
+    // vhost: readable at BEGIN too (the connection is already live by
+    // `basic_deliver`-entry — the contract's own "No gap" note), but re-read
+    // here rather than threaded through `DELIVERY_SCOPE` — one less thing
+    // that marker needs to carry, and this runs once per delivery regardless.
+    let channel = zend_helpers::this_object(execute_data);
+    let connection = channel.and_then(|c| zend_helpers::object_property_object(c, "connection"));
+    let vhost = connection
+        .and_then(|c| zend_helpers::object_property_string(c, "vhost", 256))
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+
+    let destination = messaging::amqp_destination(&vhost, &exchange, &routing_key, &queue);
+    let mut facts: Vec<(String, String)> = destination
+        .attributes()
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect();
+    if redelivered {
+        facts.push(("messaging.message.redelivered".into(), "true".into()));
+    }
+    crate::request_attributes::merge(facts);
+
+    if !queue.is_empty() {
+        queue
+    } else if !routing_key.is_empty() {
+        routing_key
+    } else if !exchange.is_empty() {
+        exchange
+    } else {
+        FLOOR.to_owned()
+    }
+}
+
+/// Which broker's END-time retval shape a banked subscribe function needs —
+/// see `CONSUME_FNS`'s docblock.
+#[cfg(feature = "zend-observer")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsumeSubscribeKind {
+    /// `Bunny\Channel::consume`: retval is a `MethodBasicConsumeOkFrame`
+    /// OBJECT with a public `consumerTag` property.
+    Bunny,
+    /// `PhpAmqpLib\Channel\AMQPChannel::basic_consume`: retval is the final
+    /// consumer tag as a plain STRING directly (server-assigned when the
+    /// caller passed `''`) — no wrapper object at all.
+    Amqplib,
+}
+
+/// Bank one successful subscribe call's `(channel, consumerTag) → queue`.
+/// Called from the end trampoline for EVERY observed call; the lookup
+/// against `CONSUME_FNS` rejects everything that is not a banked subscribe
+/// function in one small linear scan, then dispatches to whichever broker's
+/// retval shape that function needs.
+///
+/// # Safety
+/// Called from the Zend observer end handler, where execute_data and retval are
+/// both still valid for the frame being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn maybe_bank_consumer_queue(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    retval: *mut ext_php_rs::ffi::zval,
+) {
+    let function = zend_helpers::function_ptr(execute_data);
+    if function == 0 {
+        return;
+    }
+    let kind = CONSUME_FNS.with(|fns| {
+        fns.borrow()
+            .iter()
+            .find(|(known, _)| *known == function)
+            .map(|(_, kind)| *kind)
+    });
+    match kind {
+        Some(ConsumeSubscribeKind::Bunny) => maybe_bank_bunny_consumer_queue(execute_data, retval),
+        Some(ConsumeSubscribeKind::Amqplib) => {
+            maybe_bank_amqplib_consumer_queue(execute_data, retval)
+        }
+        None => {}
+    }
+}
+
+/// Bank one successful `Bunny\Channel::consume`'s
+/// `(channel, consumerTag) → queue`.
+///
+/// The AsyncClient path returns a Promise rather than a
+/// `MethodBasicConsumeOkFrame`; a Promise has no `consumerTag` property, the
+/// read yields nothing and nothing is banked — naming then degrades to routing
+/// key / exchange at dispatch time, honestly (contract §6.5).
+///
+/// # Safety
+/// Called from the Zend observer end handler, where execute_data and retval are
+/// both still valid for the frame being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn maybe_bank_bunny_consumer_queue(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    retval: *mut ext_php_rs::ffi::zval,
+) {
+    let Some(channel) = zend_helpers::this_object_handle(execute_data) else {
+        return;
+    };
+    let Some(ok_frame) = zend_helpers::retval_object(retval) else {
+        return;
+    };
+    // `MethodBasicConsumeOkFrame::$consumerTag` is public; a Promise (async
+    // subscribe) has no such property and reads as None.
+    let Some(tag) = zend_helpers::object_property_string(ok_frame, "consumerTag", 256) else {
+        return;
+    };
+    if tag.is_empty() {
+        return;
+    }
+    // Channel::consume(callable $callback, $queue = "", ...): arg 1 is the queue
+    // the application asked for. A server-named queue ("" — the app let the
+    // broker pick) banks nothing; the dispatch fallback names the delivery from
+    // its routing key instead of recording an empty name.
+    let queue = zend_helpers::arg_scalar_string(execute_data, 1, 512).unwrap_or_default();
+    let queue = queue.trim().to_owned();
+    if queue.is_empty() {
+        return;
+    }
+    bank_consumer_queue(channel, tag, queue);
+}
+
+/// Bank one successful `PhpAmqpLib\Channel\AMQPChannel::basic_consume`'s
+/// `(channel, consumerTag) → queue` — the amqplib contract's "Consume
+/// scoping" section. Unlike Bunny's, the retval here is the final consumer
+/// tag as a plain STRING directly (verified against the vendored source,
+/// `AMQPChannel::basic_consume`: `return $consumer_tag;`, itself either the
+/// caller's own arg 1 or the server-assigned replacement read off the
+/// `basic.consume_ok` wait when the caller passed `''`) — no wrapper object,
+/// so no property read is needed at all.
+///
+/// # Safety
+/// Called from the Zend observer end handler, where execute_data and retval are
+/// both still valid for the frame being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn maybe_bank_amqplib_consumer_queue(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    retval: *mut ext_php_rs::ffi::zval,
+) {
+    let Some(channel) = zend_helpers::this_object_handle(execute_data) else {
+        return;
+    };
+    let Some(tag) = zend_helpers::scalar_to_string(retval).map(|s| s.trim().to_owned()) else {
+        return;
+    };
+    if tag.is_empty() {
+        return;
+    }
+    // basic_consume($queue = '', ...): arg 0 is the queue the application
+    // asked for. A server-named queue banks nothing, same honest degrade as
+    // Bunny's.
+    let queue = zend_helpers::arg_scalar_string(execute_data, 0, 512).unwrap_or_default();
+    let queue = queue.trim().to_owned();
+    if queue.is_empty() {
+        return;
+    }
+    bank_consumer_queue(channel, tag, queue);
+}
+
+/// The shared `CONSUMER_QUEUES` insert both banking functions above end
+/// with — same cap, same insert-overwrites-known-keys rule, one place to
+/// read instead of two copies drifting apart.
+#[cfg(feature = "zend-observer")]
+fn bank_consumer_queue(channel: u32, consumer_tag: String, queue: String) {
+    CONSUMER_QUEUES.with(|map| {
+        let mut map = map.borrow_mut();
+        let key = (channel, consumer_tag);
+        if map.len() >= MAX_CONSUMER_QUEUES && !map.contains_key(&key) {
+            return;
+        }
+        map.insert(key, queue);
+    });
+}
+
+/// GAP 1: bank one serialized protobuf message's identity —
+/// `Google\Protobuf\Internal\Message::serializeToString`'s end handler, called
+/// for EVERY observed call (the name compare in the end trampoline rejects
+/// everything else in one string comparison, the same shape as
+/// `maybe_bank_consumer_queue` above).
+///
+/// `$this` is read for its RUNTIME class (`object_class_name`, NOT
+/// `frame.name`'s declaring scope — see that helper's docblock for why the
+/// two differ for exactly this method) because that IS the schema type the
+/// registry needs: a generated `QlsProtocol\Shared\Webhook` never overrides
+/// `serializeToString`, so the function identity alone can only ever say
+/// "some `Message`". The RETURN VALUE is the serialized bytes about to leave
+/// the process — reading it here, at the moment it exists, is what makes this
+/// a zero-application-code seam: no app code, no SDK, no bespoke publisher
+/// wrapper had to change for the registry to learn the class again.
+///
+/// READ-ONLY: no zval is written here, unlike the publish path's header
+/// injection. A miss at any step (no `$this`, an unreadable class, a
+/// non-string or empty return) simply banks nothing — the later publish
+/// lookup already treats "nothing banked" as an absent name, identical to
+/// today's behaviour for an app that sets no `type` header.
+///
+/// # Safety
+/// Called from the Zend observer end handler with a valid `execute_data` and
+/// `retval` for the call being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn bank_serialized_message(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    retval: *mut ext_php_rs::ffi::zval,
+) {
+    let Some(object) = zend_helpers::this_object(execute_data) else {
+        return;
+    };
+    let Some(class) = zend_helpers::object_class_name(object) else {
+        return;
+    };
+    let Some(bytes) = zend_helpers::retval_string_bytes(retval) else {
+        return;
+    };
+    MESSAGE_BANK.with(|bank| bank.borrow_mut().record(&class, &bytes));
+}
+
+/// Wall-clock epoch seconds — the messaging paths' only wall reading. A wall
+/// clock on purpose, despite being the worse clock: the enqueued-at stamp is
+/// compared by ANOTHER process on another machine, so the only comparable
+/// instant is the one both machines claim about the same world (see
+/// `MessagingWait`'s reasoning, ported in `messaging.rs`).
+#[cfg(feature = "zend-observer")]
+fn epoch_seconds_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// One line per process per REASON when header injection degrades — the
+/// spool_log/heartbeat latch idiom. The consequence is stated because it is
+/// subtle: the span is still recorded (a recorded span whose id is not on the
+/// wire breaks nothing — the causality promise runs the other way), but the
+/// consumer of this message will root a fresh trace. A fabricated id is never
+/// placed on the wire by any fallback.
+#[cfg(feature = "zend-observer")]
+fn warn_injection_failure(reason: &'static str) {
+    warn_injection_failure_for("Bunny\\AbstractClient::publish", reason);
+}
+
+/// The broker-parameterised form every messaging publish path (Bunny,
+/// RdKafka, amqplib, NATS) now shares — one line per process per (method,
+/// reason) PAIR, since the three brokers' injectors fail for different
+/// reasons under different names and collapsing them onto one latch set
+/// would silently swallow a second broker's first warning if it happened to
+/// reuse a reason string an earlier broker already latched.
+fn warn_injection_failure_for(method: &'static str, reason: &'static str) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(&'static str, &'static str)>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut seen = match seen.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if seen.insert((method, reason)) {
+        eprintln!(
+            "chronos-php: traceparent not injected into {method} \
+             ({reason}); publish span recorded, its consumer will start a new trace"
+        );
+    }
+}
+
+/// The exact pass-through the ObserveOnly branch of the begin trampoline runs,
+/// as a function the messaging handlers can fall back to on ANY path that
+/// declines to act — so a declined publish/delivery keeps begin/end pairing
+/// (and the deterministic aggregate's balance) byte-identical to an unlisted
+/// userland call.
+#[cfg(feature = "zend-observer")]
+unsafe fn observe_only_fallback(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    name: &std::rc::Rc<str>,
+    interned: &crate::deterministic::InternedFunction,
+) {
+    let has_context = REQUEST_CONTEXT.with(|ctx| ctx.borrow().is_some());
+    if has_context || crate::dst_spool::is_active() {
+        let arguments = capture_tier_three_arguments(execute_data, interned);
+        let defining_file = if interned.internal {
+            None
+        } else {
+            interned.file()
+        };
+        record_call_path_enter(name, interned.internal, defining_file, &arguments);
+        push_frame(CallFrame::observe_only(name.clone()), interned.id);
+    }
+}
+
+/// PUBLISH observation for `MESSAGING_PUBLISH_METHODS` — producer span, the
+/// `MessagingDestination` vocabulary, and native W3C header injection, replacing
+/// the estates' bespoke publish shims with zero application changes.
+///
+/// Ordering inside is load-bearing:
+///
+///   1. Facts are read off the ORIGINAL argument list first — injection may
+///      copy-on-write the headers array, and the caller-wins rule means the
+///      caller's own `content-type`/`type` are the values that matter either way
+///      (native never writes those keys: they are application declarations).
+///   2. The frame is minted (`on_begin`) BEFORE the injection so the span id
+///      that goes on the wire is the id that will be recorded at end — the
+///      causality contract, satisfied the way the curl path proved.
+///   3. Injection runs OUTSIDE the request-context gate: the enqueued-at stamp
+///      rides EVERY publish, including one with no open request (a scheduled
+///      command's message has waited just as long). The trace headers, and the
+///      span itself, still require an open context.
+///
+/// Everything fail-open: any unreadable fact is an absent attribute, an
+/// injection failure is one warn-once line, and nothing here can change what
+/// the application publishes.
+///
+/// # Safety
+/// Called from the Zend observer begin handler with a valid execute_data.
+#[cfg(feature = "zend-observer")]
+unsafe fn begin_messaging_publish_bunny(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    name: &std::rc::Rc<str>,
+    interned: &crate::deterministic::InternedFunction,
+) {
+    use crate::messaging;
+
+    // Args at the AbstractClient::publish frame: 0=$channel(int), 1=$body,
+    // 2=$headers(array), 3=$exchange, 4=$routingKey. `$this` is the client.
+    let exchange = zend_helpers::arg_scalar_string(execute_data, 3, 512).unwrap_or_default();
+    let routing_key = zend_helpers::arg_scalar_string(execute_data, 4, 512).unwrap_or_default();
+    // The caller's own declarations, read from the headers argument. After the
+    // caller-wins merge these are unchanged by construction — native adds
+    // neither key — so reading before injection is reading the merged truth.
+    let content_type = zend_helpers::arg_array_str_key_string(execute_data, 2, "content-type", 256)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    // The AMQP `type` property: the PRIMARY seam for the DTO class name
+    // (`$headers['type'] = Webhook::class` is application data, not telemetry
+    // code), landing as `messaging.message.name` on BOTH halves natively.
+    let message_name = zend_helpers::arg_array_str_key_string(execute_data, 2, "type", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    // RAW bytes, not a lossy String: the encode decision (text vs base64) must
+    // see the payload as published or a protobuf body is corrupted before it.
+    let body = zend_helpers::arg_string_bytes(execute_data, 1);
+    // GAP 1's FALLBACK: this estate's publishers never set `type`, so the
+    // primary seam above is empty for every message. Recover the class from
+    // the `serializeToString` bank (`bank_serialized_message`) by looking up
+    // THIS EXACT body's identity. A miss (never serialized through the
+    // observed method — e.g. a hand-built string body) or an ambiguous
+    // identity (`MessageBank::record` poisons any identity two DIFFERENT
+    // classes touch this request) both fall through to the same absent name
+    // an app with no `type` header already gets: this fallback can only ever
+    // ADD a name, never invent a wrong one.
+    let message_name = if !message_name.is_empty() {
+        message_name
+    } else {
+        body.as_deref()
+            .and_then(|bytes| MESSAGE_BANK.with(|bank| bank.borrow().lookup(bytes).map(str::to_owned)))
+            .unwrap_or_default()
+    };
+
+    let context = REQUEST_CONTEXT.with(|ctx| ctx.borrow().as_ref().cloned());
+    let frame = context
+        .as_ref()
+        .map(|ctx| on_begin(ctx, name, SpanPolicy::MessagingPublish));
+
+    // Injection. Add-if-absent per key (`inject_array_entries`): a caller's own
+    // traceparent/tracestate/baggage/stamp always wins, never validated, never
+    // rewritten.
+    let mut entries: Vec<(&str, String)> = Vec::new();
+    if let Some(frame) = &frame {
+        if let Some(traceparent) = &frame.injected_traceparent {
+            entries.push(("traceparent", traceparent.clone()));
+        }
+    }
+    if let Some(ctx) = &context {
+        // Forward-as-is, verbatim — the same W3C contract
+        // `merge_propagation_headers` documents for curl.
+        if let Some(tracestate) = &ctx.tracestate {
+            entries.push(("tracestate", tracestate.clone()));
+        }
+        if let Some(baggage) = &ctx.baggage {
+            entries.push(("baggage", baggage.clone()));
+        }
+    }
+    entries.push((
+        messaging::ENQUEUED_AT_HEADER,
+        messaging::enqueued_at_stamp(epoch_seconds_now()),
+    ));
+    // THE GAP's fix: hand the CONSUME side the same class identity this span
+    // just resolved (`type` property or the `serializeToString` bank above) —
+    // whichever it is, it is never a guess (an empty `message_name` here means
+    // neither source yielded one, so nothing is injected: absent, not
+    // fabricated). Add-if-absent like every other entry, so an application
+    // that already sets this exact header keeps its own value.
+    if !message_name.is_empty() {
+        entries.push((messaging::SCHEMA_HEADER, message_name.clone()));
+    }
+    // BUG FIX (RdKafka contract): `bypass_span_cap` must reflect whether a
+    // promise actually went on the wire, not merely "this policy is
+    // MessagingPublish" — Bunny's chain always passes all 7 args positionally
+    // (see this function's own docblock), so injection here always has a real
+    // slot to write into; `inject_array_entries`'s `Ok`/`Err` is still the
+    // single source of truth, so a future change to Bunny's call shape (or an
+    // application calling `Client::publish` directly with defaults) degrades
+    // this correctly rather than silently keeping a stale `true`.
+    let injection = zend_helpers::inject_array_entries(execute_data, 2, &entries);
+    let propagated = injection.is_ok();
+    if let Err(reason) = injection {
+        warn_injection_failure(reason);
+    }
+
+    let Some(mut frame) = frame else {
+        // No open request: the stamp is on the wire (that is all a scheduled
+        // command's publish gets), and there is no span to record. Keep the
+        // frame pairing exactly as ObserveOnly would.
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    frame.bypass_span_cap = propagated;
+
+    // The vocabulary, every empty value dropped — absent, never guessed.
+    // `$this->options` is protected with no getter; native property reads see
+    // protected members, which is what finally puts `server.address` on a
+    // publish span (the fact the bespoke bridge could never reach, and the
+    // reason the service map's broker node read "broker not identified").
+    let client = zend_helpers::this_object(execute_data);
+    let read_option = |key: &str| {
+        client
+            .and_then(|object| {
+                zend_helpers::object_property_table_string(object, "options", key, 256)
+            })
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let vhost = read_option("vhost");
+    let host = read_option("host");
+    let port = read_option("port");
+
+    // Queue unknown at publish: the routing key becomes NAME only on the default
+    // exchange (forAmqp's rule); a named exchange leaves NAME absent.
+    let destination = messaging::amqp_destination(&vhost, &exchange, &routing_key, "");
+    frame.span_name = Some(messaging::publish_label(&destination));
+
+    frame.attributes.push(("span.kind".into(), "producer".into()));
+    frame
+        .attributes
+        .push(("messaging.system".into(), messaging::SYSTEM_RABBITMQ.into()));
+    frame
+        .attributes
+        .push(("messaging.operation".into(), "publish".into()));
+    for (key, value) in destination.attributes() {
+        frame.attributes.push((key.into(), value));
+    }
+    if !host.is_empty() {
+        frame.attributes.push(("server.address".into(), host));
+    }
+    if !port.is_empty() {
+        frame.attributes.push(("server.port".into(), port));
+    }
+    if let Some(word) = messaging::protocol(&content_type) {
+        frame
+            .attributes
+            .push(("messaging.protocol".into(), word.into()));
+    }
+    if !content_type.is_empty() {
+        frame.attributes.push((
+            "messaging.message.body.content_type".into(),
+            content_type.clone(),
+        ));
+    }
+    if !message_name.is_empty() {
+        frame
+            .attributes
+            .push(("messaging.message.name".into(), message_name));
+    }
+    if let Some(bytes) = &body {
+        // Size always, even with capture off — measured on the raw wire bytes
+        // before any cap or base64, the one payload fact that is free.
+        frame
+            .attributes
+            .push(("messaging.message.body.size".into(), bytes.len().to_string()));
+        if messaging::capture_enabled() {
+            let preview_cap = messaging::PUBLISH_PREVIEW_CAP.min(messaging::body_ceiling());
+            if let Some(encoded) = messaging::encode_body(bytes, preview_cap) {
+                frame
+                    .attributes
+                    .push(("messaging.message.body".into(), encoded.body));
+                if encoded.base64 {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.encoding".into(), "base64".into()));
+                }
+                if encoded.truncated {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.truncated".into(), "true".into()));
+                }
+            }
+            // The whole copy, keyed by THIS frame's ids — the publish span is
+            // the span that previews it. `.stored` only when the store took the
+            // bytes: the marker never out-promises the store.
+            if let Some((payload, encoding)) = messaging::whole_body(
+                bytes,
+                messaging::PUBLISH_PREVIEW_CAP,
+                messaging::body_ceiling(),
+            ) {
+                if crate::store_message_body(
+                    frame.trace_id.clone(),
+                    frame.span_id.clone(),
+                    content_type.clone(),
+                    payload,
+                    encoding.to_owned(),
+                ) {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.stored".into(), "true".into()));
+                }
+            }
+        }
+    }
+    if let Some(file) = interned.file() {
+        frame
+            .attributes
+            .push(("code.filepath".into(), file.to_owned()));
+    }
+
+    let arguments = capture_tier_three_arguments(execute_data, interned);
+    record_call_path_enter(name, interned.internal, interned.file(), &arguments);
+    push_frame(frame, interned.id);
+}
+
+/// PUBLISH observation for RdKafka's two producer methods — the RdKafka
+/// observation contract in full. `$this` is the `ProducerTopic`; both
+/// `produce`/`producev` share this one begin handler, branching ONLY on
+/// whether a headers argument exists to inject into (`producev`, index 4) —
+/// `produce` has no headers parameter AT ALL, not merely an omitted one, so
+/// it is span-only by construction and this function never attempts
+/// injection for it. `is_internal` is true for both (C-extension
+/// `PHP_METHOD`s), which is why `MESSAGING_PUBLISH_METHODS` is checked ahead
+/// of the `is_internal` early return in `observe_policy` — see that table's
+/// own docblock.
+///
+/// Args: 0=`$partition`(int), 1=`$msgflags`(int), 2=`$payload`(?string),
+/// 3=`$key`(?string), and for `producev` only: 4=`$headers`(?array),
+/// 5=`$timestamp_ms`, 6=`$msg_opaque`.
+///
+/// The topic NAME needs a native→PHP call-back (`ProducerTopic::getName()`,
+/// via `call_object_method_string`): it is neither an argument nor a
+/// declared property (`kafka_topic_object`'s C struct field is invisible to
+/// `zend_read_property`) — see that helper's own docblock for why this is
+/// safe re-entrancy, the same shape `curl_effective_url` already uses.
+///
+/// `messaging.message.name` has only ONE source for Kafka (never a `type`
+/// property — Kafka has no AMQP-`type` equivalent): the `serializeToString`
+/// bank (`MESSAGE_BANK`), looked up by the exact same body-identity mechanism
+/// Bunny's own fallback uses — `resolve_message_name` is reused unchanged
+/// with an always-empty `type_header`.
+///
+/// `server.address`/cluster/`messaging.kafka.consumer.group` are ALWAYS
+/// absent for RdKafka (v1 decision, contract's "vhost/cluster/server.address
+/// recovery" section) — no Conf key is ever visible as a zend property, and
+/// reaching them needs either a new librdkafka C dependency or a 3-hop
+/// `Conf::set`/`newTopic` handle-keyed side-channel bank; both are listed as
+/// v2 follow-ups, not built here.
+///
+/// # Safety
+/// Called from the Zend observer begin handler with a valid execute_data.
+#[cfg(feature = "zend-observer")]
+unsafe fn begin_messaging_publish_rdkafka(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    name: &std::rc::Rc<str>,
+    interned: &crate::deterministic::InternedFunction,
+) {
+    use crate::messaging;
+
+    let is_producev = &**name == "RdKafka\\ProducerTopic::producev";
+    let partition = zend_helpers::arg_long(execute_data, 0);
+    let key = zend_helpers::arg_scalar_string(execute_data, 3, 256);
+    // RAW bytes: the encode decision (text vs base64) must see the payload as
+    // published, not a lossy UTF-8 conversion of it.
+    let body = zend_helpers::arg_string_bytes(execute_data, 2);
+    // GAP 1's ONLY source for Kafka: no AMQP `type` property exists on this
+    // wire format at all, so `resolve_message_name`'s "primary seam" is
+    // always empty here — the bank lookup is the whole story.
+    let message_name = body
+        .as_deref()
+        .and_then(|bytes| MESSAGE_BANK.with(|bank| bank.borrow().lookup(bytes).map(str::to_owned)))
+        .unwrap_or_default();
+
+    let context = REQUEST_CONTEXT.with(|ctx| ctx.borrow().as_ref().cloned());
+    let frame = context
+        .as_ref()
+        .map(|ctx| on_begin(ctx, name, SpanPolicy::MessagingPublish));
+
+    // Injection: `producev` only — `produce` has no headers slot to write
+    // into at all, so nothing is ever attempted for it (the honest
+    // consequence the contract states plainly: an estate on `produce()`
+    // gets zero native propagation of any kind, not even the enqueued-at
+    // stamp, because there is no wire carrier).
+    let propagated = if is_producev {
+        let mut entries: Vec<(&str, String)> = Vec::new();
+        if let Some(frame) = &frame {
+            if let Some(traceparent) = &frame.injected_traceparent {
+                entries.push(("traceparent", traceparent.clone()));
+            }
+        }
+        if let Some(ctx) = &context {
+            if let Some(tracestate) = &ctx.tracestate {
+                entries.push(("tracestate", tracestate.clone()));
+            }
+            if let Some(baggage) = &ctx.baggage {
+                entries.push(("baggage", baggage.clone()));
+            }
+        }
+        entries.push((
+            messaging::ENQUEUED_AT_HEADER,
+            messaging::enqueued_at_stamp(epoch_seconds_now()),
+        ));
+        if !message_name.is_empty() {
+            entries.push((messaging::SCHEMA_HEADER, message_name.clone()));
+        }
+        let injection = zend_helpers::inject_array_entries(execute_data, 4, &entries);
+        let ok = injection.is_ok();
+        if let Err(reason) = injection {
+            warn_injection_failure_for("RdKafka\\ProducerTopic::producev", reason);
+        }
+        ok
+    } else {
+        false
+    };
+
+    let Some(mut frame) = frame else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    frame.bypass_span_cap = propagated;
+
+    // The topic name: the call-back bridge, since it is reachable no other
+    // way (see this function's own docblock).
+    let topic = zend_helpers::this_object(execute_data)
+        .and_then(|topic| zend_helpers::call_object_method_string(topic, "getName", 512))
+        .unwrap_or_default();
+    let destination = messaging::kafka_destination(&topic);
+    frame.span_name = Some(messaging::labeled("PUBLISH", &destination, messaging::SYSTEM_KAFKA));
+
+    frame.attributes.push(("span.kind".into(), "producer".into()));
+    frame
+        .attributes
+        .push(("messaging.system".into(), messaging::SYSTEM_KAFKA.into()));
+    frame
+        .attributes
+        .push(("messaging.operation".into(), "publish".into()));
+    for (key, value) in destination.attributes() {
+        frame.attributes.push((key.into(), value));
+    }
+    // Kafka-specific, informational, never fed into Destination — partition
+    // is explicitly not identity (see `kafka_partition_attribute`'s
+    // docblock).
+    if let Some(partition) = partition.and_then(messaging::kafka_partition_attribute) {
+        frame
+            .attributes
+            .push(("messaging.kafka.destination.partition".into(), partition));
+    }
+    if let Some(key) = key.filter(|k| !k.is_empty()) {
+        frame.attributes.push(("messaging.kafka.message.key".into(), key));
+    }
+    if !message_name.is_empty() {
+        frame
+            .attributes
+            .push(("messaging.message.name".into(), message_name));
+    }
+    if let Some(bytes) = &body {
+        frame
+            .attributes
+            .push(("messaging.message.body.size".into(), bytes.len().to_string()));
+        if messaging::capture_enabled() {
+            let preview_cap = messaging::PUBLISH_PREVIEW_CAP.min(messaging::body_ceiling());
+            if let Some(encoded) = messaging::encode_body(bytes, preview_cap) {
+                frame
+                    .attributes
+                    .push(("messaging.message.body".into(), encoded.body));
+                if encoded.base64 {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.encoding".into(), "base64".into()));
+                }
+                if encoded.truncated {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.truncated".into(), "true".into()));
+                }
+            }
+            if let Some((payload, encoding)) = messaging::whole_body(
+                bytes,
+                messaging::PUBLISH_PREVIEW_CAP,
+                messaging::body_ceiling(),
+            ) {
+                if crate::store_message_body(
+                    frame.trace_id.clone(),
+                    frame.span_id.clone(),
+                    String::new(),
+                    payload,
+                    encoding.to_owned(),
+                ) {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.stored".into(), "true".into()));
+                }
+            }
+        }
+    }
+    if let Some(file) = interned.file() {
+        frame
+            .attributes
+            .push(("code.filepath".into(), file.to_owned()));
+    }
+
+    let arguments = capture_tier_three_arguments(execute_data, interned);
+    record_call_path_enter(name, interned.internal, interned.file(), &arguments);
+    push_frame(frame, interned.id);
+}
+
+/// PUBLISH observation for `PhpAmqpLib\Channel\AMQPChannel::basic_publish` —
+/// the amqplib observation contract in full.
+///
+/// Args: 0=`$msg` (`AMQPMessage`), 1=`$exchange`, 2=`$routing_key`,
+/// 3=`$mandatory`, 4=`$immediate`, 5=`$ticket`. `$this` is the channel.
+///
+/// Injection target: `$msg->properties['application_headers']`, via
+/// `inject_amqp_application_headers` — see that function's docblock for the
+/// three-shape branching (absent / plain array / `AMQPTable` object), all
+/// protected-property writes, none a userland method call. This CORRECTS the
+/// premise of the old in-tree follow-up note (an `AMQPTable` object was
+/// assumed to require a method call) — verified against the vendored source:
+/// neither `AMQPMessage::$properties` nor `AMQPTable::$data` enforce a
+/// runtime type, so a raw array is exactly as legal a wire value as a real
+/// `AMQPTable`.
+///
+/// `server.address`/`server.port`/vhost: a three-hop protected-property chain
+/// off `$this` (`channel->connection->io->host/port`,
+/// `channel->connection->vhost`) — `checkConnection()` (called at the very
+/// top of `basic_publish`, before this begin handler even runs, since begin
+/// fires at frame entry which is AFTER `$this->checkConnection()`'s own
+/// frame has already returned... texture note: `checkConnection` is called
+/// FROM `basic_publish`'s own body, so by the time OUR begin handler for
+/// `basic_publish` fires — at `basic_publish`'s OWN entry, before its body
+/// runs — the lazy connect has NOT necessarily happened yet for a fresh
+/// `AMQPLazyConnection`. Read anyway: `io` reads as absent until the connect
+/// completes, which just means the span degrades to no `server.address`
+/// rather than a stale/wrong one — no different from any other "unreadable
+/// fact is an absent attribute" case elsewhere in this file.
+///
+/// # Safety
+/// Called from the Zend observer begin handler with a valid execute_data.
+#[cfg(feature = "zend-observer")]
+unsafe fn begin_messaging_publish_amqplib(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    name: &std::rc::Rc<str>,
+    interned: &crate::deterministic::InternedFunction,
+) {
+    use crate::messaging;
+
+    let Some(msg) = zend_helpers::arg_object(execute_data, 0) else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    let exchange = zend_helpers::arg_scalar_string(execute_data, 1, 512).unwrap_or_default();
+    let routing_key = zend_helpers::arg_scalar_string(execute_data, 2, 512).unwrap_or_default();
+    // The caller's own declarations, read BEFORE injection — after the
+    // caller-wins merge these are unchanged by construction, so reading them
+    // now is reading the merged truth either way. `content_type`/`type` are
+    // PLAIN scalar keys directly in `$msg->properties` (protocolWriter's
+    // `$propertyDefinitions` lists them as siblings of `application_headers`,
+    // not nested under it) — a straight property-table read, the same shape
+    // Bunny's `$this->options['vhost']` read already uses; only the actual
+    // HEADER key/value pairs (`traceparent`, `x-chronos-schema`, …) live one
+    // level deeper, under `application_headers`, which is what
+    // `amqp_application_header` is for.
+    let content_type = zend_helpers::object_property_table_string(msg, "properties", "content_type", 256)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let message_name = zend_helpers::object_property_table_string(msg, "properties", "type", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    // `$msg->body` is a public, non-deprecated-for-reading string property
+    // (`AMQPMessage::$body`, populated by `setBody()`), read as RAW bytes so
+    // the text-or-base64 decision sees the payload as it will be published.
+    let body = zend_helpers::object_property_bytes(msg, "body");
+    // GAP 1's fallback: an estate that never sets `type` recovers the class
+    // from the `serializeToString` bank, identical mechanism to Bunny's.
+    let message_name = if !message_name.is_empty() {
+        message_name
+    } else {
+        body.as_deref()
+            .and_then(|bytes| MESSAGE_BANK.with(|bank| bank.borrow().lookup(bytes).map(str::to_owned)))
+            .unwrap_or_default()
+    };
+
+    let context = REQUEST_CONTEXT.with(|ctx| ctx.borrow().as_ref().cloned());
+    let frame = context
+        .as_ref()
+        .map(|ctx| on_begin(ctx, name, SpanPolicy::MessagingPublish));
+
+    let mut entries: Vec<(&str, String)> = Vec::new();
+    if let Some(frame) = &frame {
+        if let Some(traceparent) = &frame.injected_traceparent {
+            entries.push(("traceparent", traceparent.clone()));
+        }
+    }
+    if let Some(ctx) = &context {
+        if let Some(tracestate) = &ctx.tracestate {
+            entries.push(("tracestate", tracestate.clone()));
+        }
+        if let Some(baggage) = &ctx.baggage {
+            entries.push(("baggage", baggage.clone()));
+        }
+    }
+    entries.push((
+        messaging::ENQUEUED_AT_HEADER,
+        messaging::enqueued_at_stamp(epoch_seconds_now()),
+    ));
+    if !message_name.is_empty() {
+        entries.push((messaging::SCHEMA_HEADER, message_name.clone()));
+    }
+    let injection = zend_helpers::inject_amqp_application_headers(msg, &entries);
+    let propagated = injection.is_ok();
+    if let Err(reason) = injection {
+        warn_injection_failure_for("PhpAmqpLib\\Channel\\AMQPChannel::basic_publish", reason);
+    }
+
+    let Some(mut frame) = frame else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    frame.bypass_span_cap = propagated;
+
+    // vhost/server.address/server.port: the three-hop protected chain off
+    // `$this` (the channel) — see this function's own docblock.
+    let channel = zend_helpers::this_object(execute_data);
+    let connection = channel.and_then(|c| zend_helpers::object_property_object(c, "connection"));
+    let vhost = connection
+        .and_then(|c| zend_helpers::object_property_string(c, "vhost", 256))
+        .map(|v| v.trim().to_owned())
+        .unwrap_or_default();
+    let io = connection.and_then(|c| zend_helpers::object_property_object(c, "io"));
+    let host = io
+        .and_then(|io| zend_helpers::object_property_string(io, "host", 256))
+        .map(|v| v.trim().to_owned())
+        .unwrap_or_default();
+    let port = io
+        .and_then(|io| zend_helpers::object_property_string(io, "port", 32))
+        .map(|v| v.trim().to_owned())
+        .unwrap_or_default();
+
+    // Queue unknown at publish: the routing key becomes NAME only on the
+    // default exchange (forAmqp's rule); a named exchange leaves NAME absent
+    // — identical vocabulary to Bunny's, this client speaks the same broker.
+    let destination = messaging::amqp_destination(&vhost, &exchange, &routing_key, "");
+    frame.span_name = Some(messaging::publish_label(&destination));
+
+    frame.attributes.push(("span.kind".into(), "producer".into()));
+    frame
+        .attributes
+        .push(("messaging.system".into(), messaging::SYSTEM_RABBITMQ.into()));
+    frame
+        .attributes
+        .push(("messaging.operation".into(), "publish".into()));
+    for (key, value) in destination.attributes() {
+        frame.attributes.push((key.into(), value));
+    }
+    if !host.is_empty() {
+        frame.attributes.push(("server.address".into(), host));
+    }
+    if !port.is_empty() {
+        frame.attributes.push(("server.port".into(), port));
+    }
+    if let Some(word) = messaging::protocol(&content_type) {
+        frame
+            .attributes
+            .push(("messaging.protocol".into(), word.into()));
+    }
+    if !content_type.is_empty() {
+        frame.attributes.push((
+            "messaging.message.body.content_type".into(),
+            content_type.clone(),
+        ));
+    }
+    if !message_name.is_empty() {
+        frame
+            .attributes
+            .push(("messaging.message.name".into(), message_name));
+    }
+    if let Some(bytes) = &body {
+        frame
+            .attributes
+            .push(("messaging.message.body.size".into(), bytes.len().to_string()));
+        if messaging::capture_enabled() {
+            let preview_cap = messaging::PUBLISH_PREVIEW_CAP.min(messaging::body_ceiling());
+            if let Some(encoded) = messaging::encode_body(bytes, preview_cap) {
+                frame
+                    .attributes
+                    .push(("messaging.message.body".into(), encoded.body));
+                if encoded.base64 {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.encoding".into(), "base64".into()));
+                }
+                if encoded.truncated {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.truncated".into(), "true".into()));
+                }
+            }
+            if let Some((payload, encoding)) = messaging::whole_body(
+                bytes,
+                messaging::PUBLISH_PREVIEW_CAP,
+                messaging::body_ceiling(),
+            ) {
+                if crate::store_message_body(
+                    frame.trace_id.clone(),
+                    frame.span_id.clone(),
+                    content_type.clone(),
+                    payload,
+                    encoding.to_owned(),
+                ) {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.stored".into(), "true".into()));
+                }
+            }
+        }
+    }
+    if let Some(file) = interned.file() {
+        frame
+            .attributes
+            .push(("code.filepath".into(), file.to_owned()));
+    }
+
+    let arguments = capture_tier_three_arguments(execute_data, interned);
+    record_call_path_enter(name, interned.internal, interned.file(), &arguments);
+    push_frame(frame, interned.id);
+}
+
+/// CONSUME scoping for `MESSAGING_CONSUME_DISPATCH` — Bunny's own dispatch of a
+/// delivery to the callback is the only stable native scope boundary a raw AMQP
+/// consumer has, and this begin turns it into a message-scoped REQUEST: the
+/// native replacement for `BunnyTelemetry::consumer`'s wrapper, with no
+/// application code at all.
+///
+/// The pass-through rules, in check order:
+///
+///   1. Already-active guard: a request is open, so this delivery is being
+///      pumped INSIDE something already traced (a `Channel::get()` during a web
+///      request, a nested event-loop run, or a consumer process running with
+///      CHRONOS_PHP_CLI_ENABLED=1 whose RINIT request swallows everything —
+///      keep that flag off for workers, the doctrine `BunnyTelemetry` always
+///      documented). This guard is also what makes nested dispatches depth-1 by
+///      construction.
+///   2. Bunny's own branch guards, mirrored: only a `deliverFrame` with no
+///      `returnFrame` and a still-registered `deliverCallbacks[consumerTag]`
+///      reaches the callback (Channel.php:729-743) — a message Bunny would drop
+///      opens no request. The `getOkFrame` branch (a `Channel::get()` pull) is
+///      deliberately out of scope: its result resolves into whatever request is
+///      already running.
+///   3. The collector declining the request (unsampled has a context and still
+///      collects; declining means disabled/no envelope) leaves the delivery
+///      untraced.
+///
+/// Interaction with the PHP bridge (`BunnyTelemetry::consumer`): native wins by
+/// ordering — this begin fires strictly before any userland wrapper runs, the
+/// wrapper's own `NativeExtension::active()` guard then sees an open request and
+/// passes through, and it never closes a request it did not open. Nothing
+/// double-opens, nothing double-closes.
+///
+/// # Safety
+/// Called from the Zend observer begin handler with a valid execute_data.
+#[cfg(feature = "zend-observer")]
+unsafe fn begin_messaging_delivery_bunny(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    name: &std::rc::Rc<str>,
+    interned: &crate::deterministic::InternedFunction,
+) {
+    use crate::messaging;
+
+    if crate::chronos_request_active() {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    }
+    let Some(channel) = zend_helpers::this_object(execute_data) else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    let Some(deliver_frame) = zend_helpers::object_property_object(channel, "deliverFrame") else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    if zend_helpers::object_property_object(channel, "returnFrame").is_some() {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    }
+    let consumer_tag = zend_helpers::object_property_string(deliver_frame, "consumerTag", 256)
+        .unwrap_or_default();
+    if consumer_tag.is_empty()
+        || !zend_helpers::object_property_array_has_str_key(
+            channel,
+            "deliverCallbacks",
+            &consumer_tag,
+        )
+    {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    }
+
+    // Naming: the banked subscription queue first (`routeName()`'s exact
+    // fallback chain after it — routing key, exchange, the "amqp" floor).
+    let channel_handle = (*channel).handle;
+    let queue = CONSUMER_QUEUES.with(|map| {
+        map.borrow()
+            .get(&(channel_handle, consumer_tag.clone()))
+            .cloned()
+            .unwrap_or_default()
+    });
+    let routing_key = zend_helpers::object_property_string(deliver_frame, "routingKey", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let exchange = zend_helpers::object_property_string(deliver_frame, "exchange", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let redelivered =
+        zend_helpers::object_property_bool(deliver_frame, "redelivered").unwrap_or(false);
+    let route = if !queue.is_empty() {
+        queue.clone()
+    } else if !routing_key.is_empty() {
+        routing_key.clone()
+    } else if !exchange.is_empty() {
+        exchange.clone()
+    } else {
+        "amqp".to_owned()
+    };
+
+    // Wire context, from the header frame's application table. String values
+    // only, trimmed; anything else is absent — `ContentHeaderFrame::$headers`
+    // legitimately carries ints and nested tables.
+    let header_frame = zend_helpers::object_property_object(channel, "headerFrame");
+    let application_header = |key: &str| -> String {
+        header_frame
+            .and_then(|frame| {
+                zend_helpers::object_property_table_string(frame, "headers", key, 4096)
+            })
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let traceparent = application_header("traceparent");
+    let tracestate = application_header("tracestate");
+    let baggage = application_header("baggage");
+    let enqueued_at = application_header(messaging::ENQUEUED_AT_HEADER);
+    let schema_header = application_header(messaging::SCHEMA_HEADER);
+    // The FIRST wall reading, before any of the work below, so the queue wait
+    // is not inflated by the cost of measuring it.
+    let started_at_seconds = epoch_seconds_now();
+    // The payload, read at BEGIN — `onBodyComplete`'s own body consumes the
+    // buffer before it invokes the callback, so this is the last moment the
+    // bytes exist. `Buffer::$buffer` is private; unreadable ⇒ no payload, never
+    // a failure.
+    let body = zend_helpers::object_property_object(channel, "bodyBuffer")
+        .and_then(|buffer| zend_helpers::object_property_bytes(buffer, "buffer"));
+
+    // Open the message-scoped request. 'QUEUE' routes it onto the
+    // background-job profile rates; the empty service name falls back to the
+    // envelope's application id so consumer and web land on one map node; the
+    // wire `sampled` flag is honoured by `TraceContext::from_header`; a missing
+    // traceparent roots a NEW trace — an id is never fabricated.
+    crate::start_request(
+        &traceparent,
+        &tracestate,
+        &baggage,
+        "",
+        "",
+        "",
+        "QUEUE".to_owned(),
+        &route,
+        String::new(),
+    );
+    if !crate::chronos_request_active() {
+        // The collector declined (disabled, no envelope). Untraced, unharmed.
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    }
+
+    // The consume facts — `consumeAttributes()`'s exact keys, absent-never-
+    // guessed. The vhost comes off `channel->client->options`, the protected
+    // member the bespoke bridge had to take as a parameter.
+    let client = zend_helpers::object_property_object(channel, "client");
+    let read_option = |key: &str| {
+        client
+            .and_then(|object| {
+                zend_helpers::object_property_table_string(object, "options", key, 256)
+            })
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let vhost = read_option("vhost");
+    let host = read_option("host");
+    let port = read_option("port");
+    let header_property = |property: &str| -> String {
+        header_frame
+            .and_then(|frame| zend_helpers::object_property_string(frame, property, 512))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let content_type = header_property("contentType");
+
+    let destination = messaging::amqp_destination(&vhost, &exchange, &routing_key, &queue);
+    let mut facts: Vec<(String, String)> = vec![
+        ("span.kind".into(), "consumer".into()),
+        ("messaging.system".into(), messaging::SYSTEM_RABBITMQ.into()),
+        // Process, not receive: only the handler has a duration worth looking at.
+        ("messaging.operation".into(), "process".into()),
+    ];
+    for (key, value) in destination.attributes() {
+        facts.push((key.into(), value));
+    }
+    if !host.is_empty() {
+        facts.push(("server.address".into(), host));
+    }
+    if !port.is_empty() {
+        facts.push(("server.port".into(), port));
+    }
+    // Null when the stamp is missing, unparseable or in the future — never
+    // zero, which would let an unmeasured queue report the healthiest wait.
+    if let Some(waited) = messaging::wait_milliseconds(&enqueued_at, started_at_seconds) {
+        facts.push((
+            "messaging.message.queue_time_ms".into(),
+            waited.to_string(),
+        ));
+    }
+    // AMQP's only retry signal — what separates "slow" from "failing and being
+    // redelivered", which look identical without it.
+    if redelivered {
+        facts.push(("messaging.message.redelivered".into(), "true".into()));
+    }
+    let message_id = header_property("messageId");
+    if !message_id.is_empty() {
+        facts.push(("messaging.message.id".into(), message_id));
+    }
+    let correlation_id = header_property("correlationId");
+    if !correlation_id.is_empty() {
+        facts.push(("messaging.message.conversation_id".into(), correlation_id));
+    }
+    // messaging.message.name: THE GAP's fix. Precedence (header over property,
+    // and why) is `messaging::resolve_message_name`'s docblock.
+    let type_header = header_property("typeHeader");
+    if let Some(message_name) = messaging::resolve_message_name(&schema_header, &type_header) {
+        facts.push(("messaging.message.name".into(), message_name));
+    }
+    if let Some(word) = messaging::protocol(&content_type) {
+        facts.push(("messaging.protocol".into(), word.into()));
+    }
+    if !content_type.is_empty() {
+        facts.push((
+            "messaging.message.body.content_type".into(),
+            content_type.clone(),
+        ));
+    }
+    if let Some(bytes) = &body {
+        facts.push(("messaging.message.body.size".into(), bytes.len().to_string()));
+        if messaging::capture_enabled() {
+            // 8192 — the request-attribute bag's own MAX_VALUE_BYTES: the
+            // truncation happens where `.truncated` can be set honestly, not in
+            // the bag's cap where an oversized body would arrive looking
+            // complete.
+            let preview_cap = messaging::CONSUME_PREVIEW_CAP.min(messaging::body_ceiling());
+            if let Some(encoded) = messaging::encode_body(bytes, preview_cap) {
+                facts.push(("messaging.message.body".into(), encoded.body));
+                if encoded.base64 {
+                    facts.push(("messaging.message.body.encoding".into(), "base64".into()));
+                }
+                if encoded.truncated {
+                    facts.push(("messaging.message.body.truncated".into(), "true".into()));
+                }
+            }
+            // Whole copy keyed by the REQUEST ROOT (empty ids), because the
+            // preview rides the request-attribute bag and lands on the root —
+            // the span that promises the payload is the span that owns it.
+            if let Some((payload, encoding)) = messaging::whole_body(
+                bytes,
+                messaging::CONSUME_PREVIEW_CAP,
+                messaging::body_ceiling(),
+            ) {
+                if crate::store_message_body(
+                    String::new(),
+                    String::new(),
+                    content_type.clone(),
+                    payload,
+                    encoding.to_owned(),
+                ) {
+                    facts.push(("messaging.message.body.stored".into(), "true".into()));
+                }
+            }
+        }
+    }
+    // Deliberately omitted, as the bridge always did: delivery tag and consumer
+    // tag (per-connection, unbounded, useless to join on) and any consumer-group
+    // word (AMQP has none; borrowing Kafka's would invent a concept).
+
+    crate::request_attributes::merge(facts.iter().cloned());
+    // The in-flight marker, AFTER the request is open — it names the span that
+    // will close it, and that span does not exist until now. Timeout 0 (`None`
+    // downstream): AMQP gives a consumer no per-message deadline, and a guessed
+    // one reaps live work.
+    crate::chronos_job_started(route.clone(), 0, facts.into_iter().collect());
+
+    // `LAST_THROW` was cleared by `set_request_context`, so the request IS the
+    // throw window — no separate sequence counter needed.
+    DELIVERY_SCOPE.with(|slot| *slot.borrow_mut() = Some(DeliveryRoute::Known(route)));
+    let mut frame = CallFrame::observe_only(name.clone());
+    frame.owns_delivery_scope = true;
+    let arguments = capture_tier_three_arguments(execute_data, interned);
+    record_call_path_enter(name, interned.internal, interned.file(), &arguments);
+    push_frame(frame, interned.id);
+}
+
+/// CONSUME scoping for `PhpAmqpLib\Channel\AMQPChannel::basic_deliver` — the
+/// amqplib observation contract's "Consume scoping" section.
+///
+/// Args: 0=`$reader` (`AMQPReader`), 1=`$message` (`AMQPMessage`, already
+/// fully hydrated: `load_properties` and the body have already run by
+/// entry — verified against the vendored source, both happen on a
+/// content-header/body sequence read BEFORE this method-frame dispatch).
+/// What is NOT yet populated at BEGIN: the delivery envelope (consumer tag,
+/// exchange, routing key, redelivered) — those are the FIRST statements of
+/// this call's own body, read off `$reader`, and reading them ourselves here
+/// would consume the same cursor and corrupt the real parse. See
+/// `DeliveryRoute::DeferredAmqplib`'s docblock for the full reasoning and
+/// `resolve_amqplib_delivery_route` for where the envelope is actually read,
+/// at CLOSE.
+///
+/// This method is `protected` — irrelevant to `zend_observer`, which hooks by
+/// opcode/execute_data regardless of visibility, same as every other
+/// non-public method already in these tables.
+///
+/// # Safety
+/// Called from the Zend observer begin handler with a valid execute_data.
+#[cfg(feature = "zend-observer")]
+unsafe fn begin_messaging_delivery_amqplib(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    name: &std::rc::Rc<str>,
+    interned: &crate::deterministic::InternedFunction,
+) {
+    use crate::messaging;
+
+    if crate::chronos_request_active() {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    }
+    let Some(message) = zend_helpers::arg_object(execute_data, 1) else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+
+    // Message content: readable NOW (see this function's own docblock) —
+    // `content_type`/`type` are plain scalar keys directly in `$properties`
+    // (siblings of `application_headers`, not nested under it), the same
+    // shape the publish side already reads.
+    let content_type =
+        zend_helpers::object_property_table_string(message, "properties", "content_type", 256)
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default();
+    let type_header =
+        zend_helpers::object_property_table_string(message, "properties", "type", 512)
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default();
+    let message_id =
+        zend_helpers::object_property_table_string(message, "properties", "message_id", 256)
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default();
+    let correlation_id =
+        zend_helpers::object_property_table_string(message, "properties", "correlation_id", 256)
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default();
+    // `$msg->body` is a public, non-deprecated-for-reading string property,
+    // read as RAW bytes — the text-or-base64 decision must see the payload
+    // as published, not a lossy UTF-8 conversion of it.
+    let body = zend_helpers::object_property_bytes(message, "body");
+
+    // Wire context: the three-shape header carrier's READ side
+    // (`amqp_application_header`), identical mechanism to the publish side's
+    // write. The FIRST wall reading, before any further work, so the queue
+    // wait is not inflated by the cost of measuring it.
+    let traceparent =
+        zend_helpers::amqp_application_header(message, "traceparent", 256).unwrap_or_default();
+    let tracestate =
+        zend_helpers::amqp_application_header(message, "tracestate", 4096).unwrap_or_default();
+    let baggage =
+        zend_helpers::amqp_application_header(message, "baggage", 4096).unwrap_or_default();
+    let enqueued_at =
+        zend_helpers::amqp_application_header(message, messaging::ENQUEUED_AT_HEADER, 64)
+            .unwrap_or_default();
+    let schema_header =
+        zend_helpers::amqp_application_header(message, messaging::SCHEMA_HEADER, 512)
+            .unwrap_or_default();
+    let started_at_seconds = epoch_seconds_now();
+
+    // Open the message-scoped request. The route passed here is
+    // provisional — see `DeliveryRoute::DeferredAmqplib`'s docblock — it
+    // only ever reaches the profiler's "route" label on a request that is
+    // ALSO profiled, never the recorded span (that comes from
+    // `close_messaging_delivery`'s own, fully-resolved, `route_pattern`).
+    crate::start_request(
+        &traceparent,
+        &tracestate,
+        &baggage,
+        "",
+        "",
+        "",
+        "QUEUE".to_owned(),
+        "amqp",
+        String::new(),
+    );
+    if !crate::chronos_request_active() {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    }
+
+    // vhost/host/port: the three-hop protected chain off `$this` (the
+    // channel), same as the publish side — the contract's own "No gap" note:
+    // the connection is by definition already live at consume time (frames
+    // are being read off it).
+    let channel = zend_helpers::this_object(execute_data);
+    let connection = channel.and_then(|c| zend_helpers::object_property_object(c, "connection"));
+    let io = connection.and_then(|c| zend_helpers::object_property_object(c, "io"));
+    let host = io
+        .and_then(|io| zend_helpers::object_property_string(io, "host", 256))
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let port = io
+        .and_then(|io| zend_helpers::object_property_string(io, "port", 32))
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+
+    let mut facts: Vec<(String, String)> = vec![
+        ("span.kind".into(), "consumer".into()),
+        ("messaging.system".into(), messaging::SYSTEM_RABBITMQ.into()),
+        ("messaging.operation".into(), "process".into()),
+    ];
+    if !host.is_empty() {
+        facts.push(("server.address".into(), host));
+    }
+    if !port.is_empty() {
+        facts.push(("server.port".into(), port));
+    }
+    if let Some(waited) = messaging::wait_milliseconds(&enqueued_at, started_at_seconds) {
+        facts.push(("messaging.message.queue_time_ms".into(), waited.to_string()));
+    }
+    if !message_id.is_empty() {
+        facts.push(("messaging.message.id".into(), message_id));
+    }
+    if !correlation_id.is_empty() {
+        facts.push(("messaging.message.conversation_id".into(), correlation_id));
+    }
+    if let Some(name) = messaging::resolve_message_name(&schema_header, &type_header) {
+        facts.push(("messaging.message.name".into(), name));
+    }
+    if let Some(word) = messaging::protocol(&content_type) {
+        facts.push(("messaging.protocol".into(), word.into()));
+    }
+    if !content_type.is_empty() {
+        facts.push((
+            "messaging.message.body.content_type".into(),
+            content_type.clone(),
+        ));
+    }
+    if let Some(bytes) = &body {
+        facts.push(("messaging.message.body.size".into(), bytes.len().to_string()));
+        if messaging::capture_enabled() {
+            let preview_cap = messaging::CONSUME_PREVIEW_CAP.min(messaging::body_ceiling());
+            if let Some(encoded) = messaging::encode_body(bytes, preview_cap) {
+                facts.push(("messaging.message.body".into(), encoded.body));
+                if encoded.base64 {
+                    facts.push(("messaging.message.body.encoding".into(), "base64".into()));
+                }
+                if encoded.truncated {
+                    facts.push(("messaging.message.body.truncated".into(), "true".into()));
+                }
+            }
+            if let Some((payload, encoding)) = messaging::whole_body(
+                bytes,
+                messaging::CONSUME_PREVIEW_CAP,
+                messaging::body_ceiling(),
+            ) {
+                if crate::store_message_body(
+                    String::new(),
+                    String::new(),
+                    content_type.clone(),
+                    payload,
+                    encoding.to_owned(),
+                ) {
+                    facts.push(("messaging.message.body.stored".into(), "true".into()));
+                }
+            }
+        }
+    }
+
+    crate::request_attributes::merge(facts.iter().cloned());
+    // Provisional name — see `DeliveryRoute::DeferredAmqplib`'s docblock: the
+    // real destination is not readable until `resolve_amqplib_delivery_route`
+    // runs at close, and this in-flight marker cannot wait for that.
+    crate::chronos_job_started("amqp".to_owned(), 0, facts.into_iter().collect());
+
+    DELIVERY_SCOPE.with(|slot| *slot.borrow_mut() = Some(DeliveryRoute::DeferredAmqplib));
+    let mut frame = CallFrame::observe_only(name.clone());
+    frame.owns_delivery_scope = true;
+    let arguments = capture_tier_three_arguments(execute_data, interned);
+    record_call_path_enter(name, interned.internal, interned.file(), &arguments);
+    push_frame(frame, interned.id);
+}
+
+/// CONSUME scoping for `Basis\Nats\Client::processMsg` — the NATS contract
+/// §5(a)/(b)/(c): a message-scoped request when `$handler` is a real
+/// callable dispatching an inbound job, `ObserveOnly` (no request) when it
+/// is a `Queue` buffer (§5(b): no application code runs inside this call at
+/// all) or a reply to this client's OWN `dispatch()`/`request()` round trip
+/// (§5(c): that round trip already has its own client-shaped span, see
+/// `MESSAGING_NATS_RPC_METHOD`'s docblock — attributing the reply as a
+/// "consume" would double the wait-time telemetry against a call that is
+/// not a queue consumer at all).
+///
+/// Args: 0=`$handler` (callable|Queue), 1=`$message` (`Msg`), 2=`$reply`
+/// (bool, unused here). `$message` is fully parsed by the time `processMsg`
+/// is entered (the wire frame was read earlier, in `Connection::getMessage`)
+/// — unlike amqplib's `basic_deliver`, EVERYTHING this handler needs is
+/// already a plain property at BEGIN, so (unlike `DeliveryRoute::DeferredAmqplib`)
+/// this scope's route is always `Known`.
+///
+/// # Safety
+/// Called from the Zend observer begin handler with a valid execute_data.
+#[cfg(feature = "zend-observer")]
+unsafe fn begin_messaging_delivery_nats(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    name: &std::rc::Rc<str>,
+    interned: &crate::deterministic::InternedFunction,
+) {
+    use crate::messaging;
+
+    if crate::chronos_request_active() {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    }
+    // §5(b): a bare `Queue` handler only buffers the message for a later
+    // `Queue::fetchAll` poll — no application code runs here at all.
+    if zend_helpers::arg_is_instance_of(execute_data, 0, "Basis\\Nats\\Queue") {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    }
+    let Some(message) = zend_helpers::arg_object(execute_data, 1) else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    let subject = zend_helpers::object_property_string(message, "subject", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    // §5(c): a reply to this client's own round trip is not an inbound job —
+    // `requestsSubject` is private but engine-readable off `$this` (the
+    // `Client`) regardless, same as every other privacy-irrelevant read in
+    // this file.
+    if let Some(client) = zend_helpers::this_object(execute_data) {
+        let requests_subject =
+            zend_helpers::object_property_string(client, "requestsSubject", 64)
+                .unwrap_or_default();
+        if !requests_subject.is_empty() && subject.starts_with(&requests_subject) {
+            observe_only_fallback(execute_data, name, interned);
+            return;
+        }
+    }
+
+    // Naming: the SUBSCRIBE bank's subject for this sid (§4) — client-minted
+    // before the wire write, so always known by dispatch time unless the
+    // local map was cleared under a reconnect — falling back to the
+    // message's own subject when the sid was never banked, honestly rather
+    // than inventing one.
+    let sid = zend_helpers::object_property_string(message, "sid", 64).unwrap_or_default();
+    let banked = if sid.is_empty() {
+        None
+    } else {
+        SUBSCRIBE_SIDS.with(|map| map.borrow().get(&sid).cloned())
+    };
+    let (banked_subject, group) = banked.unwrap_or_default();
+    let route = if !banked_subject.is_empty() {
+        banked_subject
+    } else if !subject.is_empty() {
+        subject.clone()
+    } else {
+        messaging::SYSTEM_NATS.to_owned()
+    };
+
+    let payload = zend_helpers::object_property_object(message, "payload");
+    let header = |key: &str| -> String {
+        payload
+            .and_then(|object| {
+                zend_helpers::object_property_table_string(object, "headers", key, 4096)
+            })
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let traceparent = header("traceparent");
+    let tracestate = header("tracestate");
+    let baggage = header("baggage");
+    let enqueued_at = header(messaging::ENQUEUED_AT_HEADER);
+    let schema_header = header(messaging::SCHEMA_HEADER);
+    let content_type = header("content-type");
+    // The FIRST wall reading, before any further work.
+    let started_at_seconds = epoch_seconds_now();
+    let body = payload.and_then(|object| zend_helpers::object_property_bytes(object, "body"));
+
+    crate::start_request(
+        &traceparent,
+        &tracestate,
+        &baggage,
+        "",
+        "",
+        "",
+        "QUEUE".to_owned(),
+        &route,
+        String::new(),
+    );
+    if !crate::chronos_request_active() {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    }
+
+    // server.address/server.port: a ZERO-hop read off `$this` (the
+    // `Client`) — `$this->configuration` is public, unlike Bunny's protected
+    // `$options` array, and simpler than amqplib's three-hop chain.
+    let client = zend_helpers::this_object(execute_data);
+    let configuration =
+        client.and_then(|object| zend_helpers::object_property_object(object, "configuration"));
+    let host = configuration
+        .and_then(|object| zend_helpers::object_property_string(object, "host", 256))
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    // `Configuration::$port` is a declared `int`; `object_property_string`
+    // already coerces a LONG property the same way `zval_to_owned_string`
+    // always has, so no separate numeric read is needed for a value that
+    // only ever rides as a string attribute.
+    let port = configuration
+        .and_then(|object| zend_helpers::object_property_string(object, "port", 16))
+        .unwrap_or_default();
+
+    let destination = messaging::nats_destination(&subject);
+    let mut facts: Vec<(String, String)> = vec![
+        ("span.kind".into(), "consumer".into()),
+        ("messaging.system".into(), messaging::SYSTEM_NATS.into()),
+        ("messaging.operation".into(), "process".into()),
+    ];
+    for (key, value) in destination.attributes() {
+        facts.push((key.into(), value));
+    }
+    if !host.is_empty() {
+        facts.push(("server.address".into(), host));
+    }
+    if !port.is_empty() {
+        facts.push(("server.port".into(), port));
+    }
+    // Core NATS queue groups ARE the shared-work-queue mechanism — the
+    // direct analog of a Kafka consumer group (NATS contract §3).
+    if !group.is_empty() {
+        facts.push(("messaging.consumer.group.name".into(), group));
+    }
+    // Core NATS has no redelivery concept at all (contract §7) — absent,
+    // never guessed, unlike AMQP's real `redelivered` flag.
+    if let Some(waited) = messaging::wait_milliseconds(&enqueued_at, started_at_seconds) {
+        facts.push(("messaging.message.queue_time_ms".into(), waited.to_string()));
+    }
+    // GAP 1 on NATS: no `type`-property equivalent exists at all, so the
+    // header is the whole story — `resolve_message_name` is called with an
+    // always-empty second argument, exactly as the RdKafka path does.
+    if let Some(message_name) = messaging::resolve_message_name(&schema_header, "") {
+        facts.push(("messaging.message.name".into(), message_name));
+    }
+    if let Some(word) = messaging::protocol(&content_type) {
+        facts.push(("messaging.protocol".into(), word.into()));
+    }
+    if !content_type.is_empty() {
+        facts.push((
+            "messaging.message.body.content_type".into(),
+            content_type.clone(),
+        ));
+    }
+    if let Some(bytes) = &body {
+        facts.push(("messaging.message.body.size".into(), bytes.len().to_string()));
+        if messaging::capture_enabled() {
+            let preview_cap = messaging::CONSUME_PREVIEW_CAP.min(messaging::body_ceiling());
+            if let Some(encoded) = messaging::encode_body(bytes, preview_cap) {
+                facts.push(("messaging.message.body".into(), encoded.body));
+                if encoded.base64 {
+                    facts.push(("messaging.message.body.encoding".into(), "base64".into()));
+                }
+                if encoded.truncated {
+                    facts.push(("messaging.message.body.truncated".into(), "true".into()));
+                }
+            }
+            if let Some((payload_bytes, encoding)) = messaging::whole_body(
+                bytes,
+                messaging::CONSUME_PREVIEW_CAP,
+                messaging::body_ceiling(),
+            ) {
+                if crate::store_message_body(
+                    String::new(),
+                    String::new(),
+                    content_type.clone(),
+                    payload_bytes,
+                    encoding.to_owned(),
+                ) {
+                    facts.push(("messaging.message.body.stored".into(), "true".into()));
+                }
+            }
+        }
+    }
+
+    crate::request_attributes::merge(facts.iter().cloned());
+    crate::chronos_job_started(route.clone(), 0, facts.into_iter().collect());
+
+    DELIVERY_SCOPE.with(|slot| *slot.borrow_mut() = Some(DeliveryRoute::Known(route)));
+    let mut frame = CallFrame::observe_only(name.clone());
+    frame.owns_delivery_scope = true;
+    let arguments = capture_tier_three_arguments(execute_data, interned);
+    record_call_path_enter(name, interned.internal, interned.file(), &arguments);
+    push_frame(frame, interned.id);
+}
+
+/// NATS's single wire choke point (NATS contract §0): `Connection::sendMessage`
+/// serves THREE roles decided only by arg 0's RUNTIME class, which is why it
+/// has its own `SpanPolicy` (`MessagingNatsSend`) instead of a fixed
+/// method-name-keyed verdict:
+///
+///   * `Basis\Nats\Message\Publish` — PUBLISH span + header injection
+///     (`begin_nats_publish`).
+///   * `Basis\Nats\Message\Subscribe` — side-channel banking only, no span
+///     (`bank_nats_subscribe`, NATS contract §4) — client-minted `sid`,
+///     banked BEFORE the wire write, so (unlike Bunny/amqplib's
+///     server-assigned consumer tags) no END-time hook is needed at all.
+///   * anything else (ping/pong/connect/unsubscribe/…) — a plain
+///     pass-through frame, identical to an unlisted userland call.
+///
+/// # Safety
+/// Called from the Zend observer begin handler with a valid execute_data.
+#[cfg(feature = "zend-observer")]
+unsafe fn begin_nats_send_message(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    name: &std::rc::Rc<str>,
+    interned: &crate::deterministic::InternedFunction,
+) {
+    let Some(message) = zend_helpers::arg_object(execute_data, 0) else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    // Runtime dispatch by REAL `instanceof` (parent-chain walk, the
+    // contract's own wording), not an exact class-name compare: a userland
+    // subclass of `Publish`/`Subscribe` is still that message on the wire —
+    // `Publish` and `Subscribe` both extend `Prototype` and never each
+    // other, so the two tests stay mutually exclusive.
+    if zend_helpers::object_instance_of(message, "Basis\\Nats\\Message\\Publish") {
+        // The per-request suppression seam gates this branch exactly as it
+        // gates `MessagingPublish` in the begin trampoline (a userland NATS
+        // bridge that declared ownership gets no duplicate native span and
+        // no header write) — checked HERE rather than at the policy switch
+        // because `MessagingNatsSend` is not only a publish: the Subscribe
+        // banking below must keep running under suppression (it is a
+        // process-lifetime side channel, like Bunny's `CONSUME_FNS`
+        // tracking, which the seam never gates either — suppressing it for
+        // one request would blind every later delivery's queue naming).
+        if SUPPRESS_MESSAGING.with(std::cell::Cell::get) {
+            observe_only_fallback(execute_data, name, interned);
+            return;
+        }
+        begin_nats_publish(execute_data, name, interned, message)
+    } else if zend_helpers::object_instance_of(message, "Basis\\Nats\\Message\\Subscribe") {
+        bank_nats_subscribe(message);
+        observe_only_fallback(execute_data, name, interned);
+    } else {
+        observe_only_fallback(execute_data, name, interned);
+    }
+}
+
+/// PUBLISH observation for NATS's `Publish` message — the NATS observation
+/// contract §2/§3 in full.
+///
+/// `message` is arg 0 of `Connection::sendMessage`, already confirmed
+/// `instanceof Publish` by the caller (`begin_nats_send_message`).
+/// `$message->payload` is unconditionally a `Payload` object by the time
+/// `sendMessage` sees it — `Payload::parse()` has already run inside
+/// `Client::publish()`'s body before this call (contract §1) — so treating
+/// its absence as "decline, don't crash" is defensive, not an expected path.
+///
+/// Injection target: `$message->payload->headers`, via
+/// `inject_property_array_entries` — the two-hop object-property array
+/// write (contract §2/§8.2), add-if-absent, same semantics as
+/// `inject_array_entries`'s argument-slot write.
+///
+/// # Safety
+/// Called from the Zend observer begin handler with a valid execute_data and
+/// a live `message` object (arg 0, already type-checked by the caller).
+#[cfg(feature = "zend-observer")]
+unsafe fn begin_nats_publish(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    name: &std::rc::Rc<str>,
+    interned: &crate::deterministic::InternedFunction,
+    message: *mut ext_php_rs::ffi::zend_object,
+) {
+    use crate::messaging;
+
+    let subject = zend_helpers::object_property_string(message, "subject", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let Some(payload) = zend_helpers::object_property_object(message, "payload") else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    // RAW bytes: the text-or-base64 decision must see the payload as
+    // published, not a lossy UTF-8 conversion of it.
+    let body = zend_helpers::object_property_bytes(payload, "body");
+    let content_type =
+        zend_helpers::object_property_table_string(payload, "headers", "content-type", 256)
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default();
+    // GAP 1 on NATS: no AMQP-`type`-property equivalent exists at all, so
+    // the `serializeToString` bank is the WHOLE story here, exactly as for
+    // RdKafka — `resolve_message_name` is not even called; the bank lookup
+    // IS the resolution.
+    let message_name = body
+        .as_deref()
+        .and_then(|bytes| MESSAGE_BANK.with(|bank| bank.borrow().lookup(bytes).map(str::to_owned)))
+        .unwrap_or_default();
+
+    let context = REQUEST_CONTEXT.with(|ctx| ctx.borrow().as_ref().cloned());
+    let frame = context
+        .as_ref()
+        .map(|ctx| on_begin(ctx, name, SpanPolicy::MessagingPublish));
+
+    let mut entries: Vec<(&str, String)> = Vec::new();
+    if let Some(frame) = &frame {
+        if let Some(traceparent) = &frame.injected_traceparent {
+            entries.push(("traceparent", traceparent.clone()));
+        }
+    }
+    if let Some(ctx) = &context {
+        if let Some(tracestate) = &ctx.tracestate {
+            entries.push(("tracestate", tracestate.clone()));
+        }
+        if let Some(baggage) = &ctx.baggage {
+            entries.push(("baggage", baggage.clone()));
+        }
+    }
+    entries.push((
+        messaging::ENQUEUED_AT_HEADER,
+        messaging::enqueued_at_stamp(epoch_seconds_now()),
+    ));
+    if !message_name.is_empty() {
+        entries.push((messaging::SCHEMA_HEADER, message_name.clone()));
+    }
+    let injection = zend_helpers::inject_property_array_entries(payload, "headers", &entries);
+    let propagated = injection.is_ok();
+    if let Err(reason) = injection {
+        warn_injection_failure_for(MESSAGING_NATS_SEND_METHOD, reason);
+    }
+
+    let Some(mut frame) = frame else {
+        observe_only_fallback(execute_data, name, interned);
+        return;
+    };
+    frame.bypass_span_cap = propagated;
+
+    let destination = messaging::nats_destination(&subject);
+    frame.span_name = Some(messaging::labeled("PUBLISH", &destination, messaging::SYSTEM_NATS));
+
+    frame.attributes.push(("span.kind".into(), "producer".into()));
+    frame
+        .attributes
+        .push(("messaging.system".into(), messaging::SYSTEM_NATS.into()));
+    frame
+        .attributes
+        .push(("messaging.operation".into(), "publish".into()));
+    for (key, value) in destination.attributes() {
+        frame.attributes.push((key.into(), value));
+    }
+    if let Some(word) = messaging::protocol(&content_type) {
+        frame
+            .attributes
+            .push(("messaging.protocol".into(), word.into()));
+    }
+    if !content_type.is_empty() {
+        frame.attributes.push((
+            "messaging.message.body.content_type".into(),
+            content_type.clone(),
+        ));
+    }
+    if !message_name.is_empty() {
+        frame
+            .attributes
+            .push(("messaging.message.name".into(), message_name));
+    }
+    if let Some(bytes) = &body {
+        frame
+            .attributes
+            .push(("messaging.message.body.size".into(), bytes.len().to_string()));
+        if messaging::capture_enabled() {
+            let preview_cap = messaging::PUBLISH_PREVIEW_CAP.min(messaging::body_ceiling());
+            if let Some(encoded) = messaging::encode_body(bytes, preview_cap) {
+                frame
+                    .attributes
+                    .push(("messaging.message.body".into(), encoded.body));
+                if encoded.base64 {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.encoding".into(), "base64".into()));
+                }
+                if encoded.truncated {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.truncated".into(), "true".into()));
+                }
+            }
+            if let Some((payload_bytes, encoding)) = messaging::whole_body(
+                bytes,
+                messaging::PUBLISH_PREVIEW_CAP,
+                messaging::body_ceiling(),
+            ) {
+                if crate::store_message_body(
+                    frame.trace_id.clone(),
+                    frame.span_id.clone(),
+                    content_type.clone(),
+                    payload_bytes,
+                    encoding.to_owned(),
+                ) {
+                    frame
+                        .attributes
+                        .push(("messaging.message.body.stored".into(), "true".into()));
+                }
+            }
+        }
+    }
+    if let Some(file) = interned.file() {
+        frame
+            .attributes
+            .push(("code.filepath".into(), file.to_owned()));
+    }
+
+    let arguments = capture_tier_three_arguments(execute_data, interned);
+    record_call_path_enter(name, interned.internal, interned.file(), &arguments);
+    push_frame(frame, interned.id);
+}
+
+/// Bank one `Subscribe` message's `sid → (subject, group)` — NATS contract
+/// §4. Client-minted `sid`, already set BEFORE this call (constructed before
+/// `sendMessage` runs, same "always positional, no defaults" guarantee as
+/// the `Publish` branch), so no END-time hook is needed the way Bunny/amqplib
+/// need one for their server-assigned consumer tags.
+///
+/// # Safety
+/// Called from the Zend observer begin handler with a valid, live `message`
+/// object (arg 0 of `Connection::sendMessage`, already confirmed
+/// `instanceof Subscribe`).
+#[cfg(feature = "zend-observer")]
+unsafe fn bank_nats_subscribe(message: *mut ext_php_rs::ffi::zend_object) {
+    let Some(sid) = zend_helpers::object_property_string(message, "sid", 64) else {
+        return;
+    };
+    if sid.is_empty() {
+        return;
+    }
+    let subject = zend_helpers::object_property_string(message, "subject", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let group = zend_helpers::object_property_string(message, "group", 256)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    SUBSCRIBE_SIDS.with(|map| {
+        let mut map = map.borrow_mut();
+        if map.len() >= MAX_SUBSCRIBE_SIDS && !map.contains_key(&sid) {
+            return;
+        }
+        map.insert(sid, (subject, group));
+    });
+}
+
+/// `SpanPolicy::MessagingPoll`'s END-time reader, dispatching to whichever
+/// broker's retval shape `frame.name` needs — see that policy's own
+/// docblock for why almost everything worth saying about a pull-style
+/// consume call is only knowable here, never at BEGIN.
+///
+/// # Safety
+/// Called from the Zend observer end handler with a valid `execute_data` and
+/// `retval` for the call being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn capture_messaging_poll_result(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    retval: *mut ext_php_rs::ffi::zval,
+    frame: &mut CallFrame,
+) {
+    match frame.name.as_ref() {
+        "RdKafka\\KafkaConsumer::consume" | "RdKafka\\ConsumerTopic::consume" => {
+            capture_rdkafka_poll_result(retval, frame);
+        }
+        "Basis\\Nats\\Queue::fetchAll" => {
+            capture_nats_fetchall_result(execute_data, retval, frame);
+        }
+        _ => {}
+    }
+}
+
+/// RdKafka's poll-span reader (RdKafka contract, "the poll-span contract"):
+/// `retval` is the `Message` `KafkaConsumer::consume`/`ConsumerTopic::consume`
+/// returned (non-null for the former, nullable for the latter — a null
+/// retval reads as an honestly empty poll, not a failure: `Message::err`
+/// being `RD_KAFKA_RESP_ERR__PARTITION_EOF`/`__TIMED_OUT` is normal and never
+/// sets span status, which comes from `threw` alone regardless of policy).
+///
+/// # Safety
+/// Called from the Zend observer end handler with a valid `retval` for the
+/// call being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn capture_rdkafka_poll_result(retval: *mut ext_php_rs::ffi::zval, frame: &mut CallFrame) {
+    use crate::messaging;
+
+    frame.attributes.push(("span.kind".into(), "consumer".into()));
+    frame
+        .attributes
+        .push(("messaging.system".into(), messaging::SYSTEM_KAFKA.into()));
+    frame
+        .attributes
+        .push(("messaging.operation".into(), "receive".into()));
+
+    let Some(message) = zend_helpers::retval_object(retval) else {
+        frame.span_name = Some(format!("RECEIVE {}", messaging::SYSTEM_KAFKA));
+        return;
+    };
+
+    let topic = zend_helpers::object_property_string(message, "topic_name", 512)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let destination = messaging::kafka_destination(&topic);
+    frame.span_name = Some(messaging::labeled("RECEIVE", &destination, messaging::SYSTEM_KAFKA));
+    for (key, value) in destination.attributes() {
+        frame.attributes.push((key.into(), value));
+    }
+
+    // Partition is explicitly not identity (see `kafka_partition_attribute`'s
+    // docblock) — informational only, never fed into `Destination`.
+    if let Some(partition) = zend_helpers::object_property_long(message, "partition")
+        .and_then(messaging::kafka_partition_attribute)
+    {
+        frame
+            .attributes
+            .push(("messaging.kafka.destination.partition".into(), partition));
+    }
+    if let Some(key) = zend_helpers::object_property_string(message, "key", 256)
+        .filter(|value| !value.is_empty())
+    {
+        frame.attributes.push(("messaging.kafka.message.key".into(), key));
+    }
+    // Offset is knowable ONLY on the consume side (unlike partition, which a
+    // publisher can also name) — this is the one place it is ever recorded.
+    if let Some(offset) = zend_helpers::object_property_long(message, "offset") {
+        frame
+            .attributes
+            .push(("messaging.kafka.message.offset".into(), offset.to_string()));
+    }
+
+    // Header context: `Message::headers` is a plain string-keyed array,
+    // empty (never null) whenever `err != RD_KAFKA_RESP_ERR_NO_ERROR` — the
+    // table reads simply come back absent for an empty poll, no special
+    // casing needed.
+    let header = |key: &str| -> Option<String> {
+        zend_helpers::object_property_table_string(message, "headers", key, 4096)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(schema) = header(messaging::SCHEMA_HEADER) {
+        // GAP 1 on the consume side: Kafka has no `type` property at all, so
+        // this header is the ONLY source — `resolve_message_name` is not
+        // even called; an empty schema header means an absent name, exactly
+        // like the publish side's bank-only resolution.
+        frame
+            .attributes
+            .push(("messaging.message.name".into(), schema));
+    }
+    if let Some(enqueued_at) = header(messaging::ENQUEUED_AT_HEADER) {
+        if let Some(waited) = messaging::wait_milliseconds(&enqueued_at, epoch_seconds_now()) {
+            frame
+                .attributes
+                .push(("messaging.message.queue_time_ms".into(), waited.to_string()));
+        }
+    }
+    // Non-causal: captured for debugging only, never used to parent this
+    // span — the RdKafka contract's own "no causality link" section. This
+    // span's parent was already fixed at BEGIN, before this header was even
+    // knowable.
+    if let Some(traceparent) = header("traceparent") {
+        frame
+            .attributes
+            .push(("messaging.message.traceparent".into(), traceparent));
+    }
+}
+
+/// NATS JetStream's poll-span reader (NATS contract §5(d)): `$this` is the
+/// `Queue`, `retval` is the batch `fetchAll` returned. No per-message facts
+/// attach anywhere — a batch can span several subjects, so there is no
+/// single message this span is "about" — only the whole-batch destination
+/// (stream/consumer, parsed from the pull-consumer's own request subject)
+/// and its size.
+///
+/// # Safety
+/// Called from the Zend observer end handler with a valid `execute_data` and
+/// `retval` for the call being unwound.
+#[cfg(feature = "zend-observer")]
+unsafe fn capture_nats_fetchall_result(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    retval: *mut ext_php_rs::ffi::zval,
+    frame: &mut CallFrame,
+) {
+    use crate::messaging;
+
+    frame.attributes.push(("span.kind".into(), "consumer".into()));
+    frame
+        .attributes
+        .push(("messaging.system".into(), messaging::SYSTEM_NATS.into()));
+    frame
+        .attributes
+        .push(("messaging.operation".into(), "receive".into()));
+
+    // `Queue::$launcher` (private `?Publish`) carries the pull-consumer's own
+    // request subject, `$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>` —
+    // parsed EXACTLY (NATS subject-token grammar forbids embedded `.`), never
+    // a heuristic. Absent when the queue was never given a launcher (a core
+    // NATS subscribe wrapped in a `Queue`, not a JetStream pull consumer) —
+    // the destination then reads as `None` everywhere, honestly.
+    let queue = zend_helpers::this_object(execute_data);
+    let launcher = queue.and_then(|object| zend_helpers::object_property_object(object, "launcher"));
+    let launcher_subject =
+        launcher.and_then(|object| zend_helpers::object_property_string(object, "subject", 512));
+    let destination = launcher_subject
+        .as_deref()
+        .and_then(messaging::jetstream_next_subject_stream_and_consumer)
+        .map(|(stream, consumer)| messaging::nats_jetstream_poll_destination(&stream, &consumer))
+        .unwrap_or(messaging::Destination {
+            name: None,
+            namespace: None,
+            via: None,
+            route: None,
+        });
+    frame.span_name = Some(messaging::labeled("RECEIVE", &destination, messaging::SYSTEM_NATS));
+    for (key, value) in destination.attributes() {
+        frame.attributes.push((key.into(), value));
+    }
+
+    // Batch size: the call's own retval length, never guessed — same "only
+    // the return value knows" reasoning `bank_prepared_statement` relies on.
+    if let Some(count) = zend_helpers::retval_array_len(retval) {
+        frame
+            .attributes
+            .push(("messaging.batch.message_count".into(), count.to_string()));
+    }
+}
+
+/// Close the message-scoped request the popped frame opened.
+///
+/// The error rule, and its stated trade: the bespoke `consumeFailed()` carried
+/// the APPLICATION's judgement ("this delivery failed"); the native rule is
+/// "any exception thrown during the delivery, even caught". In a thin
+/// dispatch-decode-handle consumer those are the same set; a consumer whose
+/// framework internals throw-and-catch routinely will show false-positive
+/// errored deliveries, and the remedy is the process switch
+/// (CHRONOS_PHP_MESSAGING_AUTO=0) — not a silent heuristic.
+///
+///   * `threw` (EG(exception) still set) — the handler's throw is ESCAPING into
+///     the event loop: closed as error with `handled=false`, exception untouched.
+///   * a LastThrow within the scope, no pending exception — thrown and
+///     swallowed: closed as error with `handled=true`. This is the
+///     `consumeFailed()` replacement.
+///   * neither — a clean delivery.
+///
+/// HTTP status is always 0: a message has no status code, and borrowing 200
+/// would put a number in a column that means something it does not mean.
+///
+/// # Safety
+/// Called from the Zend observer end handler with the SAME valid
+/// `execute_data` `chronos_end_trampoline` was itself called with — needed
+/// only for a `DeliveryRoute::DeferredAmqplib` scope (see its docblock);
+/// `Known` routes ignore it entirely.
+#[cfg(feature = "zend-observer")]
+unsafe fn close_messaging_delivery(
+    execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    threw: bool,
+) {
+    let route = match DELIVERY_SCOPE.with(|slot| slot.borrow_mut().take()) {
+        Some(route) => route.resolve(execute_data),
+        None => "amqp".to_owned(),
+    };
+    let throw_site = |throw: &LastThrow| {
+        if throw.file.is_empty() {
+            String::new()
+        } else {
+            format!("{}:{}", throw.file, throw.line)
+        }
+    };
+    let error = match (last_throw(), threw) {
+        (Some(throw), escaping) => {
+            let site = throw_site(&throw);
+            Some((throw.class, throw.message, site, !escaping))
+        }
+        // Escaping exception the hook never saw (should be unreachable — the
+        // hook chains every throw): still an errored delivery, with the honest
+        // minimum said about it.
+        (None, true) => Some(("Throwable".to_owned(), String::new(), String::new(), false)),
+        (None, false) => None,
+    };
+    crate::end_request(0, route, error);
 }
 
 /// Ceiling on remembered prepared statements per request. CURL_HEADERS gets away
@@ -2002,10 +4793,30 @@ pub(crate) mod zend_helpers {
     /// Class name of a thrown object, read the same way as a call's own scope in
     /// `function_name` above: `zend_class_entry.name` is a `zend_string`.
     unsafe fn exception_class_name(exception: *mut ext_php_rs::ffi::zend_object) -> Option<String> {
-        if exception.is_null() {
+        object_class_name(exception)
+    }
+
+    /// The RUNTIME class of ANY `zend_object` — `object->ce->name`, read the
+    /// same way `function_name` reads a call's declaring scope, except this
+    /// reads the OBJECT's own class entry rather than the FUNCTION's.
+    ///
+    /// That distinction is the entire reason this exists: `function_name`'s
+    /// `(*func).common.scope` is the method's DECLARING class — for an
+    /// inherited method (`serializeToString`, declared once on
+    /// `Google\Protobuf\Internal\Message` and never overridden by a generated
+    /// DTO) that is the SAME base class for every subclass, which is exactly
+    /// what makes it usable as a stable name-table key in `observe_policy`.
+    /// But GAP 1's bank needs the OPPOSITE fact — `$this`'s actual class
+    /// (`QlsProtocol\Shared\Webhook`) — and only a read of the object's own
+    /// `ce` (not the function's `scope`) gives that. Same null-checked walk,
+    /// same `to_string_lossy` (a PHP class name is a `zend_string`, not
+    /// guaranteed valid UTF-8, and a lossy class name is still enough to bank
+    /// under — worst case one message never matches, never a wrong class).
+    pub unsafe fn object_class_name(object: *mut ext_php_rs::ffi::zend_object) -> Option<String> {
+        if object.is_null() {
             return None;
         }
-        let ce = (*exception).ce;
+        let ce = (*object).ce;
         if ce.is_null() {
             return None;
         }
@@ -2087,11 +4898,43 @@ pub(crate) mod zend_helpers {
     const IS_ARRAY: u8 = 7;
     const IS_OBJECT: u8 = 8;
     const IS_RESOURCE: u8 = 9;
+    const IS_REFERENCE: u8 = 10;
     const IS_TRUE: u8 = 3;
     const IS_FALSE: u8 = 2;
 
     unsafe fn zval_type(zv: *const ext_php_rs::ffi::zval) -> u8 {
         (*zv).u1.v.type_
+    }
+
+    /// The correct zval type tag for a `zend_string` this crate just built
+    /// with `ext_php_rs_zend_string_init` — `IS_INTERNED_STRING_EX` (NOT
+    /// refcounted) when the string is one of PHP's own shared singletons,
+    /// `IS_STRING_EX` (refcounted, copyable) otherwise.
+    ///
+    /// `ext_php_rs_zend_string_init` (`wrapper.c`) special-cases every
+    /// request for length 0 or 1: it hands back `zend_empty_string` or the
+    /// matching entry of the process-wide `zend_one_char_string[256]` table
+    /// instead of allocating — `GC_IMMUTABLE` is how those, and any other
+    /// engine-shared string, are told apart from a genuinely fresh one
+    /// (mirrors `Zval::set_zend_string`'s own `is_interned` check in
+    /// ext-php-rs, which exists for exactly this reason).
+    ///
+    /// Tagging a shared singleton as refcounted anyway is NOT cosmetic: it
+    /// tells every later copy of the zval (a `foreach`, `zend_array_dup`,
+    /// this very array's own destruction at the end of the request) to
+    /// `GC_ADDREF`/`GC_DELREF` a PROCESS-GLOBAL table entry whose count nothing
+    /// outside PHP's own string subsystem is supposed to touch. Confirmed
+    /// live: the AMQP wire format's `'S'` (long-string) tuple tag is exactly
+    /// one byte, so skipping this check corrupted `zend_interned_strings_dtor`'s
+    /// bookkeeping — reproduced as a `zend_mm_heap corrupted` abort at
+    /// `php_module_shutdown`, on literally the first real publish this table
+    /// ever carried.
+    unsafe fn owned_string_type_info(zs: *mut ext_php_rs::ffi::zend_string) -> u32 {
+        if (*zs).gc.u.type_info & ext_php_rs::ffi::GC_IMMUTABLE != 0 {
+            ext_php_rs::ffi::IS_INTERNED_STRING_EX
+        } else {
+            ext_php_rs::ffi::IS_STRING_EX
+        }
     }
 
     pub unsafe fn arg_object_handle(
@@ -2107,6 +4950,95 @@ pub(crate) mod zend_helpers {
             return None;
         }
         Some((*obj).handle)
+    }
+
+    /// The object at argument `index`, when it is one — the pointer sibling
+    /// of [`arg_object_handle`], for callers that go on to read the
+    /// argument's own properties (amqplib's `$message` at `basic_deliver`'s
+    /// begin, NATS's `$message`/`$handler` at `sendMessage`/`processMsg`'s
+    /// begin). One `IS_REFERENCE` deref, same as every other arg reader here.
+    pub unsafe fn arg_object(
+        execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+        index: usize,
+    ) -> Option<*mut ext_php_rs::ffi::zend_object> {
+        let mut zv = arg_zval(execute_data, index);
+        if zv.is_null() {
+            return None;
+        }
+        if zval_type(zv) == IS_REFERENCE {
+            zv = std::ptr::addr_of_mut!((*(*zv).value.ref_).val);
+        }
+        if zval_type(zv) != IS_OBJECT {
+            return None;
+        }
+        let obj = (*zv).value.obj;
+        if obj.is_null() {
+            return None;
+        }
+        Some(obj)
+    }
+
+    /// Whether argument `index` is present at all and holds an object —
+    /// distinguishes "not passed" (an omitted trailing default) from
+    /// "passed but not an object" without needing a second call, for a
+    /// caller like NATS's `processMsg` that must tell a `Queue` handler
+    /// apart from a real callable/closure using only the argument's TYPE
+    /// (a callable can be a string, array, or object — this predicate only
+    /// answers the object case one caller actually asks about).
+    pub unsafe fn arg_is_instance_of(
+        execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+        index: usize,
+        class_name: &str,
+    ) -> bool {
+        let Some(object) = arg_object(execute_data, index) else {
+            return false;
+        };
+        object_instance_of(object, class_name)
+    }
+
+    /// PHP `instanceof` for CLASS inheritance: true when the object's own
+    /// class, or any ancestor up its `parent` chain, is named `class_name`.
+    ///
+    /// The parent WALK (rather than one exact name compare) is what the NATS
+    /// contract's own `instanceof` wording requires: a userland
+    /// `MyQueue extends \Basis\Nats\Queue` handed to `Client::subscribe` is
+    /// still a buffering `Queue` — an exact-name compare would misread it as
+    /// a real callable and open a message-scoped request around a call that
+    /// runs no application code at all. Interfaces are deliberately NOT
+    /// walked: every class this file tests for (`Queue`, `Message\Publish`,
+    /// `Message\Subscribe`) is a concrete class, and the interface table is
+    /// a separate list this read has no need to touch.
+    ///
+    /// `ce.__bindgen_anon_1` is the engine's `parent`/`parent_name` union;
+    /// `parent` (the linked ce pointer) is the live member for any class an
+    /// OBJECT exists of — an unlinked class cannot be instantiated — the
+    /// same guarantee `object_class_name` already leans on for `ce` itself.
+    /// The walk is depth-capped: PHP's own inheritance has no cycles, so the
+    /// cap is unreachable, but a corrupted pointer looping forever inside an
+    /// observer handler would hang the worker where the cap turns it into a
+    /// plain `false`.
+    pub unsafe fn object_instance_of(
+        object: *mut ext_php_rs::ffi::zend_object,
+        class_name: &str,
+    ) -> bool {
+        if object.is_null() {
+            return false;
+        }
+        let mut ce = (*object).ce;
+        for _ in 0..64 {
+            if ce.is_null() {
+                return false;
+            }
+            let name = (*ce).name;
+            if !name.is_null() {
+                let candidate = CStr::from_ptr((*name).val.as_ptr()).to_string_lossy();
+                if candidate == class_name {
+                    return true;
+                }
+            }
+            ce = (*ce).__bindgen_anon_1.parent;
+        }
+        false
     }
 
     /// Handle id of the object a METHOD call is invoked on (`$this`) — how the
@@ -2150,6 +5082,418 @@ pub(crate) mod zend_helpers {
             return None;
         }
         Some((*obj).handle)
+    }
+
+    /// The object RETURN VALUE itself, when there is one — the pointer sibling
+    /// of [`retval_object_handle`], for callers that go on to read the object's
+    /// properties (`MethodBasicConsumeOkFrame::$consumerTag`).
+    pub unsafe fn retval_object(
+        retval: *mut ext_php_rs::ffi::zval,
+    ) -> Option<*mut ext_php_rs::ffi::zend_object> {
+        if retval.is_null() || zval_type(retval) != IS_OBJECT {
+            return None;
+        }
+        let obj = (*retval).value.obj;
+        if obj.is_null() {
+            return None;
+        }
+        Some(obj)
+    }
+
+    /// The object a METHOD call is invoked on (`$this`) — the pointer sibling of
+    /// [`this_object_handle`], for the messaging paths that read the receiver's
+    /// properties (a Bunny client's `$options`, a channel's frames).
+    pub unsafe fn this_object(
+        execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+    ) -> Option<*mut ext_php_rs::ffi::zend_object> {
+        if execute_data.is_null() {
+            return None;
+        }
+        let this = std::ptr::addr_of!((*execute_data).This) as *const ext_php_rs::ffi::zval;
+        if zval_type(this) != IS_OBJECT {
+            return None;
+        }
+        let obj = (*this).value.obj;
+        if obj.is_null() {
+            return None;
+        }
+        Some(obj)
+    }
+
+    /// Read one property of ANY object, protected and private included.
+    ///
+    /// `zend_read_property` sets `EG(fake_scope)` to the class entry it is
+    /// handed for the duration of the read, so passing the object's OWN ce
+    /// grants full visibility — the same mechanism `read_exception_property`
+    /// above has always relied on (a Throwable's `message` is protected).
+    /// Visibility binds USERLAND readers, not the engine, and this fact is what
+    /// makes the native messaging path strictly better than the bespoke bridge:
+    /// `Bunny\AbstractClient::$options` has no getter, so PHP-side telemetry had
+    /// to take the vhost as a parameter and could never see the broker host at
+    /// all. `silent = true` suppresses the undefined-property notice — a missing
+    /// property is an absent fact, never an error the application sees.
+    ///
+    /// One `IS_REFERENCE` level is dereferenced. The returned pointer is valid
+    /// only until the next engine call — every caller copies out immediately.
+    unsafe fn read_object_property(
+        object: *mut ext_php_rs::ffi::zend_object,
+        name: &str,
+        rv: *mut ext_php_rs::ffi::zval,
+    ) -> *mut ext_php_rs::ffi::zval {
+        if object.is_null() {
+            return std::ptr::null_mut();
+        }
+        let ce = (*object).ce;
+        if ce.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Ok(name) = std::ffi::CString::new(name) else {
+            return std::ptr::null_mut();
+        };
+        let mut prop = ext_php_rs::ffi::zend_read_property(
+            ce,
+            object,
+            name.as_ptr(),
+            name.as_bytes().len(),
+            true,
+            rv,
+        );
+        if !prop.is_null() && zval_type(prop) == IS_REFERENCE {
+            prop = std::ptr::addr_of_mut!((*(*prop).value.ref_).val);
+        }
+        prop
+    }
+
+    /// A property as a bounded owned string (string/long/double/bool zvals, the
+    /// same coercions `zval_to_owned_string` has always made). `None` for a
+    /// missing property or any other type.
+    pub unsafe fn object_property_string(
+        object: *mut ext_php_rs::ffi::zend_object,
+        name: &str,
+        max: usize,
+    ) -> Option<String> {
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let prop = read_object_property(object, name, rv.as_mut_ptr());
+        if prop.is_null() {
+            return None;
+        }
+        zval_to_owned_string(prop).map(|mut value| {
+            if value.len() > max {
+                let mut end = max;
+                while end > 0 && !value.is_char_boundary(end) {
+                    end -= 1;
+                }
+                value.truncate(end);
+            }
+            value
+        })
+    }
+
+    /// A string property's RAW BYTES — for payloads (`Bunny\Protocol\Buffer::$buffer`),
+    /// where the lossy UTF-8 conversion of `zval_to_owned_string` would corrupt a
+    /// protobuf body before the text-or-base64 decision ever ran. `None` for
+    /// anything that is not a string.
+    pub unsafe fn object_property_bytes(
+        object: *mut ext_php_rs::ffi::zend_object,
+        name: &str,
+    ) -> Option<Vec<u8>> {
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let prop = read_object_property(object, name, rv.as_mut_ptr());
+        if prop.is_null() || zval_type(prop) != IS_STRING {
+            return None;
+        }
+        let s = (*prop).value.str_;
+        if s.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts((*s).val.as_ptr() as *const u8, (*s).len).to_vec())
+    }
+
+    /// A boolean property. `None` for a missing property or any other type, so a
+    /// caller's default is its own decision.
+    pub unsafe fn object_property_bool(
+        object: *mut ext_php_rs::ffi::zend_object,
+        name: &str,
+    ) -> Option<bool> {
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let prop = read_object_property(object, name, rv.as_mut_ptr());
+        if prop.is_null() {
+            return None;
+        }
+        match zval_type(prop) {
+            IS_TRUE => Some(true),
+            IS_FALSE => Some(false),
+            _ => None,
+        }
+    }
+
+    /// An object-typed property, or `None` when it is null/absent/another type —
+    /// how the delivery scope walks `channel->deliverFrame`, `->headerFrame`,
+    /// `->bodyBuffer` and `->client`.
+    pub unsafe fn object_property_object(
+        object: *mut ext_php_rs::ffi::zend_object,
+        name: &str,
+    ) -> Option<*mut ext_php_rs::ffi::zend_object> {
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let prop = read_object_property(object, name, rv.as_mut_ptr());
+        if prop.is_null() || zval_type(prop) != IS_OBJECT {
+            return None;
+        }
+        let inner = (*prop).value.obj;
+        if inner.is_null() {
+            return None;
+        }
+        Some(inner)
+    }
+
+    /// Whether an array-typed property has a given string key — Bunny's own
+    /// `isset($this->deliverCallbacks[$consumerTag])` guard, mirrored: a message
+    /// Bunny would drop must open no request.
+    pub unsafe fn object_property_array_has_str_key(
+        object: *mut ext_php_rs::ffi::zend_object,
+        name: &str,
+        key: &str,
+    ) -> bool {
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let prop = read_object_property(object, name, rv.as_mut_ptr());
+        if prop.is_null() || zval_type(prop) != IS_ARRAY {
+            return false;
+        }
+        let arr = (*prop).value.arr;
+        if arr.is_null() {
+            return false;
+        }
+        !ext_php_rs::ffi::zend_hash_str_find(
+            arr as *const ext_php_rs::ffi::HashTable,
+            key.as_ptr().cast(),
+            key.len(),
+        )
+        .is_null()
+    }
+
+    /// One string-keyed entry of an array-typed property, as a bounded string —
+    /// how a Bunny client's protected `$options['vhost'|'host'|'port']` is read.
+    /// Scalar coercions match `zval_to_owned_string` (the port is a long).
+    pub unsafe fn object_property_table_string(
+        object: *mut ext_php_rs::ffi::zend_object,
+        name: &str,
+        key: &str,
+        max: usize,
+    ) -> Option<String> {
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let prop = read_object_property(object, name, rv.as_mut_ptr());
+        if prop.is_null() || zval_type(prop) != IS_ARRAY {
+            return None;
+        }
+        let arr = (*prop).value.arr;
+        if arr.is_null() {
+            return None;
+        }
+        let value = ext_php_rs::ffi::zend_hash_str_find(
+            arr as *const ext_php_rs::ffi::HashTable,
+            key.as_ptr().cast(),
+            key.len(),
+        );
+        if value.is_null() {
+            return None;
+        }
+        zval_to_owned_string(value).map(|mut text| {
+            if text.len() > max {
+                let mut end = max;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            text
+        })
+    }
+
+    /// Arg `index` as RAW BYTES, strings only — the publish body, which must not
+    /// pass through a lossy UTF-8 conversion before the text-or-base64 decision
+    /// (a protobuf payload would be corrupted). A non-string body (Bunny accepts
+    /// whatever it can append to a buffer) yields `None`: it contributes no size
+    /// and no payload rather than a guess at one.
+    pub unsafe fn arg_string_bytes(
+        execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+        index: usize,
+    ) -> Option<Vec<u8>> {
+        let mut zv = arg_zval(execute_data, index);
+        if zv.is_null() {
+            return None;
+        }
+        if zval_type(zv) == IS_REFERENCE {
+            zv = std::ptr::addr_of_mut!((*(*zv).value.ref_).val);
+        }
+        if zval_type(zv) != IS_STRING {
+            return None;
+        }
+        let s = (*zv).value.str_;
+        if s.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts((*s).val.as_ptr() as *const u8, (*s).len).to_vec())
+    }
+
+    /// One string-keyed entry of an ARRAY argument, as a bounded string — how
+    /// the publish begin reads the caller's own `content-type` and `type` out of
+    /// the headers argument. `None` when the arg is not an array or the key is
+    /// absent or non-scalar.
+    pub unsafe fn arg_array_str_key_string(
+        execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+        index: usize,
+        key: &str,
+        max: usize,
+    ) -> Option<String> {
+        let mut zv = arg_zval(execute_data, index);
+        if zv.is_null() {
+            return None;
+        }
+        if zval_type(zv) == IS_REFERENCE {
+            zv = std::ptr::addr_of_mut!((*(*zv).value.ref_).val);
+        }
+        if zval_type(zv) != IS_ARRAY {
+            return None;
+        }
+        let arr = (*zv).value.arr;
+        if arr.is_null() {
+            return None;
+        }
+        let value = ext_php_rs::ffi::zend_hash_str_find(
+            arr as *const ext_php_rs::ffi::HashTable,
+            key.as_ptr().cast(),
+            key.len(),
+        );
+        if value.is_null() {
+            return None;
+        }
+        zval_to_owned_string(value).map(|mut text| {
+            if text.len() > max {
+                let mut end = max;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            text
+        })
+    }
+
+    /// Write string entries into an ARRAY argument of the observed call, with
+    /// add-if-absent semantics per key — the delicate half of native messaging
+    /// publish observation, and the crate's only argument WRITE.
+    ///
+    /// The rules, each guarding a real corruption:
+    ///
+    /// 1. **The slot must be an actually-passed argument** (`index < num_args`,
+    ///    the same bound `arg_zval` enforces). Never bump `num_args`, never
+    ///    write an unpassed slot: `ZEND_RECV_INIT`'s default-assignment
+    ///    behaviour against a pre-written slot is PHP-version-sensitive, and at
+    ///    the chosen observation point (`Bunny\AbstractClient::publish`, which
+    ///    Bunny's own chain always calls with all seven arguments positionally)
+    ///    the case only exists for direct `Client::publish` callers using
+    ///    defaults — who then get a warn-once line, not a crash.
+    /// 2. **One `IS_REFERENCE` deref** (by-value params never keep one after
+    ///    SEND; defensive only), then the slot must hold an array.
+    /// 3. **Copy-on-write**: a shared (`refcount > 1`) or immutable
+    ///    (`GC_IMMUTABLE` — the engine's shared empty-array constant, which a
+    ///    `[]` default produces, and the COMMON case here) array is
+    ///    `zend_array_dup`'d; the old slot value is released and the dup
+    ///    (refcount 1) written in. This is what guarantees the application's own
+    ///    `$headers` variable is never observably mutated — instrumentation must
+    ///    not change what the app publishes OR what it holds. Only a
+    ///    refcount-1, mutable array is edited in place.
+    /// 4. **Add-if-absent, per key, atomically**: an existing key is KEPT — a
+    ///    caller-supplied `traceparent` always wins and ours is simply not
+    ///    added; same independently for every other entry. Native never
+    ///    validates or rewrites a caller's value.
+    ///
+    /// No PHP callback is involved (pure hash writes), so unlike
+    /// `inject_curl_traceparent` there is no re-entrancy ordering constraint
+    /// with `push_frame` — noted because the curl path's constraint is easy to
+    /// assume by analogy.
+    ///
+    /// `Err` carries the warn-once reason; on any error nothing was written and
+    /// the caller's span is still recorded (recording a span whose id is not on
+    /// the wire breaks nothing — the promise runs the other way).
+    ///
+    /// # Safety
+    /// Called from the Zend observer begin handler with a valid execute_data.
+    pub unsafe fn inject_array_entries(
+        execute_data: *mut ext_php_rs::ffi::zend_execute_data,
+        index: usize,
+        entries: &[(&str, String)],
+    ) -> Result<(), &'static str> {
+        let argc = (*execute_data).This.u2.num_args as usize;
+        if index >= argc {
+            return Err("headers argument not passed");
+        }
+        let mut slot = (execute_data.add(1) as *mut ext_php_rs::ffi::zval).add(index);
+        if zval_type(slot) == IS_REFERENCE {
+            slot = std::ptr::addr_of_mut!((*(*slot).value.ref_).val);
+        }
+        if zval_type(slot) != IS_ARRAY {
+            return Err("headers argument is not an array");
+        }
+        let mut arr = (*slot).value.arr;
+        if arr.is_null() {
+            return Err("headers argument is not an array");
+        }
+        let shared = (*arr).gc.refcount > 1
+            || ((*arr).gc.u.type_info & ext_php_rs::ffi::GC_IMMUTABLE) != 0;
+        if shared {
+            let dup = ext_php_rs::ffi::zend_array_dup(arr);
+            if dup.is_null() {
+                return Err("headers array could not be copied");
+            }
+            // Release the slot's old value (a no-op for the immutable empty
+            // array, a refcount decrement for a shared one), then hand the dup —
+            // refcount 1, mutable — to the slot.
+            ext_php_rs::ffi::zval_ptr_dtor(slot);
+            (*slot).value.arr = dup;
+            (*slot).u1.type_info = ext_php_rs::ffi::IS_ARRAY_EX;
+            arr = dup;
+        }
+        for (key, value) in entries {
+            // Caller wins, per key: an existing entry is kept untouched.
+            if !ext_php_rs::ffi::zend_hash_str_find(
+                arr as *const ext_php_rs::ffi::HashTable,
+                key.as_ptr().cast(),
+                key.len(),
+            )
+            .is_null()
+            {
+                continue;
+            }
+            let zs = ext_php_rs::ffi::ext_php_rs_zend_string_init(
+                value.as_ptr().cast(),
+                value.len(),
+                false,
+            );
+            if zs.is_null() {
+                continue;
+            }
+            let mut entry: ext_php_rs::ffi::zval = std::mem::zeroed();
+            entry.value.str_ = zs;
+            entry.u1.type_info = owned_string_type_info(zs);
+            let inserted = ext_php_rs::ffi::zend_hash_str_update(
+                arr,
+                key.as_ptr().cast(),
+                key.len(),
+                &mut entry,
+            );
+            // `zend_hash_str_update` copied the zval into the bucket: the
+            // bucket owns `zs` now. `entry` must NOT run its Drop —
+            // ext-php-rs's `Zval` Drop releases the held string, which would
+            // free a string the array still references (a use-after-free that
+            // corrupts the Zend arena; found live as php-fpm SIGSEGVs).
+            std::mem::forget(entry);
+            if inserted.is_null() {
+                // The insert was refused; the string is ours to release.
+                ext_php_rs::ffi::ext_php_rs_zend_string_release(zs);
+            }
+        }
+        Ok(())
     }
 
     pub unsafe fn arg_long(
@@ -2436,6 +5780,32 @@ pub(crate) mod zend_helpers {
         out
     }
 
+    /// A returned zval as RAW BYTES, string returns only — the
+    /// `serializeToString` sibling of [`arg_string_bytes`] above, over a
+    /// RETURN VALUE rather than an argument. Same reason as that function:
+    /// [`string_retval`] below goes through `Zval::str()`, which is a lossy
+    /// UTF-8 read, and a serialized protobuf message is binary — the GAP 1
+    /// bank must hash and length-check the WIRE bytes, not a mangled copy of
+    /// them, or every non-UTF-8 payload would bank under one identity that
+    /// never matches its own publish body.
+    pub unsafe fn retval_string_bytes(retval: *mut ext_php_rs::ffi::zval) -> Option<Vec<u8>> {
+        let mut zv = retval;
+        if zv.is_null() {
+            return None;
+        }
+        if zval_type(zv) == IS_REFERENCE {
+            zv = std::ptr::addr_of_mut!((*(*zv).value.ref_).val);
+        }
+        if zval_type(zv) != IS_STRING {
+            return None;
+        }
+        let s = (*zv).value.str_;
+        if s.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts((*s).val.as_ptr() as *const u8, (*s).len).to_vec())
+    }
+
     /// A returned zval as a String, but ONLY when it really is one. `curl_exec`
     /// without CURLOPT_RETURNTRANSFER returns `true`, and coercing that to "1" would
     /// present a one-byte lie as the response body.
@@ -2469,6 +5839,565 @@ pub(crate) mod zend_helpers {
         let mut url = url;
         url.truncate(512);
         Some(url)
+    }
+
+    /// Call a zero-argument, non-overridable internal method on `object` and
+    /// read its return value as a bounded string — the RdKafka contract's
+    /// bridge for `RdKafka\ProducerTopic::getName()`: at `produce`/`producev`,
+    /// `$this` is the Topic, and the topic name is neither an argument nor a
+    /// declared property (`kafka_topic_object`'s C struct field is invisible
+    /// to `zend_read_property`, see the contract's "vhost/cluster/server
+    /// address recovery" section) — a native→PHP method call is the only
+    /// sound route, and this is safe re-entrancy for the SAME reason
+    /// `curl_effective_url` above already calls back into PHP
+    /// (`curl_getinfo`) from inside the END trampoline: `getName` matches no
+    /// messaging/SQL/cache/network table and isn't userland, so
+    /// `observe_policy` attaches no begin/end handlers to it — this call
+    /// cannot recurse into our own trampolines or double-push `CALL_FRAMES`.
+    ///
+    /// `ZendObject::try_call_method` (ext-php-rs `types::object`) is used
+    /// rather than a raw `zend_call_known_function` here: `ZendObject` is a
+    /// type ALIAS for `ext_php_rs::ffi::zend_object` (not a wrapper), so a
+    /// `*mut ffi::zend_object` this module already holds can call it directly
+    /// with no cast games beyond the reference itself — the exact
+    /// `&*(ptr as *const types::Zval)` idiom `call_curl_setopt_httpheader`
+    /// already uses for the analogous `types::Zval` alias.
+    ///
+    /// `None` for a missing method, a call that returns non-string, or an
+    /// empty result — never a fabricated topic name.
+    pub unsafe fn call_object_method_string(
+        object: *mut ext_php_rs::ffi::zend_object,
+        method: &str,
+        max: usize,
+    ) -> Option<String> {
+        if object.is_null() {
+            return None;
+        }
+        let object_ref = &*(object as *const ext_php_rs::types::ZendObject);
+        let result = object_ref.try_call_method(method, Vec::new()).ok()?;
+        let mut value = result.string()?;
+        if value.is_empty() {
+            return None;
+        }
+        if value.len() > max {
+            let mut end = max;
+            while end > 0 && !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            value.truncate(end);
+        }
+        Some(value)
+    }
+
+    /// One string-keyed entry of `$message->properties['application_headers']`
+    /// (amqplib) — the read side of the three-shape header carrier the write
+    /// side (`inject_amqp_application_headers`) also handles: absent, a plain
+    /// array of `[tag, value]` tuples (the back-compat shape `write_table`
+    /// accepts identically to a real `AMQPTable`, and the shape the injector
+    /// itself writes), a plain array of BARE scalars (an application that
+    /// built the array by hand without the tuple wrapper — tolerated, not
+    /// required), or an `AMQPTable` OBJECT (whose own protected `$data` holds
+    /// `[int-tag, value]` tuples in the identical layout). Never a userland
+    /// method call — `AMQPTable::getNativeData()` would work but is exactly
+    /// the call this read path avoids on principle (the contract's
+    /// "Schema-name propagation" section).
+    pub unsafe fn amqp_application_header(
+        message: *mut ext_php_rs::ffi::zend_object,
+        key: &str,
+        max: usize,
+    ) -> Option<String> {
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let properties = read_object_property(message, "properties", rv.as_mut_ptr());
+        if properties.is_null() || zval_type(properties) != IS_ARRAY {
+            return None;
+        }
+        let properties_arr = (*properties).value.arr;
+        if properties_arr.is_null() {
+            return None;
+        }
+        let headers_value = ext_php_rs::ffi::zend_hash_str_find(
+            properties_arr as *const ext_php_rs::ffi::HashTable,
+            "application_headers".as_ptr().cast(),
+            "application_headers".len(),
+        );
+        if headers_value.is_null() {
+            return None;
+        }
+        match zval_type(headers_value) {
+            IS_ARRAY => amqp_read_header_from_array((*headers_value).value.arr, key, max),
+            IS_OBJECT => {
+                let table_obj = (*headers_value).value.obj;
+                if table_obj.is_null() {
+                    return None;
+                }
+                let mut rv2 = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+                let data = read_object_property(table_obj, "data", rv2.as_mut_ptr());
+                if data.is_null() || zval_type(data) != IS_ARRAY {
+                    return None;
+                }
+                amqp_read_header_from_array((*data).value.arr, key, max)
+            }
+            _ => None,
+        }
+    }
+
+    /// One key's VALUE out of an amqp headers array, tolerating both the
+    /// `[tag, value]` tuple shape and a bare scalar (an application that
+    /// wrote the array by hand without the tuple wrapper).
+    unsafe fn amqp_read_header_from_array(
+        arr: *mut ext_php_rs::ffi::zend_array,
+        key: &str,
+        max: usize,
+    ) -> Option<String> {
+        if arr.is_null() {
+            return None;
+        }
+        let value = ext_php_rs::ffi::zend_hash_str_find(
+            arr as *const ext_php_rs::ffi::HashTable,
+            key.as_ptr().cast(),
+            key.len(),
+        );
+        if value.is_null() {
+            return None;
+        }
+        let scalar = if zval_type(value) == IS_ARRAY {
+            // Index 1 is the value half of the `[tag, value]` tuple; index 0
+            // (the wire-type tag) is uninteresting to a reader.
+            let tuple = (*value).value.arr;
+            if tuple.is_null() {
+                return None;
+            }
+            ext_php_rs::ffi::zend_hash_index_find(tuple as *const ext_php_rs::ffi::HashTable, 1)
+        } else {
+            value
+        };
+        if scalar.is_null() {
+            return None;
+        }
+        zval_to_owned_string(scalar).map(|mut text| {
+            if text.len() > max {
+                let mut end = max;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            text
+        })
+    }
+
+    /// Inject propagation/schema entries into
+    /// `$msg->properties['application_headers']` (amqplib), preserving
+    /// whichever of the three shapes is already there and never making a
+    /// userland method call — see the contract's "Injectable vs span-only"
+    /// section for why a raw array is exactly as legal a wire value as a real
+    /// `AMQPTable` here (`write_table`, `Wire/AMQPWriter.php:369`, branches on
+    /// `instanceof AMQPTable` only to pick the wire type-tag alphabet, never
+    /// to reject a plain array).
+    ///
+    /// New entries are written in the LEGACY symbol-char tuple shape
+    /// (`['S', value]`, long string — the `$types_080` alphabet
+    /// `write_table`'s non-`AMQPTable` branch reads) when the array is fresh
+    /// or already a plain array, and in the `AMQPTable`-internal int-tag
+    /// shape (`[AMQPAbstractCollection::T_STRING_LONG /* 14 */, value]`) when
+    /// appending into an existing `AMQPTable` object's own `$data` — either
+    /// tuple shape is a legal wire value; matching whichever is already there
+    /// just means an application reading `$msg` back out via its own methods
+    /// sees one consistent representation, not a mixed one.
+    ///
+    /// Add-if-absent per key, same rule as [`inject_array_entries`]: an
+    /// existing entry (of EITHER tuple shape) is left untouched.
+    ///
+    /// # Safety
+    /// Called from the Zend observer begin handler with a valid, live `$msg`
+    /// object pointer (arg 0 of `AMQPChannel::basic_publish`).
+    pub unsafe fn inject_amqp_application_headers(
+        message: *mut ext_php_rs::ffi::zend_object,
+        entries: &[(&str, String)],
+    ) -> Result<(), &'static str> {
+        if message.is_null() {
+            return Err("message is null");
+        }
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let properties = read_object_property(message, "properties", rv.as_mut_ptr());
+        if properties.is_null() {
+            return Err("properties not readable");
+        }
+        if zval_type(properties) != IS_ARRAY {
+            return Err("properties is not an array");
+        }
+        let mut properties_arr = (*properties).value.arr;
+        if properties_arr.is_null() {
+            return Err("properties is not an array");
+        }
+        let props_shared = (*properties_arr).gc.refcount > 1
+            || ((*properties_arr).gc.u.type_info & ext_php_rs::ffi::GC_IMMUTABLE) != 0;
+        if props_shared {
+            let dup = ext_php_rs::ffi::zend_array_dup(properties_arr);
+            if dup.is_null() {
+                return Err("properties array could not be copied");
+            }
+            ext_php_rs::ffi::zval_ptr_dtor(properties);
+            (*properties).value.arr = dup;
+            (*properties).u1.type_info = ext_php_rs::ffi::IS_ARRAY_EX;
+            properties_arr = dup;
+        }
+
+        let existing = ext_php_rs::ffi::zend_hash_str_find(
+            properties_arr as *const ext_php_rs::ffi::HashTable,
+            "application_headers".as_ptr().cast(),
+            "application_headers".len(),
+        );
+
+        if existing.is_null() {
+            // Case 1 (the common case): absent. A fresh plain array of
+            // `[symbol, value]` tuples, inserted as a NEW
+            // `application_headers` entry.
+            let headers_arr = ext_php_rs::ffi::_zend_new_array(entries.len() as u32);
+            if headers_arr.is_null() {
+                return Err("headers array could not be allocated");
+            }
+            for (key, value) in entries {
+                amqp_insert_symbol_tuple(headers_arr, key, value);
+            }
+            let mut entry: ext_php_rs::ffi::zval = std::mem::zeroed();
+            entry.value.arr = headers_arr;
+            entry.u1.type_info = ext_php_rs::ffi::IS_ARRAY_EX;
+            let inserted = ext_php_rs::ffi::zend_hash_str_update(
+                properties_arr,
+                "application_headers".as_ptr().cast(),
+                "application_headers".len(),
+                &mut entry,
+            );
+            // Same UAF-avoidance rule as `inject_array_entries`, applied the
+            // same way: forget UNCONDITIONALLY (on success the bucket owns a
+            // byte-copy of `entry`'s contents; on refusal the raw pointer is
+            // released by hand below). Forgetting only on the success branch
+            // — an earlier shape of this code — was a latent double-free: a
+            // refused insert would destroy `headers_arr` AND then let
+            // `entry`'s Drop release the same array again.
+            std::mem::forget(entry);
+            if inserted.is_null() {
+                ext_php_rs::ffi::zend_array_destroy(headers_arr);
+            }
+            return Ok(());
+        }
+
+        match zval_type(existing) {
+            IS_ARRAY => {
+                // Case 2: a plain array already (either the injector's own
+                // earlier write, or an application-built array). COW-safe
+                // append, same tuple shape.
+                let mut headers_arr = (*existing).value.arr;
+                if headers_arr.is_null() {
+                    return Err("application_headers is not an array");
+                }
+                let shared = (*headers_arr).gc.refcount > 1
+                    || ((*headers_arr).gc.u.type_info & ext_php_rs::ffi::GC_IMMUTABLE) != 0;
+                if shared {
+                    let dup = ext_php_rs::ffi::zend_array_dup(headers_arr);
+                    if dup.is_null() {
+                        return Err("application_headers array could not be copied");
+                    }
+                    ext_php_rs::ffi::zval_ptr_dtor(existing);
+                    (*existing).value.arr = dup;
+                    (*existing).u1.type_info = ext_php_rs::ffi::IS_ARRAY_EX;
+                    headers_arr = dup;
+                }
+                for (key, value) in entries {
+                    if !ext_php_rs::ffi::zend_hash_str_find(
+                        headers_arr as *const ext_php_rs::ffi::HashTable,
+                        key.as_ptr().cast(),
+                        key.len(),
+                    )
+                    .is_null()
+                    {
+                        continue;
+                    }
+                    amqp_insert_symbol_tuple(headers_arr, key, value);
+                }
+                Ok(())
+            }
+            IS_OBJECT => {
+                // Case 3: an `AMQPTable` object. Reach into its own `$data`,
+                // same add-if-absent rule, the int-tag tuple shape.
+                let table_obj = (*existing).value.obj;
+                if table_obj.is_null() {
+                    return Err("application_headers object is null");
+                }
+                inject_amqp_table_data(table_obj, entries)
+            }
+            _ => Err("application_headers is neither array nor object"),
+        }
+    }
+
+    /// `AMQPAbstractCollection::T_STRING_LONG` (14) — the tuple-shape tag an
+    /// `AMQPTable` object's own `$data` array uses internally.
+    const AMQP_T_STRING_LONG: i64 = 14;
+
+    /// Write add-if-absent entries directly into an existing `AMQPTable`
+    /// object's own protected `$data` array — one more hop than the plain-
+    /// array case, still no userland method call (`AMQPTable::setValue`
+    /// would work but is exactly the call the contract's read/write sides
+    /// both avoid on principle).
+    unsafe fn inject_amqp_table_data(
+        table_obj: *mut ext_php_rs::ffi::zend_object,
+        entries: &[(&str, String)],
+    ) -> Result<(), &'static str> {
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let data = read_object_property(table_obj, "data", rv.as_mut_ptr());
+        if data.is_null() {
+            return Err("AMQPTable data not readable");
+        }
+        if zval_type(data) != IS_ARRAY {
+            return Err("AMQPTable data is not an array");
+        }
+        let mut data_arr = (*data).value.arr;
+        if data_arr.is_null() {
+            return Err("AMQPTable data is not an array");
+        }
+        let shared = (*data_arr).gc.refcount > 1
+            || ((*data_arr).gc.u.type_info & ext_php_rs::ffi::GC_IMMUTABLE) != 0;
+        if shared {
+            let dup = ext_php_rs::ffi::zend_array_dup(data_arr);
+            if dup.is_null() {
+                return Err("AMQPTable data could not be copied");
+            }
+            ext_php_rs::ffi::zval_ptr_dtor(data);
+            (*data).value.arr = dup;
+            (*data).u1.type_info = ext_php_rs::ffi::IS_ARRAY_EX;
+            data_arr = dup;
+        }
+        for (key, value) in entries {
+            if !ext_php_rs::ffi::zend_hash_str_find(
+                data_arr as *const ext_php_rs::ffi::HashTable,
+                key.as_ptr().cast(),
+                key.len(),
+            )
+            .is_null()
+            {
+                continue;
+            }
+            amqp_insert_long_tuple(data_arr, key, value, AMQP_T_STRING_LONG);
+        }
+        Ok(())
+    }
+
+    /// Build a `[<'S'>, value]` tuple and insert it at `key` — the legacy
+    /// back-compat wire-header shape, add-if-absent (checked by the caller,
+    /// which already holds the presence answer from its own lookup — this
+    /// function only ever inserts a NEW array, so no additional presence
+    /// check is needed here).
+    unsafe fn amqp_insert_symbol_tuple(
+        arr: *mut ext_php_rs::ffi::zend_array,
+        key: &str,
+        value: &str,
+    ) {
+        let tuple = ext_php_rs::ffi::_zend_new_array(2);
+        if tuple.is_null() {
+            return;
+        }
+        amqp_tuple_set_string_tag(tuple, "S");
+        amqp_tuple_set_value(tuple, value);
+        let mut entry: ext_php_rs::ffi::zval = std::mem::zeroed();
+        entry.value.arr = tuple;
+        entry.u1.type_info = ext_php_rs::ffi::IS_ARRAY_EX;
+        let inserted =
+            ext_php_rs::ffi::zend_hash_str_update(arr, key.as_ptr().cast(), key.len(), &mut entry);
+        // Forget UNCONDITIONALLY, release the raw pointer by hand on refusal
+        // — `inject_array_entries`' rule; a conditional forget here would
+        // double-free `tuple` on the refusal branch (Drop after destroy).
+        std::mem::forget(entry);
+        if inserted.is_null() {
+            ext_php_rs::ffi::zend_array_destroy(tuple);
+        }
+    }
+
+    /// Build a `[<long tag>, value]` tuple and insert it at `key` — the
+    /// `AMQPTable::$data` internal shape.
+    unsafe fn amqp_insert_long_tuple(
+        arr: *mut ext_php_rs::ffi::zend_array,
+        key: &str,
+        value: &str,
+        tag: i64,
+    ) {
+        let tuple = ext_php_rs::ffi::_zend_new_array(2);
+        if tuple.is_null() {
+            return;
+        }
+        amqp_tuple_set_long_tag(tuple, tag);
+        amqp_tuple_set_value(tuple, value);
+        let mut entry: ext_php_rs::ffi::zval = std::mem::zeroed();
+        entry.value.arr = tuple;
+        entry.u1.type_info = ext_php_rs::ffi::IS_ARRAY_EX;
+        let inserted =
+            ext_php_rs::ffi::zend_hash_str_update(arr, key.as_ptr().cast(), key.len(), &mut entry);
+        // Same unconditional-forget rule as `amqp_insert_symbol_tuple`.
+        std::mem::forget(entry);
+        if inserted.is_null() {
+            ext_php_rs::ffi::zend_array_destroy(tuple);
+        }
+    }
+
+    /// Index 0 of a 2-element tuple: a single-character STRING tag (the
+    /// `$types_080` symbol alphabet, e.g. `'S'` for a long string).
+    unsafe fn amqp_tuple_set_string_tag(tuple: *mut ext_php_rs::ffi::zend_array, tag: &str) {
+        let zs = ext_php_rs::ffi::ext_php_rs_zend_string_init(tag.as_ptr().cast(), tag.len(), false);
+        if zs.is_null() {
+            return;
+        }
+        let mut zv: ext_php_rs::ffi::zval = std::mem::zeroed();
+        zv.value.str_ = zs;
+        zv.u1.type_info = owned_string_type_info(zs);
+        let inserted = ext_php_rs::ffi::zend_hash_index_update(tuple, 0, &mut zv);
+        // Same unconditional-forget rule as `inject_array_entries`.
+        std::mem::forget(zv);
+        if inserted.is_null() {
+            ext_php_rs::ffi::ext_php_rs_zend_string_release(zs);
+        }
+    }
+
+    /// Index 0 of a 2-element tuple: a LONG tag
+    /// (`AMQPAbstractCollection::T_*`).
+    unsafe fn amqp_tuple_set_long_tag(tuple: *mut ext_php_rs::ffi::zend_array, tag: i64) {
+        let mut zv: ext_php_rs::ffi::zval = std::mem::zeroed();
+        zv.value.lval = tag;
+        zv.u1.type_info = IS_LONG as u32;
+        let _ = ext_php_rs::ffi::zend_hash_index_update(tuple, 0, &mut zv);
+        // A plain LONG holds no refcounted allocation, so unlike the STRING/
+        // ARRAY inserts elsewhere in this file there is nothing a natural
+        // drop of `zv` here could double-free — but `forget` it anyway,
+        // uniformly, so this function does not depend on a reader knowing
+        // that `Zval::drop` happens to be a no-op for `IS_LONG`.
+        std::mem::forget(zv);
+    }
+
+    /// Index 1 of a 2-element tuple: the value, always a STRING (every
+    /// propagation/schema value this crate injects is a string).
+    unsafe fn amqp_tuple_set_value(tuple: *mut ext_php_rs::ffi::zend_array, value: &str) {
+        let zs =
+            ext_php_rs::ffi::ext_php_rs_zend_string_init(value.as_ptr().cast(), value.len(), false);
+        if zs.is_null() {
+            return;
+        }
+        let mut zv: ext_php_rs::ffi::zval = std::mem::zeroed();
+        zv.value.str_ = zs;
+        zv.u1.type_info = owned_string_type_info(zs);
+        let inserted = ext_php_rs::ffi::zend_hash_index_update(tuple, 1, &mut zv);
+        // Same unconditional-forget rule as `inject_array_entries`.
+        std::mem::forget(zv);
+        if inserted.is_null() {
+            ext_php_rs::ffi::ext_php_rs_zend_string_release(zs);
+        }
+    }
+
+    /// Write string entries into an object's OWN property array — the NATS
+    /// two-hop write (`$message->payload->headers`), adapting
+    /// [`inject_array_entries`]'s COW/UAF-safe body from an ARGUMENT slot to
+    /// a PROPERTY slot. Every rule that function's docblock states applies
+    /// here unchanged; only where the array comes from differs.
+    ///
+    /// # Safety
+    /// Called from the Zend observer begin handler with a valid, live object
+    /// pointer (the `Payload` object read off `$message->payload`).
+    pub unsafe fn inject_property_array_entries(
+        object: *mut ext_php_rs::ffi::zend_object,
+        property: &str,
+        entries: &[(&str, String)],
+    ) -> Result<(), &'static str> {
+        if object.is_null() {
+            return Err("object is null");
+        }
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let slot = read_object_property(object, property, rv.as_mut_ptr());
+        if slot.is_null() {
+            return Err("headers property not passed");
+        }
+        if zval_type(slot) != IS_ARRAY {
+            return Err("headers property is not an array");
+        }
+        let mut arr = (*slot).value.arr;
+        if arr.is_null() {
+            return Err("headers property is not an array");
+        }
+        let shared = (*arr).gc.refcount > 1
+            || ((*arr).gc.u.type_info & ext_php_rs::ffi::GC_IMMUTABLE) != 0;
+        if shared {
+            let dup = ext_php_rs::ffi::zend_array_dup(arr);
+            if dup.is_null() {
+                return Err("headers array could not be copied");
+            }
+            ext_php_rs::ffi::zval_ptr_dtor(slot);
+            (*slot).value.arr = dup;
+            (*slot).u1.type_info = ext_php_rs::ffi::IS_ARRAY_EX;
+            arr = dup;
+        }
+        for (key, value) in entries {
+            if !ext_php_rs::ffi::zend_hash_str_find(
+                arr as *const ext_php_rs::ffi::HashTable,
+                key.as_ptr().cast(),
+                key.len(),
+            )
+            .is_null()
+            {
+                continue;
+            }
+            let zs = ext_php_rs::ffi::ext_php_rs_zend_string_init(
+                value.as_ptr().cast(),
+                value.len(),
+                false,
+            );
+            if zs.is_null() {
+                continue;
+            }
+            let mut entry: ext_php_rs::ffi::zval = std::mem::zeroed();
+            entry.value.str_ = zs;
+            entry.u1.type_info = owned_string_type_info(zs);
+            let inserted =
+                ext_php_rs::ffi::zend_hash_str_update(arr, key.as_ptr().cast(), key.len(), &mut entry);
+            std::mem::forget(entry);
+            if inserted.is_null() {
+                ext_php_rs::ffi::ext_php_rs_zend_string_release(zs);
+            }
+        }
+        Ok(())
+    }
+
+    /// A LONG property — the numeric sibling of [`object_property_string`],
+    /// for the two RdKafka `Message` facts that need to stay actual integers
+    /// rather than their string coercion: `partition` (compared against the
+    /// `RD_KAFKA_PARTITION_UA` sentinel by `messaging::kafka_partition_attribute`,
+    /// which needs a real `i64` to compare) and `offset`. `None` for a missing
+    /// property or any other type, same "caller's own default" rule as
+    /// [`object_property_bool`].
+    pub unsafe fn object_property_long(
+        object: *mut ext_php_rs::ffi::zend_object,
+        name: &str,
+    ) -> Option<i64> {
+        let mut rv = std::mem::MaybeUninit::<ext_php_rs::ffi::zval>::uninit();
+        let prop = read_object_property(object, name, rv.as_mut_ptr());
+        if prop.is_null() || zval_type(prop) != IS_LONG {
+            return None;
+        }
+        Some((*prop).value.lval)
+    }
+
+    /// The number of entries in an array RETURN VALUE — `Basis\Nats\Queue::fetchAll`'s
+    /// batch size, read off the call's own retval rather than guessed: the
+    /// same "only the return value knows" reasoning `bank_prepared_statement`
+    /// already relies on for a prepare's success. `None` when the retval is
+    /// not an array at all (should be unreachable for `fetchAll`, whose
+    /// declared return type is `array`, but a native reader never assumes
+    /// what PHP promises).
+    pub unsafe fn retval_array_len(retval: *mut ext_php_rs::ffi::zval) -> Option<u32> {
+        if retval.is_null() || zval_type(retval) != IS_ARRAY {
+            return None;
+        }
+        let arr = (*retval).value.arr;
+        if arr.is_null() {
+            return None;
+        }
+        Some((*arr).nNumOfElements)
     }
 }
 

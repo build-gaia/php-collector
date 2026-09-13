@@ -126,6 +126,16 @@ final class RichTelemetryHooks
 
     private static function traceDatabaseQuery(object $query): void
     {
+        // Self-declare ownership of SQL capture for whatever request this event
+        // records into. Under a web request or a wrapped job the middleware /
+        // QueueTelemetry already declared it, and this is an idempotent re-set;
+        // under a NATIVELY-opened message request (the .so's Bunny delivery
+        // scope, which opens before any userland code of the delivery runs)
+        // nobody else can — and without it the native PDO fallback would
+        // double-count every query this listener records. DB::listen fires
+        // AFTER execution, so the very first query of a natively-opened request
+        // may still carry one native twin; every later one is owned here.
+        NativeExtension::suppressNative('sql');
         $sql = (string) ($query->sql ?? '');
         $span = SpanManager::open('SQL ' . self::sqlVerb($sql));
         $span->backdateStart((float) ($query->time ?? 0.0));
@@ -192,6 +202,11 @@ final class RichTelemetryHooks
     private static function traceRedisCommand(object $event): void
     {
         try {
+            // Same self-declaration as traceDatabaseQuery's, for the cache kind:
+            // under a natively-opened message request no wrapper declared it, and
+            // the native Redis observer would double-count every command these
+            // listeners record. Idempotent per request.
+            NativeExtension::suppressNative('cache');
             $command = strtoupper((string) ($event->command ?? ''));
             if ($command === '') {
                 return;
@@ -429,6 +444,9 @@ final class RichTelemetryHooks
 
     private static function traceCacheRead(object $event): void
     {
+        // Cache-event spans own the cache kind for whatever request they record
+        // into — see traceRedisCommand. Idempotent per request.
+        NativeExtension::suppressNative('cache');
         $store = isset($event->storeName) && is_string($event->storeName) && $event->storeName !== ''
             ? $event->storeName
             : 'cache';
@@ -460,6 +478,9 @@ final class RichTelemetryHooks
 
     private static function traceCacheWrite(object $event): void
     {
+        // Cache-event spans own the cache kind for whatever request they record
+        // into — see traceRedisCommand. Idempotent per request.
+        NativeExtension::suppressNative('cache');
         $store = isset($event->storeName) && is_string($event->storeName) && $event->storeName !== ''
             ? $event->storeName
             : 'cache';
@@ -490,6 +511,9 @@ final class RichTelemetryHooks
 
     private static function traceCacheForget(object $event): void
     {
+        // Cache-event spans own the cache kind for whatever request they record
+        // into — see traceRedisCommand. Idempotent per request.
+        NativeExtension::suppressNative('cache');
         $store = isset($event->storeName) && is_string($event->storeName) && $event->storeName !== ''
             ? $event->storeName
             : 'cache';

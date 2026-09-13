@@ -350,9 +350,15 @@ pub fn chronos_request_start(
     );
 }
 
-/// The one true request-start path, shared by the RINIT hook and the SDK bridge.
+/// The one true request-start path, shared by the RINIT hook, the SDK bridge —
+/// and, since native messaging observation, the observer itself: a Bunny
+/// delivery scope (`observer::begin_messaging_delivery`) opens its
+/// message-scoped request through here with `http_method = "QUEUE"`, exactly as
+/// `BunnyTelemetry::openMessage` did over the FFI, so a natively-opened consumer
+/// request and a bridge-opened one are indistinguishable downstream (job profile
+/// rates, envelope service fallback, honored wire `sampled` flag and all).
 #[allow(clippy::too_many_arguments)]
-fn start_request(
+pub(crate) fn start_request(
     traceparent: &str,
     tracestate: &str,
     baggage: &str,
@@ -679,14 +685,73 @@ pub fn chronos_request_end(
     error_exit_code: Option<i64>,
     error_handled: Option<bool>,
 ) {
-    let mut error_type = error_type.unwrap_or_default();
-    let mut error_message = error_message.unwrap_or_default();
-    let mut error_stack = error_stack.unwrap_or_default();
-    let mut error_handled = error_handled;
-    // `error.code` is the throwable's own code — a string because PHP allows a
-    // non-integer code (PDOException carries SQLSTATE like `42S02`). Distinct from
-    // `error.exit_code`, the process exit status, which only a fatal shutdown has.
-    let error_code = error_code.unwrap_or_default();
+    end_request_full(
+        http_status_code,
+        route_pattern,
+        error_type.unwrap_or_default(),
+        error_message.unwrap_or_default(),
+        error_stack.unwrap_or_default(),
+        // `error.code` is the throwable's own code — a string because PHP allows a
+        // non-integer code (PDOException carries SQLSTATE like `42S02`). Distinct from
+        // `error.exit_code`, the process exit status, which only a fatal shutdown has.
+        error_code.unwrap_or_default(),
+        error_exit_code,
+        error_handled,
+    );
+}
+
+/// Close the open request from NATIVE code — the observer's seam for ending a
+/// message-scoped request it opened itself (`observer::begin_messaging_delivery`).
+///
+/// Exists because `chronos_request_end` is the PHP calling contract and the
+/// observer is not a PHP caller: it has no exit code, no route-less shutdown
+/// net, and its error identity is a `LastThrow` rather than a Throwable — the
+/// tuple is `(type, message, stack, handled)`, the four facts a delivery scope
+/// can honestly state. `error.code` stays empty (a native close never inspected
+/// the throwable object; inventing `0` would read as "captured as zero").
+pub(crate) fn end_request(
+    http_status_code: i64,
+    route_pattern: String,
+    error: Option<(String, String, String, bool)>,
+) {
+    match error {
+        Some((error_type, error_message, error_stack, handled)) => end_request_full(
+            http_status_code,
+            route_pattern,
+            error_type,
+            error_message,
+            error_stack,
+            String::new(),
+            None,
+            Some(handled),
+        ),
+        None => end_request_full(
+            http_status_code,
+            route_pattern,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            None,
+            None,
+        ),
+    }
+}
+
+/// The body `chronos_request_end` always had, callable from both the PHP calling
+/// contract and the observer's native close. Idempotent exactly as before: the
+/// first call takes the request state, so a second is a no-op.
+#[allow(clippy::too_many_arguments)]
+fn end_request_full(
+    http_status_code: i64,
+    route_pattern: String,
+    mut error_type: String,
+    mut error_message: String,
+    mut error_stack: String,
+    error_code: String,
+    error_exit_code: Option<i64>,
+    mut error_handled: Option<bool>,
+) {
     let config = REQUEST_CONFIG.with(|c| c.borrow_mut().take());
     let config = match config {
         Some(c) => c,
@@ -1187,9 +1252,24 @@ pub fn chronos_job_started(
 }
 
 /// PHP-callable: the userland SDK announces its own richer instrumentation for a
-/// data-access kind ("sql" | "cache"), and the native observer stops emitting its
-/// fallback I/O spans for this request — userland spans carry host/db/bound
-/// params the .so cannot see, and double capture splits the service map.
+/// data-access kind ("sql" | "cache" | "messaging"), and the native observer
+/// stops emitting its fallback capture for this request — userland spans carry
+/// facts the .so cannot see (host/db/bound params; a publish's DTO class), and
+/// double capture splits the service map.
+///
+/// `"messaging"` governs the PUBLISH side only: `BunnyTelemetry::publish`
+/// declares it before calling `$channel->publish`, so the native
+/// `Bunny\AbstractClient::publish` observation stands down — no duplicate span,
+/// and no injection either (the bridge already put its reserved span id on the
+/// wire; even without suppression the native caller-wins hash-add could not
+/// clobber it, so suppression removes only the duplicate SPAN). Consume-side
+/// ownership deliberately CANNOT be a per-request kind here: the native
+/// delivery scope opens at `Bunny\Channel::onBodyComplete`, strictly before any
+/// userland code of the delivery could call this — so consume ownership is the
+/// process flag `CHRONOS_PHP_MESSAGING_AUTO=0` plus the observer's
+/// already-active guard (a userland-opened request makes the native scope pass
+/// through), and the userland wrapper's own `NativeExtension::active()` check
+/// is the dedupe in the other direction.
 #[php_function]
 pub fn chronos_suppress_native(kind: String) {
     observer::suppress_native(&kind);
@@ -1424,6 +1504,22 @@ pub fn chronos_store_span_body(
     if side != "message" {
         return false;
     }
+    store_message_body(trace_id, span_id, content_type, body, encoding)
+}
+
+/// The store half of [`chronos_store_span_body`], shared with the observer's own
+/// messaging capture (`observer` stores a publish payload keyed by the publish
+/// frame's ids, and a consume payload keyed by the request root via empty ids)
+/// so the FFI entry point and the native path apply IDENTICAL gates — apm on,
+/// context open, sampled, non-empty, decodable encoding — and a `.stored`
+/// marker means one thing however the payload arrived.
+pub(crate) fn store_message_body(
+    trace_id: String,
+    span_id: String,
+    content_type: String,
+    body: String,
+    encoding: String,
+) -> bool {
     if encoding != "base64" && !encoding.is_empty() {
         return false;
     }

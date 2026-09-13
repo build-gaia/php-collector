@@ -188,6 +188,21 @@ if (class_exists(\Bunny\Channel::class) && class_exists(\Bunny\Message::class)) 
                 $headers['content-type'] = $contentType;
             }
 
+            // The native .so auto-instruments `Bunny\AbstractClient::publish`
+            // itself now (observer.rs MESSAGING_PUBLISH_METHODS). This bridge has
+            // already reserved a span id and put it on the wire above, so declare
+            // ownership before the call: the observer then emits no duplicate
+            // producer span and injects nothing for the rest of this request.
+            // (Even without this, the observer's caller-wins hash-add could not
+            // clobber the traceparent already in $headers — the declaration
+            // removes the duplicate SPAN.) Consume-side ownership is different in
+            // kind — see chronos_suppress_native's docblock in the .so: the
+            // native delivery scope opens before this wrapper could ever run, and
+            // BunnyTelemetry::consumer's own active() guard is the dedupe there.
+            // Fail-open: suppressNative swallows everything, and an older .so
+            // ignores the unknown kind.
+            NativeExtension::suppressNative('messaging');
+
             $result = $channel->publish($body, $headers, $exchange, $routingKey, $mandatory, $immediate);
 
             try {
