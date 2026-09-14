@@ -48,22 +48,46 @@ use std::cell::RefCell;
 
 const SCHEMA: &str = "chronos.tracing.span-body.v1";
 
-/// Bytes of body per document, under the engine streams' 1 MiB message limit
-/// with room for the envelope around it.
+/// Bytes of body per document, under every bound between here and
+/// `engine_span_body`.
+///
+/// Verified rather than assumed, because the store now accepts payloads with no
+/// ceiling (`messaging::body_ceiling`) and this constant is the only thing that
+/// keeps one of them transportable. The bounds downstream, narrowest first:
+///
+/// * `engine-agent`'s `MAX_SHIPMENT_BYTES` (4 MiB) — the read window a shipment
+///   is cut from, so it is the real per-FRAME ceiling, tighter than the 8 MiB
+///   [`crate::spool_log`] itself enforces. A frame over it decodes as
+///   `Incomplete` forever rather than shipping short.
+/// * `spool_log::MAX_FRAME_PAYLOAD_BYTES` (8 MiB) — refuses a larger frame
+///   rather than trimming one.
+/// * ingest's `MAX_BATCH_BYTES` and the NATS server's `max_payload`, 8 MiB each.
+///
+/// None of them truncates; they refuse. A chunk is JSON-escaped into its
+/// document before any of them sees it, and the worst case there is 2x (a text
+/// body of nothing but quotes — `is_text` has already excluded the control
+/// bytes that escape to six characters), so 512 KiB stays inside 4 MiB with
+/// room to spare. Measured end to end on a live estate: a 4 MiB protobuf
+/// payload rode eleven chunks and reassembled complete.
 const CHUNK_BYTES: usize = 512 * 1024;
 
 /// The most bodies one request may buffer for the userland store.
 ///
 /// Deliberately NOT sized by analogy to `log_spool`'s 512 records: a log body is
 /// capped at a kilobyte, while one of these is capped by
-/// `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY`, whose hard clamp is 512 KiB — so 512
-/// of them would be a quarter of a gigabyte held in a request that is still
-/// running. Sixteen is one publish loop's worth of evidence: 1 MiB at the 64 KiB
-/// default, 8 MiB at the clamp, both of which a request can carry. A publisher
-/// that sends more than sixteen messages in one request keeps the first sixteen
-/// payloads and the spans for all of them — the seventeenth span simply does not
-/// claim `.stored`, which is the honest degradation, because
-/// [`crate::body_spool::capture`] reports the refusal rather than swallowing it.
+/// `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY` — unlimited unless an operator opts
+/// into a smaller number (`messaging::body_ceiling`), so held memory per
+/// request is now bounded by what publishers actually send, not by a fixed
+/// clamp. Sixteen is one publish loop's worth of evidence regardless: it
+/// bounds the COUNT so one runaway loop cannot buffer an unbounded number of
+/// (now potentially unbounded-size) payloads in a still-running request. A
+/// publisher that sends more than sixteen messages in one request keeps the
+/// first sixteen payloads and the spans for all of them — the seventeenth span
+/// simply does not claim `.stored`, which is the honest degradation, because
+/// [`crate::body_spool::capture`] reports the refusal rather than swallowing
+/// it. The per-payload SIZE budget, now effectively unlimited by default, is a
+/// separate concern the fixed-segment spool downstream (`spool_log::MAX_SEGMENTS`)
+/// absorbs instead — see `messaging::body_ceiling`'s docblock.
 const MAX_PENDING_BODIES: usize = 16;
 
 /// A whole payload handed over by userland, waiting for request end.

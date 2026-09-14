@@ -176,18 +176,62 @@ final class NativeExtension
     }
 
     /**
-     * The most of one message body the operator has allowed, in bytes.
+     * The most of one message body the STORE may keep, in bytes — or
+     * `PHP_INT_MAX` standing in for "no limit", which is now the default.
      *
-     * The fallback is the Go SDK's own `CHRONOS_GO_MESSAGING_CAPTURE_MAX_BODY`
-     * default rather than a number chosen here, so a Go producer and a PHP
-     * producer on the same stream cap it identically — a stream where one side
-     * truncates at 64 KiB and the other at some other figure is a stream whose
-     * payloads cannot be compared.
+     * The directive this enforces: the collector must always capture ALL
+     * bytes of a message payload, never a partial copy dressed up as whole.
+     * `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY` used to be a default-64-KiB,
+     * hard-clamped-at-512-KiB cap that silently truncated the span-body STORE
+     * (see `MessagingBody::whole`) — a 2 MB payload was kept as its first
+     * 64 KiB while `messaging.message.body.size` still reported 2,000,000.
+     * That was wrong: this setting is an OPT-IN safety valve now, not a
+     * default truncation. Unset or `0` means unlimited — the entire payload
+     * is stored, base64 or verbatim, whatever its size. A positive value still
+     * caps the store with no further clamp, and when a configured cap actually
+     * cuts the payload the stored copy is marked truncated rather than
+     * presented as whole — see `MessagingBody::whole()`'s docblock for why that
+     * can never go silently.
      *
-     * This is a CEILING on the operator's number, not the effective limit: each
-     * call site min()s it against its own hard bound (a span attribute is capped
-     * at 16 KiB, the request-attribute bag at 8 KiB), which is why
-     * `MessagingBody::encode()` takes that bound as an argument.
+     * The number is measured on the STORED copy, which for a binary payload is
+     * its base64: an operator who writes `4194304` gets 4 MiB of stored string,
+     * i.e. 4 MiB of a text payload but 3 MiB of a protobuf one
+     * (`MessagingBody::binary()` cuts to `intdiv($cap, 4) * 3` raw bytes so the
+     * encoding lands at the cap rather than 1.33x over it). Stated because the
+     * difference is the operator's whole reason for setting a number.
+     *
+     * This is NOT the span attribute's ceiling. `messaging.message.body` (the
+     * PREVIEW beside the whole stored copy) rides a span attribute capped at
+     * `Span::MAX_TEXT_LENGTH` (16 KiB) on publish or the request-attribute
+     * bag's 8 KiB on consume — a hard structural bound a span attribute cannot
+     * exceed, and NOT the partial-capture problem this setting addresses. Do
+     * not "fix" that cap by raising it here; `MessagingBody::encode()` already
+     * min()s this ceiling against the caller's own bound for exactly that
+     * reason.
+     *
+     * The cost of removing the clamp is real and is taken deliberately: the
+     * spool this ships through has a fixed segment budget
+     * (`spool_log::MAX_SEGMENTS` in the native extension), not a byte budget
+     * that grows with what an operator allows, so one enormous payload can
+     * evict other telemetry sharing that budget. That trade is visible rather
+     * than silent — the native side logs "spool budget reached: dropped ...
+     * unshipped" when it happens — which is what makes it a trade an operator
+     * can notice and size for, rather than a silent loss.
+     *
+     * The second cost is memory, and it is the sharper one, because it lands
+     * inside the request that published. The stored copy is built here:
+     * `mb_strcut()`/`substr()` copies the payload, `base64_encode()` adds a
+     * third again on the binary path, ext-php-rs copies it across into a Rust
+     * `String`, and `serde_json` escapes that into the spool document — several
+     * times the payload, live, at once (measured on this estate: a 4 MiB
+     * protobuf published through Bunny peaked at 27 MiB). Every step of the
+     * capture path fails open through `catch (Throwable)`, but PHP's own
+     * "allowed memory size exhausted" is a fatal error and NOT a `Throwable`,
+     * so it is the one failure those guards cannot absorb: past `memory_limit`
+     * the casualty is the REQUEST, not the capture. That is the operator this
+     * valve is for — one whose publishers send payloads within an order of
+     * magnitude of `memory_limit`. It is not a reason to re-clamp the default:
+     * a cap that bites is a partial capture, which is the thing this closed.
      */
     public static function messagingBodyCeiling(): int
     {
@@ -199,10 +243,14 @@ final class NativeExtension
             $configured = (int) \chronos_setting('CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY');
         }
         if ($configured <= 0) {
-            $configured = 65536;
+            // No limit: capture every byte. PHP_INT_MAX rather than a sentinel
+            // like -1 so every downstream comparison (min(), <=) keeps working
+            // exactly as it would for any other cap — it is just a cap that
+            // never bites.
+            return self::$messagingCeiling = PHP_INT_MAX;
         }
 
-        return self::$messagingCeiling = min($configured, 512 * 1024);
+        return self::$messagingCeiling = $configured;
     }
 
     /**

@@ -353,6 +353,16 @@ pub struct EncodedBody {
 /// `None` for an empty payload or a zero budget — an absent attribute, never an
 /// empty one. The capture GATE is the caller's job ([`capture_enabled`]), so
 /// this stays a pure function of its arguments.
+///
+/// Called with a PREVIEW cap (`PUBLISH_PREVIEW_CAP` / `CONSUME_PREVIEW_CAP`,
+/// each `.min()`'d with [`body_ceiling`]) this cuts a span attribute, which
+/// is a structural bound, not a capture-completeness decision — a span
+/// attribute cannot exceed 16 KiB (8 KiB for the consume side's
+/// request-attribute bag) no matter what an operator configures. "Capture
+/// every byte" is a promise this function does not make and is not meant to;
+/// it is kept by [`whole_body`] and the store behind it, whose own cap
+/// ([`body_ceiling`]) is unlimited by default. Do not raise the preview
+/// constants to chase that promise here — the place it is kept is the store.
 pub fn encode_body(bytes: &[u8], cap: usize) -> Option<EncodedBody> {
     if bytes.is_empty() || cap == 0 {
         return None;
@@ -384,6 +394,19 @@ pub fn encode_body(bytes: &[u8], cap: usize) -> Option<EncodedBody> {
 /// attribute was already cut to (mirroring `http_capture`'s own rule): a blob
 /// identical to the attribute beside it costs a NATS message, a hypertable row
 /// and a round trip to say what the span already said.
+///
+/// `budget` is [`body_ceiling`], which is `usize::MAX` unless an operator
+/// opted into a smaller cap — so the common call stores the payload WHOLE,
+/// however large, which is the "always all bytes, never partial" contract
+/// this function exists to keep. Because this only ever runs when `budget >
+/// preview_ceiling`, a configured `budget` that does truncate the store means
+/// the payload also exceeds `preview_ceiling`, so [`encode_body`]'s own
+/// `truncated` is already `true` on the span for the same payload — the
+/// span can never claim complete while this quietly stored a prefix. The
+/// reverse is NOT promised: a payload between `preview_ceiling` and `budget`
+/// is stored whole while the preview attribute still reports itself
+/// truncated (it was, as an attribute) — a false pessimism about the
+/// preview, never a false optimism about the store.
 ///
 /// Returns `(payload, transfer_encoding)` where the encoding is `"base64"` or
 /// `""` — the shape `chronos_store_span_body` accepts. The encoding a READER
@@ -450,21 +473,51 @@ pub fn capture_enabled() -> bool {
     })
 }
 
-/// The most of one message body the operator has allowed, in bytes:
-/// `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY`, default 65536 (the Go SDK's own
-/// default, so a Go producer and a PHP producer on one stream cap identically),
-/// hard-clamped to 512 KiB — the same numbers as
-/// `NativeExtension::messagingBodyCeiling()`. A ceiling on the operator's
-/// number, not the effective limit: each call site min()s it against its own
-/// preview bound.
+/// The most of one message body the STORE may keep, in bytes — `usize::MAX`
+/// standing in for "no limit", which is the default, mirroring
+/// `NativeExtension::messagingBodyCeiling()` clause for clause.
+///
+/// `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY` used to default to 65536 and
+/// hard-clamp at 512 KiB, silently truncating [`whole_body`]'s store while
+/// `messaging.message.body.size` kept reporting the real, larger length — the
+/// exact "the collector should always be capturing all bytes, never partial"
+/// violation this function now closes. Unset, absent or `<= 0` therefore means
+/// unlimited: the observer's whole-body path stores every byte, base64 or
+/// verbatim. A positive value is still an OPT-IN cap — no further clamp is
+/// applied — measured on the STORED copy, which for a binary payload is its
+/// base64: 4 MiB configured is 4 MiB of stored string, i.e. 4 MiB of a text
+/// payload but 3 MiB of a protobuf one ([`encode_body`] cuts to `(cap / 4) * 3`
+/// raw bytes so the encoding lands AT the cap rather than 1.33x over it). And
+/// it caps only the STORE; it is not, and must never become, the span
+/// attribute's preview
+/// bound (`PUBLISH_PREVIEW_CAP` / `CONSUME_PREVIEW_CAP`), which is a
+/// structural limit on what an attribute can hold, not a capture-completeness
+/// setting. Each observer call site still `min()`s this against its own
+/// preview bound to compute the PREVIEW's cap, exactly as before — only the
+/// STORE side's default changed.
+///
+/// The cost of no clamp is real and deliberate, and it is two costs. The spool
+/// this feeds has a fixed segment budget (`spool_log::MAX_SEGMENTS`), not one
+/// that grows with what an operator allows, so one huge payload can evict other
+/// telemetry sharing it — visibly, via the "spool budget reached: dropped ...
+/// unshipped" warning, rather than silently. The sharper one is memory, inside
+/// the request that published: the payload is base64'd (a third again), copied
+/// into the `PendingBody` buffer, held there until request end, and escaped
+/// into its spool documents, so peak usage is a multiple of a payload that now
+/// has no ceiling. Rust has no `catch (Throwable)` for that — an allocation
+/// that cannot be served aborts the process — which is why
+/// `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY` still exists as a valve for an
+/// operator whose publishers send payloads on the order of the box's free
+/// memory. It is not a reason to re-clamp the default: a cap that bites is a
+/// partial capture, which is the thing this closed.
 pub fn body_ceiling() -> usize {
     static CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CEILING.get_or_init(|| {
-        let configured = crate::settings::get("CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY")
+        crate::settings::get("CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY")
             .and_then(|value| value.trim().parse::<i64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(65536);
-        usize::try_from(configured).unwrap_or(65536).min(512 * 1024)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(usize::MAX)
     })
 }
 
@@ -876,6 +929,54 @@ mod tests {
         let binary: Vec<u8> = vec![0u8; 40_000];
         let (_, encoding) = whole_body(&binary, 16384, 65536).expect("stored");
         assert_eq!(encoding, "base64");
+    }
+
+    #[test]
+    fn a_store_cut_by_a_configured_budget_is_never_reported_as_whole() {
+        // The invariant [`whole_body`]'s docblock rests on, locked here because
+        // it is structural rather than visible at the call site: this refuses
+        // unless `budget > preview_ceiling`, so a budget that CUTS the store
+        // implies the payload also cleared the preview cap — and the span
+        // therefore already carries [`encode_body`]'s `truncated` for the same
+        // payload. There is no configured cap that can shorten the stored copy
+        // while the span beside it still claims to be whole.
+        let budget = 40_000;
+        for body in [vec![b'a'; 100_000], vec![0_u8; 100_000]] {
+            let (stored, encoding) = whole_body(&body, PUBLISH_PREVIEW_CAP, budget).expect("stored");
+            let raw_stored = if encoding == "base64" {
+                (budget / 4) * 3
+            } else {
+                stored.len()
+            };
+            assert!(raw_stored < body.len(), "this budget genuinely cuts the store");
+            let preview = encode_body(&body, PUBLISH_PREVIEW_CAP.min(budget)).expect("previewed");
+            assert!(
+                preview.truncated,
+                "the span already reports truncated for the payload the store had to cut"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbounded_budget_stores_a_multi_megabyte_payload_whole_and_never_overflows() {
+        // `body_ceiling()`'s new default is `usize::MAX` — the "capture every
+        // byte" contract — so this is the budget every call site now passes in
+        // the common, unconfigured case. Both the text and the binary path
+        // must handle it without truncating a realistically large payload and
+        // without overflowing the `(cap / 4) * 3` arithmetic on the way there.
+        let text = "x".repeat(3 * 1024 * 1024);
+        let (payload, encoding) = whole_body(text.as_bytes(), 16384, usize::MAX).expect("stored");
+        assert_eq!(payload.len(), text.len(), "the whole text body is kept");
+        assert_eq!(encoding, "");
+
+        let binary = vec![0xABu8; 3 * 1024 * 1024];
+        let (payload, encoding) = whole_body(&binary, 16384, usize::MAX).expect("stored");
+        assert_eq!(encoding, "base64");
+        assert_eq!(
+            payload,
+            base64_encode(&binary),
+            "the whole binary body is kept, not a prefix of it"
+        );
     }
 
     #[test]

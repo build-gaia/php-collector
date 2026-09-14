@@ -90,6 +90,20 @@ final class MessagingBody
      * precise failure `NativeExtension::bodyCaptureCeiling`'s own docblock was
      * written about.
      *
+     * ## This cap is not partial capture — it is a preview
+     *
+     * This method's cut is a STRUCTURAL bound, not a capture-completeness
+     * decision: a span attribute cannot exceed 16 KiB (8 KiB in the
+     * request-attribute bag) no matter what anyone configures, so this always
+     * truncates once the body crosses it. That is fine, because [`whole`]
+     * stores the untruncated payload alongside it by default — the preview
+     * exists to be cheap to read without a second round trip, not to be the
+     * only copy. "The collector should always capture all bytes, never
+     * partial" is a promise about the STORE (`whole()`/`chronos_store_span_body`),
+     * never about this attribute preview. Do not widen `Span::MAX_TEXT_LENGTH`
+     * or this method's cap to chase that promise — it cannot be kept here, and
+     * the place it is already kept is `whole()`.
+     *
      * @return array<string, string>
      */
     public static function encode(string $body, int $ceiling): array
@@ -123,20 +137,32 @@ final class MessagingBody
      * The sibling of [`encode`] and deliberately not a widening of it: they
      * answer different questions against the same bytes. `encode` produces the
      * span's PREVIEW, cut to whatever the attribute it rides can hold (16 KiB on
-     * a publish span, 8 KiB in the consume side's request-attribute bag). This
-     * produces the copy that goes to the blob store, cut only to what the
-     * operator allowed — `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY`, 64 KiB by
-     * default and hard-clamped to 512 KiB. Same gate, same `isText()` test, same
-     * cut-before-encode rule, so the preview and the stored copy can never
-     * disagree about the same payload; one implementation of each is exactly why
-     * they cannot.
+     * a publish span, 8 KiB in the consume side's request-attribute bag) — a
+     * structural bound that is not, and cannot be, "all bytes". This produces
+     * the copy that goes to the blob store, and BY DEFAULT it is cut to
+     * nothing at all: `NativeExtension::messagingBodyCeiling()` returns
+     * `PHP_INT_MAX` unless an operator has opted into a smaller
+     * `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY`, so the common case stores the
+     * complete payload, base64 or verbatim, however large. Same gate, same
+     * `isText()` test, same cut-before-encode rule as `encode()`, so the
+     * preview and the stored copy can never disagree about the same payload;
+     * one implementation of each is exactly why they cannot.
      *
      * `$previewCeiling` is the bound the caller's preview was already cut to, and
      * nothing is stored unless the allowance genuinely exceeds it — mirroring
      * `http_capture`'s own rule (`if !overflowed || max_body_total_bytes <=
      * max_body_bytes`). A blob identical to the attribute beside it costs a NATS
      * message, a hypertable row and a round trip to say what the span already
-     * said.
+     * said. Because `whole()` only ever runs when the budget exceeds
+     * `$previewCeiling`, whenever the STORE truncates (an operator-configured
+     * budget smaller than the payload) the payload also exceeds
+     * `$previewCeiling` and `encode()`'s own `.truncated` is therefore already
+     * `true` on the span — the shared attribute can never claim "complete"
+     * while the store silently holds a partial copy. It is deliberately
+     * one-directional: a payload between `$previewCeiling` and an unlimited (or
+     * generous) budget is stored WHOLE while the preview attribute still says
+     * `.truncated` (it was, as an attribute) — that is the preview being
+     * conservative about itself, never the store misrepresenting what it kept.
      *
      * The returned encoding is a TRANSFER encoding (`base64` or `''`), and it is
      * only ever handed to the native store. The authority a reader consults is
@@ -162,6 +188,10 @@ final class MessagingBody
             if ($body === '') {
                 return ['', ''];
             }
+            // Unlimited by default (PHP_INT_MAX) — see
+            // NativeExtension::messagingBodyCeiling(). `$budget <= 0` is
+            // unreachable in that default but stays as the same defensive
+            // floor `encode()` applies, in case a future setting resolves to 0.
             $budget = NativeExtension::messagingBodyCeiling();
             if ($budget <= 0 || $budget <= $previewCeiling) {
                 return ['', ''];
