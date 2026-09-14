@@ -455,14 +455,13 @@ narrows it to a path.
 
 | `.chronos` key | env | default |
 |---|---|---|
-| `messaging_capture_bodies` | `CHRONOS_PHP_MESSAGING_CAPTURE_BODIES` | `0` |
+| `messaging_capture_bodies` | `CHRONOS_PHP_MESSAGING_CAPTURE_BODIES` | `1` |
 | `messaging_capture_max_body` | `CHRONOS_PHP_MESSAGING_CAPTURE_MAX_BODY` | `65536` (64 KiB) |
 
-Note the default: this is OFF where `http_capture_bodies` is ON. Installing an APM
-agent is already a decision to look at your own request and response bodies; an
-inter-service message payload is a different one — it was written by one team for
-another team's consumer, and capturing it copies that contract into telemetry a
-third audience reads.
+Note the default: this is ON, same as `http_capture_bodies`. A messaging span
+that only records a byte count cannot answer what crossed the broker. Set
+`CHRONOS_PHP_MESSAGING_CAPTURE_BODIES=0` on a service that must not copy
+payloads into telemetry.
 
 **No field-level masking applies to a body on either path.** `redact_patterns`
 masks map ENTRIES — header and query-parameter keys — and a body is only ever

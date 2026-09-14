@@ -121,6 +121,7 @@ fn native_request_start() {
     let tracestate = http_capture::lookup(&server, "HTTP_TRACESTATE").to_owned();
     let baggage = http_capture::lookup(&server, "HTTP_BAGGAGE").to_owned();
     let session_id = http_capture::lookup(&server, "HTTP_X_CHRONOS_SESSION_ID").to_owned();
+    let origin_trace = http_capture::lookup(&server, "HTTP_X_CHRONOS_ORIGIN_TRACE").to_owned();
     let dst_directive = {
         let header = http_capture::lookup(&server, "HTTP_X_CHRONOS_DST");
         if header.is_empty() {
@@ -155,6 +156,7 @@ fn native_request_start() {
         "",
         String::new(),
     );
+    stamp_origin_trace(&origin_trace);
 }
 
 /// Extract one cookie's value from a raw `Cookie:` header line.
@@ -164,6 +166,42 @@ fn cookie_value(raw: &str, name: &str) -> String {
         .find(|(k, _)| k.trim() == name)
         .map(|(_, v)| v.trim().to_owned())
         .unwrap_or_default()
+}
+
+/// Does this DST directive arm a recording?
+///
+/// Same `a=b;c=d` shape as the profile cookie, so a browser session can carry
+/// `chronos_dst=record` next to other cookies. The desktop's Run DST button
+/// sends the bare `record` value on `X-Chronos-DST`.
+fn dst_directive_records(directive: &str) -> bool {
+    directive
+        .split(&[';', ','][..])
+        .any(|part| matches!(part.trim(), "record" | "record=1" | "record=true"))
+}
+
+/// The originating trace a Run DST capture is investigating. Empty or malformed
+/// input is absent — a hostile header must not become a fake correlation id.
+fn parse_origin_trace_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 32 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+/// Attribute on the captured request's root span, and the DST recording header,
+/// naming the trace Run DST was fired from. The new request has its own
+/// `traceparent`; this is the only durable pointer back.
+const ORIGIN_TRACE_ATTR: &str = "chronos.dst.origin_trace_id";
+
+fn stamp_origin_trace(raw: &str) {
+    if REQUEST_CONFIG.with(|c| c.borrow().is_none()) {
+        return;
+    }
+    let Some(origin) = parse_origin_trace_id(raw) else {
+        return;
+    };
+    request_attributes::merge([(ORIGIN_TRACE_ATTR.into(), origin)]);
 }
 
 /// Does this request's profile directive arm a forced profile?
@@ -401,9 +439,19 @@ pub(crate) fn start_request(
 
     heartbeat(&config);
 
+    // DST recording: armed by the global flag, or per request by an explicit
+    // `record` directive (x-chronos-dst header / chronos_dst cookie). Decided
+    // here, before sampling, because an armed DST must keep its trace AND its
+    // profile — a recording with no sampled request to hang off is an orphan,
+    // and Run DST is an explicit ask for the heavy capture, not a rate roll.
+    let dst_armed = config.dst_enabled || dst_directive_records(dst_directive);
+
     // The profile decision, made BEFORE the trace decision because it can force it.
     //
     //   forced  — the directive carried the shared secret. Always profiles.
+    //   dst     — this request is an armed DST recording. Always profiles when
+    //             the profiler is on; the token is not required because DST is
+    //             already the expensive, operator-triggered path.
     //   rolled  — the rate die for this workload came up. Independent of the
     //             APM rate, so "1% profiling" means 1% of requests rather than
     //             1% of whatever APM already kept.
@@ -424,7 +472,7 @@ pub(crate) fn start_request(
     };
     let profile_this_request = if !config.profiler_enabled {
         false
-    } else if forced_profile {
+    } else if forced_profile || dst_armed {
         true
     } else if context.parent_span_id.is_none() {
         head_sample(profile_rate)
@@ -444,11 +492,12 @@ pub(crate) fn start_request(
         context.sampled = head_sample(config.apm_sample_rate);
     }
     // A profiled request is always a traced one — see above. On a child request
-    // this can only be reached by a FORCED profile, which is an explicit human
-    // instruction and so is allowed to override the root's sampling decision;
-    // the result is a partial distributed trace, which is the honest outcome of
-    // asking one service for a profile the caller never asked for.
-    if profile_this_request {
+    // this can only be reached by a FORCED profile or an armed DST, both of which
+    // are an explicit instruction and so are allowed to override the root's
+    // sampling decision; the result is a partial distributed trace, which is the
+    // honest outcome of asking one service for a capture the caller never asked for.
+    // DST without a profiler still keeps the trace: the recording has to hang off it.
+    if profile_this_request || dst_armed {
         context.sampled = true;
     }
 
@@ -502,12 +551,6 @@ pub(crate) fn start_request(
         http_capture::reset();
     }
 
-    // DST recording: armed by the global flag, or per request by an explicit
-    // `record` directive (x-chronos-dst header / chronos_dst cookie).
-    let directive_records = dst_directive
-        .split(&[';', ','][..])
-        .any(|part| matches!(part.trim(), "record" | "record=1" | "record=true"));
-    let dst_armed = config.dst_enabled || directive_records;
     if dst_armed {
         dst_spool::activate();
     } else {
@@ -533,7 +576,16 @@ pub(crate) fn start_request(
             // a flame graph needs to know whether they are seeing a representative
             // sample or the one request somebody forced, because the two answer
             // completely different questions about the service.
-            sampler::set_label("trigger", if forced_profile { "forced" } else { "sampled" });
+            sampler::set_label(
+                "trigger",
+                if forced_profile {
+                    "forced"
+                } else if dst_armed {
+                    "dst"
+                } else {
+                    "sampled"
+                },
+            );
             // Jobs and web requests are sampled at different rates, so a reader
             // aggregating profiles has to be able to separate the populations —
             // mixing a tenth of the jobs into a percent of the requests would
@@ -612,10 +664,7 @@ fn enrich_request(
     // The bridge may know a DST directive the native start could not see (a
     // framework-decoded cookie, a queue-message header). Activation is one-way for
     // the request; deactivation stays with request_end.
-    let directive_records = dst_directive
-        .split(&[';', ','][..])
-        .any(|part| matches!(part.trim(), "record" | "record=1" | "record=true"));
-    if directive_records {
+    if dst_directive_records(dst_directive) {
         dst_spool::activate();
     }
 }
@@ -770,6 +819,10 @@ fn end_request_full(
 
     let sampled = context.as_ref().map(|c| c.sampled).unwrap_or(false);
     let extra_attributes = request_attributes::take();
+    let origin_trace_id = extra_attributes
+        .iter()
+        .find(|(key, _)| key == ORIGIN_TRACE_ATTR)
+        .map(|(_, value)| value.clone());
 
     // A request dying on an exception NOTHING caught, with no framework bridge to
     // say so (plain-PHP scripts, or a framework whose bridge is not installed):
@@ -1071,7 +1124,13 @@ fn end_request_full(
         let events = dst_spool::drain();
         dst_spool::deactivate();
         if let Some(ctx) = &context {
-            let _ = dst_spool::flush(&envelope, &events, &ctx.trace_id, ctx.session_id.as_deref());
+            let _ = dst_spool::flush(
+                &envelope,
+                &events,
+                &ctx.trace_id,
+                ctx.session_id.as_deref(),
+                origin_trace_id.as_deref(),
+            );
         }
     }
 
@@ -1664,7 +1723,30 @@ fn monotonic_nanos() -> u128 {
 
 #[cfg(test)]
 mod directive_tests {
-    use super::{constant_time_eq, cookie_value, profile_forced};
+    use super::{
+        constant_time_eq, cookie_value, dst_directive_records, parse_origin_trace_id, profile_forced,
+    };
+
+    #[test]
+    fn a_record_directive_arms_dst() {
+        assert!(dst_directive_records("record"));
+        assert!(dst_directive_records("record=1"));
+        assert!(dst_directive_records("record=true"));
+        assert!(dst_directive_records("record; other=1"));
+        assert!(!dst_directive_records(""));
+        assert!(!dst_directive_records("1"));
+        assert!(!dst_directive_records("off"));
+    }
+
+    #[test]
+    fn origin_trace_ids_are_32_hex_digits() {
+        let id = "aa".repeat(16);
+        assert_eq!(parse_origin_trace_id(&id), Some(id.clone()));
+        assert_eq!(parse_origin_trace_id(&id.to_uppercase()), Some(id));
+        assert_eq!(parse_origin_trace_id("not-a-trace"), None);
+        assert_eq!(parse_origin_trace_id("aa"), None);
+        assert_eq!(parse_origin_trace_id(""), None);
+    }
 
     #[test]
     fn a_matching_token_arms_a_forced_profile() {

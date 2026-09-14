@@ -19,16 +19,14 @@ use Throwable;
  * where it rides a span attribute, once on the consume side where it rides the
  * request-attribute bag) and drifting.
  *
- * ## Off by default, which is the opposite of the HTTP path
+ * ## On by default, same as HTTP bodies
  *
  * `http_capture_bodies` defaults ON because an operator installing an APM agent
- * has already decided to look at their own request and response bodies. An
- * inter-service message is a different decision: the payload was written by one
- * team for another team's consumer, and capturing it copies that contract into
- * telemetry a third audience reads. `messaging_capture_bodies` therefore
- * defaults OFF, and with it off not one byte of payload is copied, encoded or
- * even measured beyond `strlen()` — the gate is the FIRST thing checked, before
- * the emptiness test and before the cap is resolved.
+ * has already decided to look at request and response bodies. A message body is
+ * the same decision: it is the fact that makes a messaging span answer what
+ * crossed the broker. `messaging_capture_bodies` therefore defaults ON; an
+ * explicit `0|false|no|off` still switches payloads off for a service that
+ * must not copy them into telemetry.
  *
  * ## No field-level masking, stated rather than implied
  *

@@ -149,12 +149,14 @@ pub fn flush(
     events: &[DstEvent],
     trace_id: &str,
     session_id: Option<&str>,
+    origin_trace_id: Option<&str>,
 ) -> std::io::Result<()> {
     flush_with_budget(
         envelope,
         events,
         trace_id,
         session_id,
+        origin_trace_id,
         spool_common::max_body_bytes(),
     )
 }
@@ -167,6 +169,7 @@ pub fn flush_with_budget(
     events: &[DstEvent],
     trace_id: &str,
     session_id: Option<&str>,
+    origin_trace_id: Option<&str>,
     max_body_bytes: usize,
 ) -> std::io::Result<()> {
     if events.is_empty() {
@@ -221,6 +224,10 @@ pub fn flush_with_budget(
     header.insert(
         "sessionId".into(),
         Value::String(session_id.unwrap_or("").to_owned()),
+    );
+    header.insert(
+        "originTraceId".into(),
+        Value::String(origin_trace_id.unwrap_or("").to_owned()),
     );
     header.insert("recordedAt".into(), Value::String(now_utc()));
     header.insert("eventCount".into(), Value::String(events.len().to_string()));
@@ -394,7 +401,7 @@ mod tests {
     #[test]
     fn flushing_no_events_writes_no_file() {
         let dir = temp_spool("empty");
-        flush(&envelope(&dir), &[], "trace-1", None).expect("flush");
+        flush(&envelope(&dir), &[], "trace-1", None, None).expect("flush");
         assert!(!std::path::Path::new(&dir).exists());
     }
 
@@ -415,6 +422,7 @@ mod tests {
             &events,
             "trace-1",
             Some("session-1"),
+            None,
             spool_common::DEFAULT_MAX_BODY_BYTES,
         )
         .expect("flush");
@@ -424,6 +432,7 @@ mod tests {
         assert_eq!(doc["schema"], SCHEMA);
         assert_eq!(doc["traceId"], "trace-1");
         assert_eq!(doc["sessionId"], "session-1");
+        assert_eq!(doc["originTraceId"], "");
         assert_eq!(doc["eventCount"], "2");
         assert_eq!(doc["events"].as_array().unwrap().len(), 2);
         assert_eq!(doc["chunk"]["index"], 0);
@@ -443,11 +452,36 @@ mod tests {
             &events,
             "trace-1",
             None,
+            None,
             spool_common::DEFAULT_MAX_BODY_BYTES,
         )
         .expect("flush");
         let chunks = read_chunks(&dir);
         assert_eq!(chunks[0]["sessionId"], "");
+        assert_eq!(chunks[0]["originTraceId"], "");
+    }
+
+    #[test]
+    fn origin_trace_id_rides_the_recording_header() {
+        activate();
+        record(DstEventKind::Time, vec![]);
+        let events = drain();
+        deactivate();
+
+        let dir = temp_spool("origin-trace");
+        let origin = "ab".repeat(16);
+        flush_with_budget(
+            &envelope(&dir),
+            &events,
+            "trace-1",
+            None,
+            Some(&origin),
+            spool_common::DEFAULT_MAX_BODY_BYTES,
+        )
+        .expect("flush");
+        let chunks = read_chunks(&dir);
+        assert_eq!(chunks[0]["originTraceId"], origin);
+        assert_eq!(chunks[0]["traceId"], "trace-1");
     }
 
     #[test]
@@ -476,7 +510,7 @@ mod tests {
         // same value bounds the assertion below — the budget the writer was given is the only
         // budget the files can be checked against.
         let budget = 2048;
-        flush_with_budget(&envelope(&dir), &events, "trace-1", None, budget).expect("flush");
+        flush_with_budget(&envelope(&dir), &events, "trace-1", None, None, budget).expect("flush");
 
         let chunks = read_chunks(&dir);
         assert!(
