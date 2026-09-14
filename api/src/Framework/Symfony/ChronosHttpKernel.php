@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Symfony;
 
+use Chronos\Collector\Service\BoundUrl;
 use Chronos\Collector\Service\NativeExtension;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -77,6 +78,7 @@ final class ChronosHttpKernel implements HttpKernelInterface
 
             NativeExtension::markPhase('send');
             $this->captureResponse($response);
+            $this->stampBoundUrl($request);
 
             NativeExtension::requestEnd($statusCode, $route ?? $request->getPathInfo(), null, true);
 
@@ -84,6 +86,7 @@ final class ChronosHttpKernel implements HttpKernelInterface
 
             return $response;
         } catch (Throwable $e) {
+            $this->stampBoundUrl($request);
             NativeExtension::requestEnd(500, $request->getPathInfo(), $e, false);
             throw $e;
         }
@@ -118,6 +121,16 @@ final class ChronosHttpKernel implements HttpKernelInterface
             NativeExtension::setResponseBody($body, $contentType, $headers);
         } catch (Throwable) {
             // Capture is never allowed to break the response it is observing.
+        }
+    }
+
+    private function stampBoundUrl(Request $request): void
+    {
+        try {
+            $path = method_exists($request, 'getPathInfo') ? (string) $request->getPathInfo() : '';
+            $full = method_exists($request, 'getUri') ? (string) $request->getUri() : '';
+            NativeExtension::setRequestAttributes(BoundUrl::attributes($path, $full));
+        } catch (Throwable) {
         }
     }
 

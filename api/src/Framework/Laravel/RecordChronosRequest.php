@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Chronos\Collector\Framework\Laravel;
 
+use Chronos\Collector\Service\BoundUrl;
 use Chronos\Collector\Service\NativeExtension;
 use Chronos\Collector\Service\Span;
 use Chronos\Collector\Service\SpanManager;
@@ -160,6 +161,7 @@ final class RecordChronosRequest
         RichTelemetryHooks::closeDanglingTransactions();
         BootTiming::reset();
         try {
+            $this->stampBoundUrl($request);
             $identity = $this->requestIdentity($request);
             $action = $identity['http.route.action'] ?? '';
             if ($action !== '' && function_exists('chronos_profile_tag')) {
@@ -223,6 +225,24 @@ final class RecordChronosRequest
         }
 
         return RequestFacts::identity($routeName, $action, $middleware, $userId, $guard, $peak);
+    }
+
+    /**
+     * Stamp the bound inbound URL. `requestEnd` overwrites the start-time path
+     * with `$route->uri()`, which is the template (`orders/{order}`). OTel
+     * wants that template on `http.route`; the instance belongs on `url.path`.
+     */
+    private function stampBoundUrl(Request $request): void
+    {
+        try {
+            $path = method_exists($request, 'getPathInfo') ? (string) $request->getPathInfo() : '';
+            if ($path === '' && method_exists($request, 'path')) {
+                $path = (string) $request->path();
+            }
+            $full = method_exists($request, 'fullUrl') ? (string) $request->fullUrl() : '';
+            NativeExtension::setRequestAttributes(BoundUrl::attributes($path, $full));
+        } catch (Throwable) {
+        }
     }
 
     private function resolveRoute(Request $request): ?string

@@ -38,6 +38,7 @@ pub const TIMELINE: &str = "http.timeline";
 // emit sites in `observer.rs` and `lib.rs` cannot drift in spelling.
 pub const REQUEST_METHOD: &str = "http.request.method";
 pub const RESPONSE_STATUS_CODE: &str = "http.response.status_code";
+pub const URL_PATH: &str = "url.path";
 pub const URL_FULL: &str = "url.full";
 pub const DB_QUERY_TEXT: &str = "db.query.text";
 
@@ -193,6 +194,11 @@ struct Capture {
     request_body: Option<(String, usize, String)>,
     response_headers: Vec<(String, String)>,
     response_body: Option<(String, usize, String)>,
+    /// Bound inbound path (`/orders/99`), from `REQUEST_URI` / `PATH_INFO`.
+    /// Distinct from `http.route`, which is the template the framework resolves
+    /// later (`/orders/{id}`).
+    url_path: String,
+    url_full: String,
     /// (phase name, nanoseconds from request start at which it BEGAN). `u128` to match
     /// the monotonic clock the rest of the extension measures in.
     phases: Vec<(String, u128)>,
@@ -236,10 +242,13 @@ pub fn on_request_start(config: HttpCaptureConfig) {
     }
 
     let server = server_vars();
+    let (url_path, url_full) = bound_url_from_server(&server);
     let mut capture = Capture {
         request_headers: request_headers(&server),
         request_cookies: parse_pairs(lookup(&server, "HTTP_COOKIE"), ';'),
         request_query: parse_pairs(lookup(&server, "QUERY_STRING"), '&'),
+        url_path,
+        url_full,
         ..Default::default()
     };
 
@@ -318,6 +327,13 @@ pub fn drain(request_duration_ns: u128) -> Drained {
     if let Some(json) = encode_map_masked(&capture.request_query, &config) {
         attributes.push((REQUEST_QUERY.to_owned(), json));
     }
+    if !capture.url_path.is_empty() {
+        attributes.push((URL_PATH.to_owned(), capture.url_path.clone()));
+    }
+    if !capture.url_full.is_empty() {
+        attributes.push((URL_FULL.to_owned(), capture.url_full.clone()));
+        attributes.push(("http.url".to_owned(), capture.url_full));
+    }
     if let Some((body, size, content_type)) = capture.request_body.take() {
         let (encoded, stored) =
             body_attributes(REQUEST_BODY, "request", &body, size, &content_type, &config);
@@ -390,6 +406,105 @@ pub fn server_vars() -> HashMap<String, String> {
 /// every caller treats "absent" and "present but blank" the same way.
 pub fn lookup<'a>(server: &'a HashMap<String, String>, key: &str) -> &'a str {
     server.get(key).map(String::as_str).unwrap_or("")
+}
+
+/// Bound inbound URL from CGI `$_SERVER`, kept apart from `http.route`.
+///
+/// Framework bridges resolve a template (`/orders/{id}`) at request end and
+/// stamp that as `http.route`. The instance this request actually served lives
+/// on `REQUEST_URI` / `PATH_INFO` from the first moment of the request, which
+/// is the only copy that is still bound after the template overwrites the
+/// start-time route argument.
+pub(crate) fn bound_url_from_server(server: &HashMap<String, String>) -> (String, String) {
+    let path = inbound_path(server);
+    if path.is_empty() {
+        return (String::new(), String::new());
+    }
+    let query = inbound_query(server);
+    let host = inbound_host(server);
+    if host.is_empty() {
+        return (path, String::new());
+    }
+    let scheme = inbound_scheme(server);
+    let full = if query.is_empty() {
+        format!("{scheme}://{host}{path}")
+    } else {
+        format!("{scheme}://{host}{path}?{query}")
+    };
+    (path, full)
+}
+
+fn inbound_path(server: &HashMap<String, String>) -> String {
+    let path_info = lookup(server, "PATH_INFO");
+    if !path_info.is_empty() && path_info != "/" {
+        return normalise_bound_path(path_info);
+    }
+    let (uri_path, _) = split_request_uri(lookup(server, "REQUEST_URI"));
+    if looks_like_front_controller(uri_path, lookup(server, "SCRIPT_NAME")) {
+        return String::new();
+    }
+    normalise_bound_path(uri_path)
+}
+
+fn inbound_query(server: &HashMap<String, String>) -> &str {
+    let (_, uri_query) = split_request_uri(lookup(server, "REQUEST_URI"));
+    if !uri_query.is_empty() {
+        return uri_query;
+    }
+    lookup(server, "QUERY_STRING")
+}
+
+fn inbound_host(server: &HashMap<String, String>) -> String {
+    let forwarded = lookup(server, "HTTP_X_FORWARDED_HOST");
+    let host = if forwarded.is_empty() {
+        lookup(server, "HTTP_HOST")
+    } else {
+        forwarded.split(',').next().unwrap_or("").trim()
+    };
+    host.to_owned()
+}
+
+fn inbound_scheme(server: &HashMap<String, String>) -> &'static str {
+    let proto = lookup(server, "HTTP_X_FORWARDED_PROTO");
+    let first = proto.split(',').next().unwrap_or("").trim();
+    if first.eq_ignore_ascii_case("https") || lookup(server, "HTTPS").eq_ignore_ascii_case("on") {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+fn split_request_uri(uri: &str) -> (&str, &str) {
+    match uri.find('?') {
+        Some(i) => (&uri[..i], &uri[i + 1..]),
+        None => (uri, ""),
+    }
+}
+
+fn looks_like_front_controller(uri_path: &str, script: &str) -> bool {
+    let path = uri_path.trim_end_matches('/');
+    if path.ends_with(".php") {
+        return true;
+    }
+    let script = script.trim_end_matches('/');
+    !script.is_empty() && path == script
+}
+
+fn normalise_bound_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('{') {
+        return String::new();
+    }
+    let path = if trimmed.starts_with('/') {
+        trimmed.to_owned()
+    } else {
+        format!("/{trimmed}")
+    };
+    if path.starts_with("//") || path.split('/').any(|segment| segment == "..") {
+        String::new()
+    } else {
+        path
+    }
 }
 
 /// The inbound headers, recovered from their `HTTP_*` spellings.
@@ -754,4 +869,76 @@ fn env_usize(name: &str, default: usize) -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn bound_url_from_request_uri_and_host() {
+        let (path, full) = bound_url_from_server(&server(&[
+            ("REQUEST_URI", "/organizations/99/orders/70?tab=lines"),
+            ("HTTP_HOST", "oms.qls.local"),
+        ]));
+        assert_eq!(path, "/organizations/99/orders/70");
+        assert_eq!(full, "http://oms.qls.local/organizations/99/orders/70?tab=lines");
+    }
+
+    #[test]
+    fn bound_url_prefers_path_info_when_the_uri_is_the_front_controller() {
+        let (path, full) = bound_url_from_server(&server(&[
+            ("REQUEST_URI", "/index.php"),
+            ("SCRIPT_NAME", "/index.php"),
+            ("PATH_INFO", "/organizations/99/orders/70"),
+            ("HTTP_HOST", "oms.qls.local"),
+            ("HTTPS", "on"),
+        ]));
+        assert_eq!(path, "/organizations/99/orders/70");
+        assert_eq!(full, "https://oms.qls.local/organizations/99/orders/70");
+    }
+
+    #[test]
+    fn bound_url_uses_forwarded_proto_and_host() {
+        let (path, full) = bound_url_from_server(&server(&[
+            ("REQUEST_URI", "/health"),
+            (
+                "HTTP_X_FORWARDED_HOST",
+                "oms.example.test, internal.example.test",
+            ),
+            ("HTTP_X_FORWARDED_PROTO", "https, http"),
+            ("HTTP_HOST", "127.0.0.1:8080"),
+        ]));
+        assert_eq!(path, "/health");
+        assert_eq!(full, "https://oms.example.test/health");
+    }
+
+    #[test]
+    fn bound_url_rejects_a_template_and_a_parent_segment() {
+        let templated = bound_url_from_server(&server(&[
+            ("REQUEST_URI", "/organizations/{organization}/orders/{order}"),
+            ("HTTP_HOST", "oms.qls.local"),
+        ]));
+        assert_eq!(templated, (String::new(), String::new()));
+        let parent = bound_url_from_server(&server(&[
+            ("REQUEST_URI", "/organizations/99/../admin"),
+            ("HTTP_HOST", "oms.qls.local"),
+        ]));
+        assert_eq!(parent, (String::new(), String::new()));
+    }
+
+    #[test]
+    fn bound_url_keeps_path_when_host_is_absent() {
+        let (path, full) =
+            bound_url_from_server(&server(&[("REQUEST_URI", "/organizations/99/orders/70")]));
+        assert_eq!(path, "/organizations/99/orders/70");
+        assert_eq!(full, "");
+    }
 }

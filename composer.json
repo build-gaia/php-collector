@@ -44,6 +44,7 @@
       "php api/tests/httpclient-case.php",
       "php api/tests/psr18-client-decorator-case.php",
       "php api/tests/native-extension-case.php",
+      "php api/tests/bound-url-case.php",
       "php api/tests/integration-wiring-case.php"
     ]
   }
