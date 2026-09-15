@@ -304,6 +304,29 @@ both names is not a conflict — `team_id` is taken and `project` ignored.
 | `cli_enabled` | `CHRONOS_PHP_CLI_ENABLED` | `0` — CLI/workers are not auto-collected |
 | `dst_enabled` | `CHRONOS_PHP_DST_ENABLED` | `0` — lab/CLI only; ignored when `env` is `production`/`prod`, where the only path is the `x-chronos-dst` header / `chronos_dst` cookie |
 | `env` | `CHRONOS_PHP_ENV` | — (`production`/`prod` refuses process-wide DST) |
+| `propagation_priority` | `CHRONOS_PHP_PROPAGATION_PRIORITY` | `1` — see *Sharing a process with another tracer* below |
+
+### Sharing a process with another tracer
+
+Where Chronos is instrumenting, Chronos owns the outbound `traceparent`. A
+process running a second tracer — ddtrace, typically, during a migration — hooks
+`curl_exec` too, and injects from inside the function handler, i.e. AFTER our
+observer hook. Its header would be the last writer, so the callee joins ITS trace
+while the client span we recorded sits under ours: caller and callee land in two
+different trace ids, and every read path that joins a trace (the dependency
+graph, hop banding, the waterfall) sees two disconnected halves.
+
+Before the first outbound call of a request, the extension therefore turns the
+other tracer's distributed-tracing injection off for the remainder of that
+request (`datadog.distributed_tracing`, a `PHP_INI_ALL` setting, so Zend restores
+it at request shutdown — nothing is written to any configuration file). Only
+propagation is affected: the other tracer's spans, agent and sampling are
+untouched.
+
+Set `CHRONOS_PHP_PROPAGATION_PRIORITY=false` to leave the wire to the other
+tracer. Chronos keeps recording its own spans, and the service map falls back to
+the first-party `chronos.peer.application` stamp the Engine writes at ingest — so
+the edges still appear, without the joined callee spans underneath them.
 
 There is no runtime-metrics tier. The extension used to write one `.metrics`
 spool file per request behind `CHRONOS_PHP_RUNTIME_METRICS_ENABLED`, carrying a

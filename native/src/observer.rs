@@ -298,6 +298,7 @@ pub fn set_request_context(context: TraceContext) {
     SUPPRESS_SQL.with(|flag| flag.set(false));
     SUPPRESS_CACHE.with(|flag| flag.set(false));
     SUPPRESS_MESSAGING.with(|flag| flag.set(false));
+    crate::propagation_priority::reset_for_request();
     #[cfg(feature = "zend-observer")]
     CURL_HEADERS.with(|h| h.borrow_mut().clear());
     #[cfg(feature = "zend-observer")]
@@ -4568,6 +4569,14 @@ unsafe fn inject_curl_traceparent(
 ) {
     // Publish for userland retrieval regardless of whether direct injection works.
     PENDING_TRACEPARENT.with(|tp| *tp.borrow_mut() = Some(traceparent.to_owned()));
+
+    // Another tracer sharing this process injects from inside the `curl_exec`
+    // handler — after this observer hook — so ours would be overwritten and the
+    // callee would join ITS trace instead of the one we recorded. Where Chronos
+    // is instrumenting, Chronos owns the wire: stand the other tracer's
+    // propagation down for the rest of this request, once. See
+    // `propagation_priority`.
+    crate::propagation_priority::claim_once();
 
     let Some(handle) = zend_helpers::arg_object_handle(execute_data, 0) else {
         return;

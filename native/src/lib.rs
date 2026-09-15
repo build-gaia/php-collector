@@ -39,6 +39,7 @@ pub mod log_spool;
 pub mod messaging;
 pub mod observer;
 pub mod profile_spool;
+pub mod propagation_priority;
 pub mod rate;
 pub mod replay_hooks;
 pub mod request_attributes;
