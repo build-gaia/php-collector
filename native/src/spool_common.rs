@@ -39,14 +39,33 @@ pub fn hex_digest(body: &str) -> String {
         .collect()
 }
 
+/// Make a spool file readable and writable by its GROUP as well as its owner.
+///
+/// 0600 was wrong on any spool more than one uid writes, and wrong in a way
+/// nothing reported. One organisation's spool is a shared volume by design, and
+/// `www-data` is uid 82 in the Alpine PHP images and uid 33 in the Debian ones,
+/// so whichever image created the active segment owned it and the other was
+/// refused by the kernel on every append — silently, because a spool write has
+/// no error path a request can see. Measured on one estate: a service had not
+/// landed a single span for thirteen hours while its extension, its
+/// configuration and its traffic were all correct.
+///
+/// The deployment already anticipated this. The spool volume is setgid to a
+/// shared group with POSIX ACLs granting each application gid, and a default ACL
+/// so new files inherit them — but a file CREATED 0600 collapses the ACL mask to
+/// `---` and neuters every named group entry, so the design could never take
+/// effect. Group permission is what makes it work.
+///
+/// Still not world-readable: the spool holds request bodies and query text, and
+/// the volume is per-organisation. The group is the boundary.
 #[cfg(unix)]
-pub fn set_mode_0600(file: &fs::File) {
+pub fn set_spool_mode(file: &fs::File) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    let _ = file.set_permissions(fs::Permissions::from_mode(0o660));
 }
 
 #[cfg(not(unix))]
-pub fn set_mode_0600(_file: &fs::File) {}
+pub fn set_spool_mode(_file: &fs::File) {}
 
 /// Append one document to the tenant's spool log as a framed entry (ADR 0035).
 ///
@@ -87,7 +106,7 @@ pub fn write_document_file(
     let final_path = format!("{spool_directory}/{id}.{extension}");
 
     let mut file = fs::File::create(&tmp)?;
-    set_mode_0600(&file);
+    set_spool_mode(&file);
     file.write_all(body.as_bytes())?;
     drop(file);
 

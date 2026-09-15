@@ -262,7 +262,7 @@ fn create_segment(spool_directory: &str, generation: u64) -> std::io::Result<Fil
         .create_new(true)
         .append(true)
         .open(&path)?;
-    crate::spool_common::set_mode_0600(&file);
+    crate::spool_common::set_spool_mode(&file);
     Ok(file)
 }
 
